@@ -48,34 +48,22 @@ s3_client = boto3.client(
     config=Config(signature_version="s3v4"),
 )
 
-# TODO: these node IDs are placeholders. Once the real API-format workflow
-# export lands (see workflow_template.json's _comment), open it and fill in
-# the actual numeric string IDs ComfyUI assigned to each of these nodes -
-# they're stable per-workflow-file but arbitrary, not something to guess.
+# Node IDs from the real API-format export (video_minimax_h3_t2v_3.json,
+# captured off the proven RunPod CUDA 13.0 pod). This graph is TEXT-TO-VIDEO
+# ONLY - MiniMaxH3ImageToVideo (105:104) has no first_frame/last_frame wired
+# in this export, so I2V isn't supported by this handler yet. Adding it
+# means capturing a second export with those inputs connected and branching
+# build_prompt_payload() on whether the job provides an image.
 NODE_IDS = {
-    "positive_prompt": "TODO",  # CLIPTextEncode (positive) node - "text" input
-    "width_height": "TODO",     # the node holding the video's width/height widgets
-    "frame_count": "TODO",      # the node holding num_frames (or length) for duration
-    "seed": "TODO",             # KSampler/BasicScheduler-adjacent seed source
-    "steps": "TODO",            # BasicScheduler - "steps" widget
-    "output": "TODO",           # SaveVideo / VHS_VideoCombine - the terminal output node
-    "first_frame": "TODO",      # image input node - I2V start frame (optional per job)
-    "last_frame": "TODO",       # image input node - I2V end frame (optional per job)
+    "prompt_and_dims": "105:104",  # MiniMaxH3ImageToVideo - prompt/width/height/length inputs
+    "duration_seconds": "105:111", # PrimitiveFloat feeding ComfyMathExpression's 17n+5 frame-count snap
+    "seed": "105:15",              # RandomNoise - noise_seed
+    "steps": "105:9",              # BasicScheduler - steps
+    "output": "92",                # SaveVideo - terminal output node
 }
 
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
-
-
-def duration_to_frame_count(duration_seconds):
-    """MiniMax H3 requires frame counts of the form 17n+5, not an arbitrary
-    integer. 24fps target, snapped to the nearest valid count - e.g.
-    duration=7.29 -> round(7.29*24)=175 -> already 17*10+5, matches the
-    stress-test baseline this was validated against.
-    """
-    raw = max(5, round(duration_seconds * 24))
-    n = round((raw - 5) / 17)
-    return 17 * n + 5
 
 
 def ensure_comfyui_engine():
@@ -152,12 +140,21 @@ def build_prompt_payload(job_input):
     steps = job_input.get("steps", 20)
     seed = job_input.get("seed", uuid.uuid4().int & 0xFFFFFFFF)
 
-    workflow[NODE_IDS["positive_prompt"]]["inputs"]["text"] = prompt_text
-    workflow[NODE_IDS["width_height"]]["inputs"]["width"] = width
-    workflow[NODE_IDS["width_height"]]["inputs"]["height"] = height
-    workflow[NODE_IDS["frame_count"]]["inputs"]["length"] = duration_to_frame_count(duration)
+    prompt_node = workflow[NODE_IDS["prompt_and_dims"]]["inputs"]
+    prompt_node["prompt"] = prompt_text
+    # Overwrites the link to ResolutionSelector (node "115") with a literal
+    # value - ResolutionSelector becomes unreachable from the output node
+    # and simply won't execute, which ComfyUI tolerates fine.
+    prompt_node["width"] = width
+    prompt_node["height"] = height
+
+    # The graph itself does the 17n+5 frame-count snap via ComfyMathExpression
+    # (node "105:107") fed by this raw duration-in-seconds value - no need
+    # to replicate that math here, just hand it the seconds.
+    workflow[NODE_IDS["duration_seconds"]]["inputs"]["value"] = duration
+
     workflow[NODE_IDS["steps"]]["inputs"]["steps"] = steps
-    workflow[NODE_IDS["seed"]]["inputs"]["seed"] = seed
+    workflow[NODE_IDS["seed"]]["inputs"]["noise_seed"] = seed
 
     return workflow
 
@@ -186,10 +183,11 @@ def submit_and_wait(workflow, timeout_seconds=1200):
 def fetch_output_video(history_entry):
     outputs = history_entry["outputs"]
     output_node = outputs[NODE_IDS["output"]]
-    # ComfyUI's video-output nodes (SaveVideo/VHS_VideoCombine) list produced
-    # files under a "gifs" or "videos" key depending on node type - checked
-    # at runtime against the real exported workflow rather than assumed here.
-    video_info = (output_node.get("videos") or output_node.get("gifs"))[0]
+    # Verified against ComfyUI's actual source (comfy_api/latest/_ui.py,
+    # PreviewVideo.as_dict()) rather than assumed: SaveVideo's history
+    # output list is keyed "images" even though it's video - that's
+    # PreviewVideo's own key choice, not a ComfyLabV2 convention.
+    video_info = output_node["images"][0]
 
     r = requests.get(
         f"{COMFYUI_URL}/view",

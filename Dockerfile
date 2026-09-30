@@ -15,16 +15,13 @@
 # persistent RunPod network volume by ensure_comfyui_engine.sh.
 FROM python:3.12-slim
 
-# TODO: replace with the real commits confirmed on the proven RunPod
-# "ComfyUI - CUDA 13.0" pod:
-#   git -C /workspace/runpod-slim/ComfyUI rev-parse HEAD
-#   git -C /workspace/runpod-slim/ComfyUI/custom_nodes/ComfyUI-KJNodes rev-parse HEAD
-# Floating on a branch tip means a future rebuild can silently pull a
-# different (or broken) ComfyUI/KJNodes version with no record of what
-# changed - pin these the same way SageAttention's build commit is pinned
-# below.
-ARG COMFYUI_COMMIT=master
-ARG KJNODES_COMMIT=main
+# Pinned to the exact commits confirmed on the proven RunPod "ComfyUI -
+# CUDA 13.0" pod (2026-09-30 session) - floating on a branch tip means a
+# future rebuild can silently pull a different (or broken) ComfyUI/KJNodes
+# version with no record of what changed, same reason SageAttention's build
+# commit is pinned below.
+ARG COMFYUI_COMMIT=700a8f6669607a599c1834723f4c006418b5e3fe
+ARG KJNODES_COMMIT=a3250418d58d81aada1826aecaa4ccfce9963def
 
 WORKDIR /opt/comfylab
 
@@ -37,11 +34,14 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git ComfyUI \
     && cd ComfyUI \
     && git checkout "$COMFYUI_COMMIT"
 
-# Torch pinned to the same CUDA 13.0 wheel index the proven pod used -
-# ComfyUI's own requirements.txt doesn't pin a CUDA build, and pulling from
-# the default PyPI index would grab a CPU-only or mismatched-CUDA wheel.
+# Torch pinned to the exact version+build confirmed on the proven pod
+# (torch.__version__ == "2.10.0+cu130") - ComfyUI's own requirements.txt
+# doesn't pin a CUDA build, and pulling from the default PyPI index would
+# grab a CPU-only or mismatched-CUDA wheel. torchvision/torchaudio left
+# unpinned to whatever version pip resolves as compatible with that exact
+# torch build.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
-    torch torchvision torchaudio
+    torch==2.10.0+cu130 torchvision torchaudio
 
 RUN pip install --no-cache-dir -r ComfyUI/requirements.txt
 
