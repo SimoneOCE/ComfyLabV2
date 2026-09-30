@@ -278,4 +278,21 @@ snapshot_download(repo_id='JunhaoZhuang/FlashVSR-v1.1', local_dir='$FLASHVSR_MOD
 "
 fi
 
+# NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI,
+# Apache-2.0 node) - third upscale option, test-only (see handler.py's
+# NVIDIA_VSR comment for why it's not recommended for production yet: its
+# one dependency, nvidia-vfx, is PyPI-classified Development Status ::
+# 3 - Alpha, and NVIDIA's own SDK license says pre-release SDKs aren't
+# intended for production). No separate model-weight download needed -
+# its VFX SDK libraries ship bundled inside the nvidia-vfx wheel itself,
+# unlike FlashVSR's multi-GB checkpoint.
+NVIDIA_VSR_NODE_DIR="$COMFYUI_DIR/custom_nodes/Nvidia_RTX_Nodes_ComfyUI"
+if [ -d "$NVIDIA_VSR_NODE_DIR" ]; then
+    echo "[comfylab-engine] NVIDIA RTX VSR custom node already present, skipping clone."
+else
+    echo "[comfylab-engine] Cloning NVIDIA RTX VSR custom node..."
+    git clone --depth 1 https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI.git "$NVIDIA_VSR_NODE_DIR"
+fi
+pip install nvidia-vfx
+
 echo "[comfylab-engine] Done. Engine + models ready on volume."
