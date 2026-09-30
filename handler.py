@@ -147,6 +147,27 @@ UPSCALE_MODEL = {
     "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
 }
 
+# FlashVSR (naxci1/ComfyUI-FlashVSR_Stable, MIT) - the second upscale
+# option, added to compare against ESRGAN 2x rather than replace it. Not
+# a small CNN like ESRGAN - it's a real diffusion model (Wan2.1-1.3B
+# based per its paper, 11-18GB of its own VRAM), so it can't just splice
+# into the same graph submission as MiniMax H3's own ~40GB the way ESRGAN
+# does. See run_generation's "flashvsr" branch: it runs as a genuinely
+# separate submission, with an explicit /free {"unload_models": true}
+# between them to evict MiniMax H3's weights first - not a repeat of the
+# two-submission design mentioned in build_prompt_payload's history below
+# (that one was chasing a VRAM theory later proven wrong), this one has
+# an actual second model that needs the room.
+#
+# Picked over the original repo's other community ComfyUI ports (several
+# exist, under GPL-3.0/Apache-2.0/MIT) specifically because its CHANGELOG
+# says it replaced the original Block-Sparse-Attention with Sparse_Sage
+# Attention "for RTX 50 series support" - this worker's actual GPU (see
+# the EUR-IS-2 comment above) - using the same SageAttention family
+# MiniMax H3 already runs on here, not an unverified guess at Blackwell
+# compatibility.
+FLASHVSR_MODEL_NAME = "FlashVSR-v1.1"
+
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
 
@@ -358,15 +379,18 @@ def build_prompt_payload(job_input, include_upscale=False):
     """Builds the full workflow graph for one generation. include_upscale
     splices the ESRGAN nodes into the SAME submission as everything else
     (matching how production's koboldcpp path does upscale - one request,
-    not two) rather than a separate follow-up submission - see
-    run_generation's docstring for why that two-submission design got
-    reverted: splitting it into two separate HTTP requests defeated
-    ComfyUI's own automatic per-node memory management (which frees a
-    model's VRAM the moment nothing downstream still needs it, within a
-    single continuous execution), which is what actually caused a real
-    upscale test to OOM and crash the whole process. One request lets
-    ComfyUI handle that hand-off the normal way, the same as any other
-    node transition already visible in every log.
+    not two). An earlier two-submission design (base gen + a separate
+    follow-up upscale request) got reverted at the time on the theory that
+    splitting into two HTTP requests was itself what caused a real upscale
+    test to OOM - that theory turned out to be wrong: the actual cause,
+    confirmed directly against comfy/model_management.py, was ESRGAN's
+    output tensor landing on intermediate_device() (system RAM) for the
+    WHOLE video at once regardless of submission count, fixed by switching
+    to 2x (see UPSCALE_MODEL's comment). ESRGAN stays single-submission
+    because there's no reason to split it now that the real cause is
+    fixed, not because two submissions are inherently unsafe - see
+    run_generation's "flashvsr" branch for a case where a second
+    submission is the right call for a different, real reason.
     """
     with open(WORKFLOW_TEMPLATE_PATH, "r") as f:
         workflow = json.load(f)
@@ -533,7 +557,10 @@ def submit_and_wait(workflow, timeout_seconds=1200, should_cancel=None, should_f
     raise TimeoutError(f"ComfyUI generation did not finish within {timeout_seconds}s.")
 
 
-def fetch_output_video(history_entry):
+def _output_video_info_and_path(history_entry):
+    """Shared by fetch_output_video and stage_video_for_reload: resolves a
+    finished submission's SaveVideo output to (video_info, its real path
+    under COMFYUI_OUTPUT_DIR)."""
     outputs = history_entry["outputs"]
     output_node = outputs[NODE_IDS["output"]]
     # Verified against ComfyUI's actual source (comfy_api/latest/_ui.py,
@@ -541,6 +568,12 @@ def fetch_output_video(history_entry):
     # output list is keyed "images" even though it's video - that's
     # PreviewVideo's own key choice, not a ComfyLabV2 convention.
     video_info = output_node["images"][0]
+    raw_path = os.path.join(COMFYUI_OUTPUT_DIR, video_info.get("subfolder", ""), video_info["filename"])
+    return video_info, raw_path
+
+
+def fetch_output_video(history_entry):
+    video_info, raw_path = _output_video_info_and_path(history_entry)
 
     r = requests.get(
         f"{COMFYUI_URL}/view",
@@ -558,13 +591,119 @@ def fetch_output_video(history_entry):
     # volume doesn't grow unbounded across a long session's worth of jobs,
     # same reasoning as redirecting it off the container disk in the first
     # place (see start_comfyui_if_needed).
-    raw_path = os.path.join(COMFYUI_OUTPUT_DIR, video_info.get("subfolder", ""), video_info["filename"])
     try:
         os.remove(raw_path)
     except OSError as e:
         print(f"Could not clean up {raw_path}: {e}")
 
     return r.content, video_info["filename"]
+
+
+def stage_video_for_reload(history_entry):
+    """FlashVSR path only: moves a just-finished base generation's SaveVideo
+    output from COMFYUI_OUTPUT_DIR into ComfyUI's input/ directory - same
+    convention save_input_image() already uses for ref/start/end frame
+    images - so the second submission's LoadVideo node can read it back in
+    by filename. Returns the bare filename LoadVideo should reference."""
+    video_info, raw_path = _output_video_info_and_path(history_entry)
+    input_dir = os.path.join(COMFYUI_DIR, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    staged_filename = f"flashvsr_src_{uuid.uuid4()}{os.path.splitext(video_info['filename'])[1]}"
+    shutil.move(raw_path, os.path.join(input_dir, staged_filename))
+    return staged_filename
+
+
+def free_comfyui_models():
+    """POST /free {"unload_models": true} - ComfyUI's own endpoint
+    (server.py's post_free route), which sets a flag main.py's worker loop
+    consumes right after its current item finishes, calling
+    comfy.model_management.unload_all_models() (moves resident weights
+    from VRAM to CPU RAM, not deletes them). Used between the base
+    generation and a FlashVSR submission so FlashVSR's own VRAM footprint
+    doesn't have to coexist with MiniMax H3's - see FLASHVSR_MODEL_NAME's
+    comment for why that's a real constraint here, unlike ESRGAN."""
+    requests.post(f"{COMFYUI_URL}/free", json={"unload_models": True}, timeout=30).raise_for_status()
+
+
+def build_flashvsr_payload(input_filename):
+    """Second-submission graph for the FlashVSR path: LoadVideo/GetVideo
+    Components (native ComfyUI nodes, comfy_extras/nodes_video.py) reload
+    the base generation's staged file as IMAGE frames, FlashVSRNodeInitPipe/
+    FlashVSRNodeAdv (naxci1/ComfyUI-FlashVSR_Stable, verified against its
+    actual nodes.py) upscale them, CreateVideo/SaveVideo re-encode - same
+    output shape as the base graph's own tail, so fetch_output_video works
+    on this submission's result unchanged.
+
+    Parameters left at the node's own recommended defaults (tuned by its
+    maintainer, not guessed here) except: scale=2, to match ESRGAN's scale
+    for a fair side-by-side comparison; enable_debug=True, to surface the
+    per-run VRAM/timing summary this test is specifically comparing
+    against ESRGAN's; keep_models_on_cpu/force_offload left True (their
+    own defaults) since offloading its own weights afterward is exactly
+    what's wanted here.
+    """
+    return {
+        "_load_video": {
+            "inputs": {"file": input_filename},
+            "class_type": "LoadVideo",
+        },
+        "_video_components": {
+            "inputs": {"video": ["_load_video", 0]},
+            "class_type": "GetVideoComponents",
+        },
+        "_flashvsr_pipe": {
+            "inputs": {
+                "model": FLASHVSR_MODEL_NAME,
+                "mode": "tiny",
+                "vae_model": "Wan2.1",
+                "force_offload": True,
+                "precision": "auto",
+                "device": "auto",
+                "attention_mode": "sparse_sage_attention",
+            },
+            "class_type": "FlashVSRNodeInitPipe",
+        },
+        "_flashvsr_upscale": {
+            "inputs": {
+                "pipe": ["_flashvsr_pipe", 0],
+                "frames": ["_video_components", 0],
+                "scale": 2,
+                "color_fix": True,
+                "tiled_vae": True,
+                "tiled_dit": True,
+                "tile_size": 256,
+                "tile_overlap": 24,
+                "unload_dit": False,
+                "sparse_ratio": 2.0,
+                "kv_ratio": 3.0,
+                "local_range": 11,
+                "seed": 0,
+                "frame_chunk_size": 0,
+                "enable_debug": True,
+                "keep_models_on_cpu": True,
+                "resize_factor": 1.0,
+            },
+            "class_type": "FlashVSRNodeAdv",
+        },
+        "_flashvsr_create_video": {
+            "inputs": {
+                "fps": ["_video_components", 2],
+                "bit_depth": 8,
+                "images": ["_flashvsr_upscale", 0],
+                "audio": ["_video_components", 1],
+            },
+            "class_type": "CreateVideo",
+        },
+        NODE_IDS["output"]: {
+            "inputs": {
+                "filename_prefix": "video/FlashVSR",
+                "format": "auto",
+                "codec": "auto",
+                "video": ["_flashvsr_create_video", 0],
+            },
+            "class_type": "SaveVideo",
+        },
+    }
 
 
 def upload_result_and_get_key(raw_bytes, filename):
@@ -583,12 +722,14 @@ def upload_result_and_get_key(raw_bytes, filename):
 
 
 def run_generation(job_input, should_cancel=None, should_force_kill=None):
-    """One full generation: build the workflow (upscale tail included in
-    the same submission when requested - see build_prompt_payload's
-    docstring for why splitting that into a separate follow-up request
-    got reverted), run it, upload the result. Shared by both the classic
-    one-shot handler() path and run_session()'s per-job loop below -
-    identical either way, since ComfyUI itself only ever has one thing
+    """One full generation. upscale_method selects how the tail is built:
+    "none"/"esrgan2x" stay a single submission (see build_prompt_payload's
+    docstring); "flashvsr" runs the base generation, then a genuinely
+    separate second submission for FlashVSR - see FLASHVSR_MODEL_NAME's
+    comment for why that one specifically needs its own submission rather
+    than splicing into the first like ESRGAN does. Shared by both the
+    classic one-shot handler() path and run_session()'s per-job loop below
+    - identical either way, since ComfyUI itself only ever has one thing
     loaded/running at a time regardless of which path queued it.
     should_cancel/should_force_kill default to None (never cancels) for
     the classic path, which has no per-job cancel flag to poll.
@@ -596,14 +737,39 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
     No separate upscale-only timing here (production's koboldcpp path
     doesn't expose that either) - upscale's cost is folded into the same
     total time as everything else, same as any other node in the graph.
+    FlashVSR's own enable_debug=True prints its own VRAM/timing summary to
+    the worker log for this comparison, since that can't ride through
+    gpu_session_jobs.output the same simple way.
     """
-    workflow = build_prompt_payload(job_input, include_upscale=job_input.get("upscale", False))
+    upscale_method = job_input.get("upscale_method", "none")
+    workflow = build_prompt_payload(job_input, include_upscale=(upscale_method == "esrgan2x"))
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
     if result.get("force_killed"):
         return {"cancelled": True, "force_killed": True}
     if result.get("cancelled"):
         return {"cancelled": True}
-    raw_bytes, filename = fetch_output_video(result)
+
+    if upscale_method != "flashvsr":
+        raw_bytes, filename = fetch_output_video(result)
+        video_key = upload_result_and_get_key(raw_bytes, filename)
+        return {"videoKey": video_key}
+
+    staged_filename = stage_video_for_reload(result)
+    free_comfyui_models()
+    flashvsr_workflow = build_flashvsr_payload(staged_filename)
+    flashvsr_result = submit_and_wait(flashvsr_workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
+
+    staged_path = os.path.join(COMFYUI_DIR, "input", staged_filename)
+    try:
+        os.remove(staged_path)
+    except OSError as e:
+        print(f"Could not clean up {staged_path}: {e}")
+
+    if flashvsr_result.get("force_killed"):
+        return {"cancelled": True, "force_killed": True}
+    if flashvsr_result.get("cancelled"):
+        return {"cancelled": True}
+    raw_bytes, filename = fetch_output_video(flashvsr_result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
     return {"videoKey": video_key}
 

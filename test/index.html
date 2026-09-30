@@ -48,9 +48,12 @@
       <option value="fast">Fast</option>
     </select>
   </label>
-  <label style="display:flex; align-items:center; gap:8px;">
-    <input id="upscale" type="checkbox" style="width:auto; margin-top:0;" />
-    Real-ESRGAN upscale (one request, same as everything else - no separate timing breakdown, matches production's koboldcpp path)
+  <label>Upscale
+    <select id="upscaleMethod">
+      <option value="none">None</option>
+      <option value="esrgan2x">Real-ESRGAN 2x (one request, folded into the same submission - no separate timing breakdown)</option>
+      <option value="flashvsr">FlashVSR (genuinely separate second submission - own VRAM/timing summary printed to the worker log, not returned here)</option>
+    </select>
   </label>
 
   <h2>S3 credentials (to fetch the finished video)</h2>
@@ -112,13 +115,8 @@
 // Wrapped in try/catch: file:// pages sometimes block or reset storage
 // depending on the browser, and this is a convenience, not something the
 // page depends on to function.
-// Checkboxes deliberately excluded here - loadPersistedFields/
-// wireUpPersistence below work off .value, which doesn't reflect a
-// checkbox's checked state (its .value is always the fixed string "on"
-// regardless of whether it's checked), so "upscale" just resets to
-// unchecked on reload rather than silently persisting wrong.
 const PERSISTED_FIELDS = [
-  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'lora',
+  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'lora', 'upscaleMethod',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
@@ -424,7 +422,8 @@ async function runJob() {
   };
   const loraChoice = document.getElementById('lora').value;
   if (loraChoice) genInput.lora = loraChoice;
-  if (document.getElementById('upscale').checked) genInput.upscale = true;
+  const upscaleMethod = document.getElementById('upscaleMethod').value;
+  if (upscaleMethod !== 'none') genInput.upscale_method = upscaleMethod;
 
   // Session mode: a held-open worker is ready, so route through the job
   // queue instead of RunPod's own /run (which would spin up/reuse-by-luck
