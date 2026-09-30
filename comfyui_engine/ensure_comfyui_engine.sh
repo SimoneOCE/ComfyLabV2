@@ -14,12 +14,17 @@
 # reintroducing the exact GPU-mismatch risk the -arch=native/runtime-install
 # pattern exists to avoid.
 #
-# Proven on a live RunPod "ComfyUI - CUDA 13.0" pod (2026-09-30 session):
-# the pod's apt-installed CUDA toolkit is deliberately minimal
-# (cuda-minimal-build-13-0, no library dev headers) because PyTorch's own pip
-# wheel bundles its own copies under dist-packages/nvidia/*/include - so the
-# build fails with "fatal error: cusparse.h: No such file or directory"
-# unless CPATH is pointed at those bundled headers first.
+# The CPATH fix below was proven on a live RunPod "ComfyUI - CUDA 13.0" pod
+# (2026-09-30 session): its apt-installed CUDA toolkit was deliberately
+# minimal (no library dev headers) because PyTorch's own pip wheel bundles
+# its own copies of them - so the build fails with "fatal error: cusparse.h:
+# No such file or directory" unless CPATH is pointed at those bundled
+# headers first. That part of the pod's finding held up. What didn't: this
+# worker's actual GPU driver only supports up to CUDA 12.8, not 13.0 (the
+# pod's driver apparently was newer) - torch built for cu130 can't
+# initialize CUDA at all here, so everything downstream (torch, nvcc, the
+# CPATH search) is now pinned to the 12.8 line instead. See the Dockerfile's
+# FROM line for the full story on why and how nvcc itself is baked in.
 set -euo pipefail
 
 SAGEATTENTION_REPO_URL="https://github.com/thu-ml/SageAttention.git"
@@ -89,27 +94,22 @@ else
     export CPATH="${NVIDIA_INCLUDE_DIRS}:${CPATH:-}"
     echo "[comfylab-engine] CPATH set to: $CPATH"
 
-    # CPATH alone isn't enough - it only helps the compiler find headers.
-    # SageAttention's build (via torch.utils.cpp_extension) also needs
-    # CUDA_HOME to locate the nvcc compiler binary itself, which this pod's
-    # apt toolkit provided but nothing in this image does - PyTorch's pip
-    # wheel bundles CUDA *runtime* libraries, not the compiler toolchain.
-    # nvidia-cuda-nvcc is NVIDIA's own pip-installable nvcc, pinned to the
-    # 13.0.x line to match the pinned torch build (2.10.0+cu130) - installs
-    # into the same nvidia/cu13/ namespace dir the CPATH headers were just
-    # found under (verified by downloading and inspecting the wheel: nvcc
-    # lands at <site-packages>/nvidia/cu13/bin/nvcc).
-    pip install "nvidia-cuda-nvcc==13.0.88"
-
-    NVCC_PATH=$(find /usr/local/lib/python3.12/site-packages/nvidia/cu13/bin /usr/local/lib/python3.12/dist-packages/nvidia/cu13/bin -maxdepth 1 -type f -name nvcc 2>/dev/null | head -1; true)
-    if [ -z "$NVCC_PATH" ]; then
-        echo "[comfylab-engine] FATAL: nvcc not found after installing nvidia-cuda-nvcc - package layout may have changed." >&2
+    # nvcc itself (the compiler, not just headers) is baked into the
+    # Dockerfile now - CUDA_HOME/PATH are already set via ENV in the image
+    # (/usr/local/cuda-12.8). Earlier attempts tried pip-installing nvcc at
+    # runtime instead: nvidia-cuda-nvcc (CUDA 13.x line) works, but
+    # nvidia-cuda-nvcc-cu12 (the 12.x line, which is what this worker's
+    # driver actually needs) turns out to not ship an nvcc binary at all
+    # when its wheel is inspected directly - confirmed, not assumed.
+    # NVIDIA's apt packages don't have that inconsistency, and installing
+    # the compiler itself needs no GPU, so it belongs in the Dockerfile
+    # alongside everything else that's safe to bake in. Just verify it's
+    # actually where the image's ENV vars claim before relying on it.
+    if ! command -v nvcc >/dev/null 2>&1; then
+        echo "[comfylab-engine] FATAL: nvcc not found on PATH (expected \$CUDA_HOME/bin from the image's baked-in cuda-nvcc-12-8) - Dockerfile's CUDA toolkit install may have changed or failed silently." >&2
         exit 1
     fi
-    export CUDA_HOME
-    CUDA_HOME=$(dirname "$(dirname "$NVCC_PATH")")
-    export PATH="$CUDA_HOME/bin:$PATH"
-    echo "[comfylab-engine] CUDA_HOME set to: $CUDA_HOME"
+    echo "[comfylab-engine] Using nvcc: $(command -v nvcc) ($(nvcc --version | tail -1))"
 
     mkdir -p "$WHEEL_CACHE_DIR"
 
