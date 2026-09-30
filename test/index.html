@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ComfyLabV2 - Local Endpoint Test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; background: #111; color: #eee; }
+  h1 { font-size: 1.2rem; }
+  label { display: block; margin-top: 12px; font-size: 0.9rem; color: #aaa; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; font-family: inherit; }
+  textarea { min-height: 60px; }
+  button { margin-top: 16px; padding: 10px 20px; background: #4a7; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  #status { margin-top: 16px; white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; background: #1a1a1a; padding: 12px; border-radius: 4px; min-height: 40px; }
+  video { width: 100%; margin-top: 16px; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <h1>ComfyLabV2 - Local Endpoint Test</h1>
+  <p style="color:#888; font-size:0.85rem;">
+    POSTs a job directly to a deployed RunPod Serverless endpoint, bypassing the production website.
+    Endpoint ID and API key are kept only in this page's memory (not stored) - never commit real
+    credentials into this repo.
+  </p>
+
+  <label>RunPod Endpoint ID
+    <input id="endpointId" type="text" placeholder="e.g. abc123xyz" />
+  </label>
+  <label>RunPod API Key
+    <input id="apiKey" type="password" placeholder="rpa_..." />
+  </label>
+  <label>Prompt
+    <textarea id="prompt">a cat surfing a wave</textarea>
+  </label>
+  <label>Width <input id="width" type="number" value="1280" /></label>
+  <label>Height <input id="height" type="number" value="736" /></label>
+  <label>Duration (seconds) <input id="duration" type="number" value="7.29" step="0.01" /></label>
+  <label>Steps <input id="steps" type="number" value="20" /></label>
+
+  <button id="submitBtn" onclick="runJob()">Run Generation</button>
+
+  <div id="status"></div>
+  <video id="resultVideo" controls style="display:none;"></video>
+
+<script>
+async function runJob() {
+  const btn = document.getElementById('submitBtn');
+  const statusEl = document.getElementById('status');
+  const videoEl = document.getElementById('resultVideo');
+  videoEl.style.display = 'none';
+
+  const endpointId = document.getElementById('endpointId').value.trim();
+  const apiKey = document.getElementById('apiKey').value.trim();
+  if (!endpointId || !apiKey) {
+    statusEl.textContent = 'Endpoint ID and API key are required.';
+    return;
+  }
+
+  const payload = {
+    input: {
+      prompt: document.getElementById('prompt').value,
+      width: Number(document.getElementById('width').value),
+      height: Number(document.getElementById('height').value),
+      duration: Number(document.getElementById('duration').value),
+      steps: Number(document.getElementById('steps').value),
+    }
+  };
+
+  btn.disabled = true;
+  const startTime = Date.now();
+  statusEl.textContent = 'Submitting job...';
+
+  try {
+    const runResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify(payload),
+    });
+    const runData = await runResp.json();
+    if (!runData.id) {
+      statusEl.textContent = `Submit failed:\n${JSON.stringify(runData, null, 2)}`;
+      btn.disabled = false;
+      return;
+    }
+    const jobId = runData.id;
+    statusEl.textContent = `Job submitted: ${jobId}\nPolling...`;
+
+    while (true) {
+      await new Promise(r => setTimeout(r, 3000));
+      const statusResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/status/${jobId}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+      });
+      const statusData = await statusResp.json();
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      statusEl.textContent = `Job ${jobId} - status: ${statusData.status} (${elapsed}s elapsed)`;
+
+      if (statusData.status === 'COMPLETED') {
+        statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(statusData.output, null, 2)}`;
+        const videoKey = statusData.output && statusData.output.videoKey;
+        if (videoKey) {
+          statusEl.textContent += `\n\nNote: videoKey is an object key on the RunPod network volume's S3-compatible storage, not a direct URL - fetch it the same way the production site does (signed URL via its own backend, or the S3 endpoint directly with credentials).`;
+        }
+        break;
+      }
+      if (statusData.status === 'FAILED') {
+        statusEl.textContent += `\n\n${JSON.stringify(statusData, null, 2)}`;
+        break;
+      }
+    }
+  } catch (err) {
+    statusEl.textContent = `Error: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>

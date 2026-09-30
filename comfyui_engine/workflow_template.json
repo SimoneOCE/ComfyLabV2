@@ -1,0 +1,3 @@
+{
+  "_comment": "PLACEHOLDER - NOT A REAL WORKFLOW. Replace this entire file with the actual API-format export from ComfyUI (menu -> Export (API Format)), taken from the modular MiniMax H3 template with Patch Sage Attention wired in, on the proven RunPod CUDA 13.0 pod. handler.py's NODE_ID map below must then be updated to match the real node IDs in that export - this stub exists only so the repo's file layout and handler.py's patch logic are correct in shape ahead of that export landing."
+}
