@@ -5,6 +5,7 @@ import time
 import requests
 import os
 import json
+import shutil
 import uuid
 import boto3
 from botocore.client import Config
@@ -82,8 +83,8 @@ def ensure_comfyui_engine():
 def symlink_models_to_volume():
     """Points ComfyUI's normal models/{diffusion_models,text_encoders,vae}
     lookup paths at the volume-backed copies ensure_comfyui_engine.sh just
-    downloaded, instead of ComfyUI looking in its own (empty, ephemeral)
-    models/ dir baked into the image.
+    downloaded, instead of ComfyUI looking in its own (ephemeral) models/
+    dir baked into the image.
     """
     for subdir in ("diffusion_models", "text_encoders", "vae"):
         link_path = os.path.join(COMFYUI_DIR, "models", subdir)
@@ -91,7 +92,12 @@ def symlink_models_to_volume():
         if os.path.islink(link_path):
             continue
         if os.path.isdir(link_path):
-            os.rmdir(link_path)  # the empty dir ComfyUI ships with by default
+            # Not actually empty - ComfyUI ships a placeholder file in each
+            # of these (e.g. put_diffusion_model_files_here) to keep the
+            # directory tracked in git, so os.rmdir() (empty dirs only)
+            # fails with ENOTEMPTY. rmtree since it's being replaced by a
+            # symlink regardless of what's in it.
+            shutil.rmtree(link_path)
         os.makedirs(os.path.dirname(link_path), exist_ok=True)
         os.symlink(target_path, link_path)
         print(f"Symlinked {link_path} -> {target_path}")
