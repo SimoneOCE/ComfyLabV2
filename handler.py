@@ -851,17 +851,22 @@ def run_session(session_id):
 def handler(job):
     job_input = job["input"]
 
-    # Session mode: this one RunPod job IS the held-open worker for the
-    # named session - stays inside run_session() until the session ends.
+    # Session mode ONLY - this one RunPod job IS the held-open worker for
+    # the named session, and stays inside run_session() until the session
+    # ends. There is deliberately no classic one-shot fallback: a frontend-
+    # side check ("don't call /run without a session") is not a real
+    # boundary, since anyone holding the RunPod API key can send any job
+    # shape directly, bypassing whatever the test page's or website's own
+    # JS does or doesn't allow. The only enforcement that actually means
+    # anything lives here, in the one place that decides whether GPU work
+    # happens at all - a request with no session_id gets rejected outright,
+    # before touching ComfyUI or the GPU, rather than silently running a
+    # full generation for whoever sent it.
     session_id = job_input.get("session_id")
-    if session_id:
-        return run_session(session_id)
+    if not session_id:
+        return {"error": "This endpoint only accepts session-mode jobs (session_id required). Start a GPU session first."}
 
-    ensure_comfyui_engine()
-    symlink_models_to_volume()
-    start_comfyui_if_needed()
-
-    return run_generation(job_input)
+    return run_session(session_id)
 
 
 runpod.serverless.start({"handler": handler})

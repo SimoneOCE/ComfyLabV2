@@ -74,11 +74,12 @@
 
   <h2>GPU Session (held-open worker)</h2>
   <p style="color:#888; font-size:0.85rem;">
-    Optional. Starting a session holds one RunPod worker open across multiple generations instead of
-    each Run Generation cold-starting/reusing-by-luck - mirrors minimax-h3-worker's run_session pattern,
-    using its own comfylab_gpu_sessions/comfylab_active_gpu_sessions/comfylab_gpu_session_jobs tables
-    (same Supabase project, but isolated from the production billing tables - safe to use the public
-    anon key here). Leave this section empty to fall back to classic one-shot mode below.
+    Required. handler.py only accepts session-mode jobs now - there's no classic one-shot fallback,
+    enforced server-side so it can't be bypassed by skipping this page. Click Run GPU below, wait for
+    "Session ready", then Run Generation queues onto that held-open worker. Mirrors minimax-h3-worker's
+    run_session pattern, using its own comfylab_gpu_sessions/comfylab_active_gpu_sessions/
+    comfylab_gpu_session_jobs tables (same Supabase project, but isolated from the production billing
+    tables - safe to use the public anon key here).
   </p>
   <label>Supabase URL
     <input id="supabaseUrl" type="text" placeholder="https://xxxx.supabase.co" />
@@ -148,9 +149,11 @@ wireUpPersistence();
 // Mirrors minimax-h3-worker's server.js /api/session/start + GeneratorPanel.tsx's
 // direct-Supabase job insert/poll, but does both from right here in the
 // browser instead of through a backend - this test page has no server of
-// its own, and RUNPOD_API_KEY is already typed directly into this page for
-// the classic path anyway, so there's no new trust boundary crossed by
-// calling RunPod's /run for session_id from here too.
+// its own. RUNPOD_API_KEY typed into this page is the only way any job
+// (session-start included) reaches RunPod at all; handler.py's own
+// rejection of non-session jobs (see its handler() function) is the real
+// boundary against anyone using that key to run generation work outside
+// a held-open session, not anything this page's JS does or doesn't allow.
 let sessionId = null;
 let sessionReady = false;
 let sessionReconnectPollHandle = null;
@@ -453,59 +456,14 @@ async function runJob() {
     return;
   }
 
-  const endpointId = document.getElementById('endpointId').value.trim();
-  const apiKey = document.getElementById('apiKey').value.trim();
-  if (!endpointId || !apiKey) {
-    statusEl.textContent = 'Endpoint ID and API key are required.';
-    return;
-  }
-
-  const payload = { input: genInput };
-
-  btn.disabled = true;
-  const startTime = Date.now();
-  statusEl.textContent = 'Submitting job (classic one-shot mode)...';
-
-  try {
-    const runResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/run`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify(payload),
-    });
-    const runData = await runResp.json();
-    if (!runData.id) {
-      statusEl.textContent = `Submit failed:\n${JSON.stringify(runData, null, 2)}`;
-      btn.disabled = false;
-      return;
-    }
-    const jobId = runData.id;
-    statusEl.textContent = `Job submitted: ${jobId}\nPolling...`;
-
-    while (true) {
-      await new Promise(r => setTimeout(r, 3000));
-      const statusResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/status/${jobId}`, {
-        headers: { 'Authorization': `Bearer ${apiKey}` },
-      });
-      const statusData = await statusResp.json();
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      statusEl.textContent = `Job ${jobId} - status: ${statusData.status} (${elapsed}s elapsed)`;
-
-      if (statusData.status === 'COMPLETED') {
-        statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(statusData.output, null, 2)}`;
-        const videoKey = statusData.output && statusData.output.videoKey;
-        if (videoKey) await handleVideoKey(videoKey);
-        break;
-      }
-      if (statusData.status === 'FAILED') {
-        statusEl.textContent += `\n\n${JSON.stringify(statusData, null, 2)}`;
-        break;
-      }
-    }
-  } catch (err) {
-    statusEl.textContent = `Error: ${err.message}`;
-  } finally {
-    btn.disabled = false;
-  }
+  // No classic one-shot fallback here on purpose, and not just because the
+  // button could be disabled - handler.py itself now rejects any job
+  // without a session_id outright, before touching the GPU at all, so a
+  // classic /run call from here would just come back with that error.
+  // Real enforcement lives server-side (the one boundary that can't be
+  // bypassed by skipping this page's JS and hitting RunPod's API
+  // directly), not in what this button does or doesn't let you click.
+  statusEl.textContent = 'No active GPU session - click "Run GPU" first. This endpoint no longer accepts jobs without one.';
 }
 
 async function handleVideoKey(videoKey) {
