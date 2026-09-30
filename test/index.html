@@ -3,30 +3,35 @@
 <head>
 <meta charset="utf-8" />
 <title>ComfyLabV2 - Local Endpoint Test</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/aws-sdk/2.1691.0/aws-sdk.min.js"></script>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; background: #111; color: #eee; }
   h1 { font-size: 1.2rem; }
+  h2 { font-size: 0.95rem; color: #9c9; margin-top: 28px; border-top: 1px solid #333; padding-top: 16px; }
   label { display: block; margin-top: 12px; font-size: 0.9rem; color: #aaa; }
   input, textarea { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; font-family: inherit; }
   textarea { min-height: 60px; }
   button { margin-top: 16px; padding: 10px 20px; background: #4a7; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem; }
   button:disabled { background: #555; cursor: not-allowed; }
   #status { margin-top: 16px; white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; background: #1a1a1a; padding: 12px; border-radius: 4px; min-height: 40px; }
-  video { width: 100%; margin-top: 16px; border-radius: 4px; }
+  video { width: 100%; margin-top: 16px; border-radius: 4px; display: none; }
+  a.download-link { display: inline-block; margin-top: 12px; color: #4a7; }
 </style>
 </head>
 <body>
   <h1>ComfyLabV2 - Local Endpoint Test</h1>
   <p style="color:#888; font-size:0.85rem;">
     POSTs a job directly to a deployed RunPod Serverless endpoint, bypassing the production website.
-    Endpoint ID and API key are kept only in this page's memory (not stored) - never commit real
-    credentials into this repo.
+    All keys below stay only in this page's memory (not stored, not sent anywhere except RunPod's own
+    APIs) - never commit real credentials into this repo, and don't host this file publicly with keys
+    typed in.
   </p>
 
-  <label>RunPod Endpoint ID
+  <h2>RunPod Serverless</h2>
+  <label>Endpoint ID
     <input id="endpointId" type="text" placeholder="e.g. abc123xyz" />
   </label>
-  <label>RunPod API Key
+  <label>API Key
     <input id="apiKey" type="password" placeholder="rpa_..." />
   </label>
   <label>Prompt
@@ -37,17 +42,60 @@
   <label>Duration (seconds) <input id="duration" type="number" value="7.29" step="0.01" /></label>
   <label>Steps <input id="steps" type="number" value="20" /></label>
 
+  <h2>S3 credentials (to fetch the finished video)</h2>
+  <p style="color:#888; font-size:0.85rem;">
+    handler.py uploads the result to the network volume's S3-compatible storage and only returns its
+    key, not a URL - these are needed to turn that key into an actual downloadable/playable link.
+  </p>
+  <label>S3 Endpoint URL
+    <input id="s3Endpoint" type="text" value="https://s3api-eur-no-1.runpod.io" />
+  </label>
+  <label>Bucket (Network Volume ID)
+    <input id="s3Bucket" type="text" placeholder="e.g. z10ee344d9" />
+  </label>
+  <label>S3 Access Key
+    <input id="s3AccessKey" type="text" placeholder="user_..." />
+  </label>
+  <label>S3 Secret Key
+    <input id="s3SecretKey" type="password" placeholder="rps_..." />
+  </label>
+
   <button id="submitBtn" onclick="runJob()">Run Generation</button>
 
   <div id="status"></div>
-  <video id="resultVideo" controls style="display:none;"></video>
+  <video id="resultVideo" controls></video>
+  <div id="downloadLinkWrap"></div>
 
 <script>
+function getS3Client() {
+  return new AWS.S3({
+    endpoint: document.getElementById('s3Endpoint').value.trim(),
+    accessKeyId: document.getElementById('s3AccessKey').value.trim(),
+    secretAccessKey: document.getElementById('s3SecretKey').value.trim(),
+    s3ForcePathStyle: true,
+    signatureVersion: 'v4',
+    region: 'us-east-1', // required by the SDK, ignored by RunPod's S3-compatible endpoint
+  });
+}
+
+async function resolveVideoUrl(videoKey) {
+  const bucket = document.getElementById('s3Bucket').value.trim();
+  const s3 = getS3Client();
+  const url = s3.getSignedUrl('getObject', {
+    Bucket: bucket,
+    Key: `outputs/${videoKey}`,
+    Expires: 3600,
+  });
+  return url;
+}
+
 async function runJob() {
   const btn = document.getElementById('submitBtn');
   const statusEl = document.getElementById('status');
   const videoEl = document.getElementById('resultVideo');
+  const downloadWrap = document.getElementById('downloadLinkWrap');
   videoEl.style.display = 'none';
+  downloadWrap.innerHTML = '';
 
   const endpointId = document.getElementById('endpointId').value.trim();
   const apiKey = document.getElementById('apiKey').value.trim();
@@ -98,7 +146,21 @@ async function runJob() {
         statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(statusData.output, null, 2)}`;
         const videoKey = statusData.output && statusData.output.videoKey;
         if (videoKey) {
-          statusEl.textContent += `\n\nNote: videoKey is an object key on the RunPod network volume's S3-compatible storage, not a direct URL - fetch it the same way the production site does (signed URL via its own backend, or the S3 endpoint directly with credentials).`;
+          try {
+            const url = await resolveVideoUrl(videoKey);
+            statusEl.textContent += `\n\nResolved signed URL (valid 1hr) - see below.`;
+            videoEl.src = url;
+            videoEl.style.display = 'block';
+            const link = document.createElement('a');
+            link.href = url;
+            link.textContent = `Download ${videoKey}`;
+            link.className = 'download-link';
+            link.target = '_blank';
+            downloadWrap.appendChild(link);
+            statusEl.textContent += `\n\nNote: if the inline preview above stays blank, the S3 endpoint may not allow cross-origin video playback from this page - the download link below bypasses that (it's a direct navigation, not a fetch), so use it either way.`;
+          } catch (s3err) {
+            statusEl.textContent += `\n\nFailed to resolve S3 URL: ${s3err.message}\n(check S3 credentials/bucket fields above)`;
+          }
         }
         break;
       }
