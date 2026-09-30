@@ -36,19 +36,20 @@ VOLUME_MODELS_DIR = os.path.join(VOLUME_DIR, "models")
 
 OUTPUT_DIR = os.path.join(VOLUME_DIR, "outputs")
 
-S3_ACCESS_KEY = os.environ.get("RUNPOD_S3_ACCESS_KEY")
-S3_SECRET_KEY = os.environ.get("RUNPOD_S3_SECRET_KEY")
-S3_ENDPOINT = os.environ.get("RUNPOD_S3_ENDPOINT")
-S3_VOLUME_ID = os.environ.get("RUNPOD_VOLUME_ID")
-
-# boto3 defaults to us-east-1 when no region is given, but RunPod's
-# S3-compatible endpoint's SigV4 signing genuinely checks the region against
-# the datacenter the volume lives in - confirmed by a real upload failing
-# with "the region 'us-east-1' is wrong; expecting 'eur-no-1'". Derived from
-# the endpoint URL itself (s3api-<region>.runpod.io) rather than hardcoded,
-# so this doesn't silently break if this ever points at a volume in a
-# different datacenter.
-S3_REGION = S3_ENDPOINT.split("s3api-")[1].split(".runpod.io")[0] if S3_ENDPOINT else None
+# Wasabi (third-party S3-compatible storage), NOT RunPod's own S3-compatible
+# volume storage - that only exists in 15 specific datacenters (see RunPod's
+# docs), and EUR-IS-2 (the one datacenter with real RTX 5090 + CUDA 13.0
+# availability) isn't one of them, confirmed the hard way with a real
+# EndpointConnectionError against a guessed s3api-eur-is-2.runpod.io hostname
+# that doesn't even resolve. Wasabi decouples storage from whichever
+# datacenter the GPU worker happens to land in - the bucket lives in Wasabi's
+# own eu-west-1 (UK), picked as the shortest real network path from Iceland
+# (FARICE-1 submarine cable runs Iceland -> Scotland, backhauled to London).
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY")
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://s3.eu-west-1.wasabisys.com")
+S3_BUCKET = os.environ.get("S3_BUCKET", "comfylab-outputs")
+S3_REGION = os.environ.get("S3_REGION", "eu-west-1")
 
 s3_client = boto3.client(
     "s3",
@@ -229,7 +230,7 @@ def upload_result_and_get_key(raw_bytes, filename):
 
     content_type = "video/mp4" if ext == "mp4" else "application/octet-stream"
     key = f"outputs/{out_filename}"
-    s3_client.upload_file(filepath, S3_VOLUME_ID, key, ExtraArgs={"ContentType": content_type})
+    s3_client.upload_file(filepath, S3_BUCKET, key, ExtraArgs={"ContentType": content_type})
     return out_filename
 
 

@@ -44,20 +44,21 @@
 
   <h2>S3 credentials (to fetch the finished video)</h2>
   <p style="color:#888; font-size:0.85rem;">
-    handler.py uploads the result to the network volume's S3-compatible storage and only returns its
-    key, not a URL - these are needed to turn that key into an actual downloadable/playable link.
+    handler.py uploads the result to Wasabi (S3-compatible, third-party - decoupled from whichever
+    RunPod datacenter the GPU worker lands in) and only returns its key, not a URL - these are needed
+    to turn that key into an actual downloadable/playable link.
   </p>
   <label>S3 Endpoint URL
-    <input id="s3Endpoint" type="text" value="https://s3api-eur-is-2.runpod.io" />
+    <input id="s3Endpoint" type="text" value="https://s3.eu-west-1.wasabisys.com" />
   </label>
-  <label>Bucket (Network Volume ID)
-    <input id="s3Bucket" type="text" value="osu1oeb0v" />
+  <label>Bucket
+    <input id="s3Bucket" type="text" value="comfylab-outputs" />
   </label>
   <label>S3 Access Key
-    <input id="s3AccessKey" type="text" placeholder="user_..." />
+    <input id="s3AccessKey" type="text" placeholder="access key" />
   </label>
   <label>S3 Secret Key
-    <input id="s3SecretKey" type="password" placeholder="rps_..." />
+    <input id="s3SecretKey" type="password" placeholder="secret key" />
   </label>
 
   <button id="submitBtn" onclick="runJob()">Run Generation</button>
@@ -116,34 +117,30 @@ function getS3Client() {
     secretAccessKey: document.getElementById('s3SecretKey').value.trim(),
     s3ForcePathStyle: true,
     signatureVersion: 'v4',
-    // NOT ignored, despite what this comment used to claim - a real upload
-    // from handler.py failed with "the region 'us-east-1' is wrong;
-    // expecting 'eur-no-1'", proving RunPod's S3-compatible endpoint does
-    // check this against SigV4 signing. Derived from the endpoint URL
-    // (s3api-<region>.runpod.io) so it's never wrong regardless of which
-    // datacenter's volume this points at.
-    region: (document.getElementById('s3Endpoint').value.match(/s3api-([^.]+)\.runpod\.io/) || [])[1] || 'us-east-1',
+    // Wasabi's SigV4 signing checks this like any standard S3-compatible
+    // provider. Derived from the endpoint URL (s3.<region>.wasabisys.com)
+    // so it's never wrong regardless of which Wasabi region the bucket is in.
+    region: (document.getElementById('s3Endpoint').value.match(/s3\.([^.]+)\.wasabisys\.com/) || [])[1] || 'eu-west-1',
   });
 }
 
 async function resolveVideoUrl(videoKey) {
   const bucket = document.getElementById('s3Bucket').value.trim();
   const s3 = getS3Client();
-  // NOT getSignedUrl - confirmed via a real presigned URL (fully valid
-  // SigV4 query params, verified by inspection) still getting "AccessDenied:
-  // missing Authorization header" from RunPod's S3-compatible endpoint.
-  // That error, on an otherwise well-formed presigned URL, means this
-  // endpoint doesn't accept query-string SigV4 auth at all - only a real
-  // Authorization HEADER, which a browser can't attach to a plain
-  // navigation/<a href>/<video src> anyway. handler.py's own upload
-  // (boto3's normal upload_file, header-signed) never hit this because it
-  // was never a presigned URL to begin with.
-  // Fetching the actual bytes through the S3 client itself does sign with
-  // a header, so this works: pull the object down directly, then hand the
-  // browser a local blob: URL instead of a remote presigned one.
-  const data = await s3.getObject({ Bucket: bucket, Key: `outputs/${videoKey}` }).promise();
-  const blob = new Blob([data.Body], { type: data.ContentType || 'video/mp4' });
-  return URL.createObjectURL(blob);
+  // Plain presigned URL - unlike RunPod's own S3-compatible endpoint (which
+  // rejected query-string SigV4 auth entirely, confirmed by a real
+  // "AccessDenied: missing Authorization header" on an otherwise-valid
+  // presigned URL), Wasabi is a standard S3-compatible implementation and
+  // supports presigned GETs normally. A plain URL also sidesteps CORS
+  // entirely for <video src>/<a href> (the browser's own navigation/media
+  // fetch, not an XHR/fetch() call, so no preflight or Access-Control-*
+  // headers are needed) - simpler than pulling bytes through the SDK and
+  // wrapping them in a blob: URL, which was only ever a RunPod workaround.
+  return s3.getSignedUrl('getObject', {
+    Bucket: bucket,
+    Key: `outputs/${videoKey}`,
+    Expires: 3600,
+  });
 }
 
 async function runJob() {
@@ -222,18 +219,19 @@ async function handleVideoKey(videoKey) {
   const videoEl = document.getElementById('resultVideo');
   const downloadWrap = document.getElementById('downloadLinkWrap');
   try {
-    statusEl.textContent += `\n\nFetching video bytes through the S3 client (header-signed, not a presigned URL - see resolveVideoUrl's comment)...`;
+    statusEl.textContent += `\n\nResolving a presigned Wasabi URL (valid 1hr)...`;
     const url = await resolveVideoUrl(videoKey);
-    statusEl.textContent += `\n\nResolved local blob URL - see below.`;
+    statusEl.textContent += `\n\nResolved - see below.`;
     videoEl.src = url;
     videoEl.style.display = 'block';
     const link = document.createElement('a');
     link.href = url;
     link.textContent = `Download ${videoKey}`;
     link.className = 'download-link';
-    // download attribute (not target="_blank") - a blob: URL opened as a
-    // plain navigation just plays inline in a new tab since it has a real
-    // video content-type; this forces an actual Save-As instead.
+    // download attribute: browsers honor it for a same-origin/blob: URL, but
+    // for this cross-origin presigned URL most browsers just navigate to it
+    // instead (it'll still play/offer save via the browser's own video
+    // controls) - fine for a local debug tool, not worth blob-wrapping again.
     link.download = videoKey;
     downloadWrap.appendChild(link);
   } catch (s3err) {
