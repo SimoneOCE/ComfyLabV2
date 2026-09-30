@@ -89,6 +89,28 @@ else
     export CPATH="${NVIDIA_INCLUDE_DIRS}:${CPATH:-}"
     echo "[comfylab-engine] CPATH set to: $CPATH"
 
+    # CPATH alone isn't enough - it only helps the compiler find headers.
+    # SageAttention's build (via torch.utils.cpp_extension) also needs
+    # CUDA_HOME to locate the nvcc compiler binary itself, which this pod's
+    # apt toolkit provided but nothing in this image does - PyTorch's pip
+    # wheel bundles CUDA *runtime* libraries, not the compiler toolchain.
+    # nvidia-cuda-nvcc is NVIDIA's own pip-installable nvcc, pinned to the
+    # 13.0.x line to match the pinned torch build (2.10.0+cu130) - installs
+    # into the same nvidia/cu13/ namespace dir the CPATH headers were just
+    # found under (verified by downloading and inspecting the wheel: nvcc
+    # lands at <site-packages>/nvidia/cu13/bin/nvcc).
+    pip install "nvidia-cuda-nvcc==13.0.88"
+
+    NVCC_PATH=$(find /usr/local/lib/python3.12/site-packages/nvidia/cu13/bin /usr/local/lib/python3.12/dist-packages/nvidia/cu13/bin -maxdepth 1 -type f -name nvcc 2>/dev/null | head -1; true)
+    if [ -z "$NVCC_PATH" ]; then
+        echo "[comfylab-engine] FATAL: nvcc not found after installing nvidia-cuda-nvcc - package layout may have changed." >&2
+        exit 1
+    fi
+    export CUDA_HOME
+    CUDA_HOME=$(dirname "$(dirname "$NVCC_PATH")")
+    export PATH="$CUDA_HOME/bin:$PATH"
+    echo "[comfylab-engine] CUDA_HOME set to: $CUDA_HOME"
+
     mkdir -p "$WHEEL_CACHE_DIR"
 
     # --no-build-isolation: pip's isolated build sandbox can't see the
