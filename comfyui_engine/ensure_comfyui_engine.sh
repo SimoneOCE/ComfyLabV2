@@ -160,7 +160,7 @@ echo "[comfylab-engine] Verifying the install (from outside any SageAttention so
 (cd /tmp && python3 -c "import sageattention; print(sageattention)")
 
 echo "[comfylab-engine] Ensuring MiniMax H3 model files are present on the volume..."
-mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae" "$MODELS_DIR/loras"
+mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae" "$MODELS_DIR/loras" "$MODELS_DIR/upscale_models"
 
 # HF_TOKEN is optional - Comfy-Org/MiniMax-H3 is a public repo (verified:
 # HTTP 200 with zero credentials), so this isn't required for these specific
@@ -208,5 +208,10 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/va
 # koboldcpp/stable-diffusion.cpp handled it.
 download_if_missing "https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora/resolve/main/minimax_h3_turbo_4step_ema_ckpt500.safetensors" "$MODELS_DIR/loras" "minimax_h3_turbo_ema_ckpt500.safetensors"
 download_if_missing "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v0.1.safetensors" "$MODELS_DIR/loras" "minimax_h3_lightx2v_turbo.safetensors"
+
+# Real-ESRGAN 4x upscale model - see handler.py's UPSCALE_MODEL comment.
+# wget follows the GitHub releases redirect (-L equivalent is wget's
+# default behavior) to the real signed asset URL.
+download_if_missing "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" "$MODELS_DIR/upscale_models"
 
 echo "[comfylab-engine] Done. Engine + models ready on volume."

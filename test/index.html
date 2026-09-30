@@ -41,6 +41,17 @@
   <label>Height <input id="height" type="number" value="736" /></label>
   <label>Duration (seconds) <input id="duration" type="number" value="7.29" step="0.01" /></label>
   <label>Steps <input id="steps" type="number" value="20" /></label>
+  <label>LoRA
+    <select id="lora">
+      <option value="">None</option>
+      <option value="turbo">Turbo</option>
+      <option value="fast">Fast</option>
+    </select>
+  </label>
+  <label style="display:flex; align-items:center; gap:8px;">
+    <input id="upscale" type="checkbox" style="width:auto; margin-top:0;" />
+    Real-ESRGAN upscale (submits twice - status log will show base_seconds/upscale_seconds separately)
+  </label>
 
   <h2>S3 credentials (to fetch the finished video)</h2>
   <p style="color:#888; font-size:0.85rem;">
@@ -100,8 +111,13 @@
 // Wrapped in try/catch: file:// pages sometimes block or reset storage
 // depending on the browser, and this is a convenience, not something the
 // page depends on to function.
+// Checkboxes deliberately excluded here - loadPersistedFields/
+// wireUpPersistence below work off .value, which doesn't reflect a
+// checkbox's checked state (its .value is always the fixed string "on"
+// regardless of whether it's checked), so "upscale" just resets to
+// unchecked on reload rather than silently persisting wrong.
 const PERSISTED_FIELDS = [
-  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps',
+  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'lora',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
@@ -403,6 +419,9 @@ async function runJob() {
     duration: Number(document.getElementById('duration').value),
     steps: Number(document.getElementById('steps').value),
   };
+  const loraChoice = document.getElementById('lora').value;
+  if (loraChoice) genInput.lora = loraChoice;
+  if (document.getElementById('upscale').checked) genInput.upscale = true;
 
   // Session mode: a held-open worker is ready, so route through the job
   // queue instead of RunPod's own /run (which would spin up/reuse-by-luck
