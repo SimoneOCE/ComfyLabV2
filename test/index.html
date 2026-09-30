@@ -51,7 +51,7 @@
     <input id="s3Endpoint" type="text" value="https://s3api-eur-no-1.runpod.io" />
   </label>
   <label>Bucket (Network Volume ID)
-    <input id="s3Bucket" type="text" placeholder="e.g. z10ee344d9" />
+    <input id="s3Bucket" type="text" value="z10ee344d9" />
   </label>
   <label>S3 Access Key
     <input id="s3AccessKey" type="text" placeholder="user_..." />
@@ -67,6 +67,38 @@
   <div id="downloadLinkWrap"></div>
 
 <script>
+// Remembers every field's last value in this browser only (localStorage),
+// so you don't have to retype endpoint ID/API key/S3 creds on every reload.
+// Wrapped in try/catch: file:// pages sometimes block or reset storage
+// depending on the browser, and this is a convenience, not something the
+// page depends on to function.
+const PERSISTED_FIELDS = [
+  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps',
+  's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
+];
+
+function loadPersistedFields() {
+  try {
+    for (const id of PERSISTED_FIELDS) {
+      const saved = localStorage.getItem(`comfylab_${id}`);
+      if (saved !== null) document.getElementById(id).value = saved;
+    }
+  } catch (e) { /* storage unavailable - fields just start blank/default */ }
+}
+
+function wireUpPersistence() {
+  try {
+    for (const id of PERSISTED_FIELDS) {
+      document.getElementById(id).addEventListener('input', (e) => {
+        try { localStorage.setItem(`comfylab_${id}`, e.target.value); } catch (e2) {}
+      });
+    }
+  } catch (e) { /* storage unavailable */ }
+}
+
+loadPersistedFields();
+wireUpPersistence();
+
 function getS3Client() {
   return new AWS.S3({
     endpoint: document.getElementById('s3Endpoint').value.trim(),
