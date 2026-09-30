@@ -41,11 +41,21 @@ S3_SECRET_KEY = os.environ.get("RUNPOD_S3_SECRET_KEY")
 S3_ENDPOINT = os.environ.get("RUNPOD_S3_ENDPOINT")
 S3_VOLUME_ID = os.environ.get("RUNPOD_VOLUME_ID")
 
+# boto3 defaults to us-east-1 when no region is given, but RunPod's
+# S3-compatible endpoint's SigV4 signing genuinely checks the region against
+# the datacenter the volume lives in - confirmed by a real upload failing
+# with "the region 'us-east-1' is wrong; expecting 'eur-no-1'". Derived from
+# the endpoint URL itself (s3api-<region>.runpod.io) rather than hardcoded,
+# so this doesn't silently break if this ever points at a volume in a
+# different datacenter.
+S3_REGION = S3_ENDPOINT.split("s3api-")[1].split(".runpod.io")[0] if S3_ENDPOINT else None
+
 s3_client = boto3.client(
     "s3",
     endpoint_url=S3_ENDPOINT,
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY,
+    region_name=S3_REGION,
     config=Config(signature_version="s3v4"),
 )
 

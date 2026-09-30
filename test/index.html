@@ -106,7 +106,13 @@ function getS3Client() {
     secretAccessKey: document.getElementById('s3SecretKey').value.trim(),
     s3ForcePathStyle: true,
     signatureVersion: 'v4',
-    region: 'us-east-1', // required by the SDK, ignored by RunPod's S3-compatible endpoint
+    // NOT ignored, despite what this comment used to claim - a real upload
+    // from handler.py failed with "the region 'us-east-1' is wrong;
+    // expecting 'eur-no-1'", proving RunPod's S3-compatible endpoint does
+    // check this against SigV4 signing. Derived from the endpoint URL
+    // (s3api-<region>.runpod.io) so it's never wrong regardless of which
+    // datacenter's volume this points at.
+    region: (document.getElementById('s3Endpoint').value.match(/s3api-([^.]+)\.runpod\.io/) || [])[1] || 'us-east-1',
   });
 }
 
