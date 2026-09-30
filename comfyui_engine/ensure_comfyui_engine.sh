@@ -71,7 +71,17 @@ else
     # dist-packages instead) - hardcoding one guessed wrong here once
     # already (this image's python:3.12-slim base uses site-packages, not
     # the pod's dist-packages), so search both instead of assuming.
-    NVIDIA_INCLUDE_DIRS=$(find /usr/local/lib/python3.12/site-packages/nvidia /usr/local/lib/python3.12/dist-packages/nvidia -maxdepth 2 -type d -name include 2>/dev/null | paste -sd: -)
+    #
+    # The trailing `; true` is load-bearing under `set -euo pipefail`: find
+    # exits non-zero when a starting path doesn't exist (exactly one of the
+    # two won't, on any given image), and that non-zero status would
+    # otherwise propagate through the pipe to paste and abort the whole
+    # script right here - silently, before the -z check below ever runs,
+    # which is exactly what happened on the previous attempt (the script
+    # died with no FATAL message printed at all). `; true` resets the
+    # command substitution's own exit status to 0 regardless, while still
+    # capturing whatever real output find did produce.
+    NVIDIA_INCLUDE_DIRS=$(find /usr/local/lib/python3.12/site-packages/nvidia /usr/local/lib/python3.12/dist-packages/nvidia -maxdepth 2 -type d -name include 2>/dev/null | paste -sd: -; true)
     if [ -z "$NVIDIA_INCLUDE_DIRS" ]; then
         echo "[comfylab-engine] FATAL: could not find PyTorch's bundled nvidia/*/include dirs under dist-packages - CPATH fix has nothing to point at. Toolkit layout may have changed." >&2
         exit 1
