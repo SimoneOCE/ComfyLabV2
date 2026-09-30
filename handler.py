@@ -842,12 +842,17 @@ def run_session(session_id):
         finish_job(job_row["id"], result)
         jobs_processed += 1
 
-        if result.get("force_killed"):
-            # ComfyUI is genuinely down now, not just idle - restart and
-            # re-warm right away rather than waiting for the next job to
-            # discover it's dead, same reasoning as minimax-h3-worker's
-            # force-kill handling.
-            print(f"Session {session_id}: ComfyUI was force-killed - restarting and re-warming.")
+        # Two separate ways ComfyUI can be down after a job: we killed it
+        # ourselves (force_killed), or it crashed on its own - a real run
+        # hit this via what looked like an OOM mid-upscale (ComfyUI's HTTP
+        # server itself stopped responding, not a clean in-graph error).
+        # Without this check, an unplanned crash left every later job in
+        # the session failing the same way forever, since nothing else
+        # here ever re-checks whether ComfyUI is still alive between jobs.
+        needs_restart = result.get("force_killed") or (result.get("error") and not is_comfyui_ready())
+        if needs_restart:
+            reason = "force-killed" if result.get("force_killed") else "crashed unexpectedly"
+            print(f"Session {session_id}: ComfyUI {reason} - restarting and re-warming.")
             try:
                 start_comfyui_if_needed()
                 run_generation({
@@ -858,7 +863,7 @@ def run_session(session_id):
                     "steps": 1,
                 })
             except Exception as e:
-                print(f"Session {session_id}: failed to restart after force-kill ({e}) - ending session.")
+                print(f"Session {session_id}: failed to restart after ComfyUI {reason} ({e}) - ending session.")
                 mark_session_ended(session_id, "error")
                 return session_summary("worker_error", last_error=str(e))
 
