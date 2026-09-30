@@ -428,7 +428,18 @@ async function runJob() {
   // a SEPARATE worker rather than reach the one already held open for
   // this session - see comfylab_gpu_session_jobs/claim_next_queued_job in
   // handler.py).
-  if (sessionId && sessionReady) {
+  if (sessionId) {
+    // A session claims the worker for its whole lifetime - falling through
+    // to the classic /run call below while one exists (even one that's
+    // still starting) would spin up a SECOND, separate RunPod job instead
+    // of using the held-open one, wasting a worker. Block here instead,
+    // same as production's GeneratorPanel.tsx (if (!currentSession.
+    // workerReady) { ...; return; }) - don't queue early either, since
+    // this test page has no realtime push to notice readiness mid-wait.
+    if (!sessionReady) {
+      statusEl.textContent = 'GPU session is still starting - wait for "Session ready" before generating.';
+      return;
+    }
     btn.disabled = true;
     statusEl.textContent = 'Queuing job on held-open session worker...';
     try {
