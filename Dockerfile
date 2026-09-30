@@ -31,7 +31,7 @@ ARG KJNODES_COMMIT=d3cfe21625e5170126ce06fbfcfe1d88108688c3
 WORKDIR /opt/comfylab
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ca-certificates \
+    git curl wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ComfyUI itself

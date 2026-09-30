@@ -32,6 +32,14 @@ VOLUME_DIR="${1:?usage: ensure_comfyui_engine.sh <persistent-volume-dir> <comfyu
 COMFYUI_DIR="${2:?usage: ensure_comfyui_engine.sh <persistent-volume-dir> <comfyui-dir>}"
 
 MARKER_FILE="$VOLUME_DIR/.comfylab_engine_ready"
+# The actual built wheel is cached here, on the volume - NOT just a marker.
+# `pip install` writes into this container's own local site-packages, which
+# is ephemeral (gone the moment this worker's container is replaced), so a
+# marker file alone would make every worker AFTER the first one skip the
+# build (marker already exists) while never actually having SageAttention
+# installed. Caching the real wheel here lets every worker boot do a fast
+# local install (no compilation) from it instead.
+WHEEL_CACHE_DIR="$VOLUME_DIR/sageattention_wheel"
 # Deliberately NOT $COMFYUI_DIR/models - COMFYUI_DIR is inside the image's
 # own container filesystem (ComfyUI is baked into the Dockerfile), which
 # doesn't survive past this worker's lifetime. Model weights (~40GB) go on
@@ -48,15 +56,22 @@ fi
 nvidia-smi -L
 
 if [ -f "$MARKER_FILE" ]; then
-    echo "[comfylab-engine] Marker found at $MARKER_FILE - engine already installed on this volume, skipping build."
+    echo "[comfylab-engine] Marker found at $MARKER_FILE - wheel already built on this volume, skipping the build step."
 else
-    echo "[comfylab-engine] First run on this volume - installing SageAttention from source..."
+    echo "[comfylab-engine] First run on this volume - building the SageAttention wheel from source..."
 
     # PyTorch's pip wheel bundles its own copies of the CUDA library headers
     # (cusparse.h etc.) under dist-packages/nvidia/*/include - this pod's
     # apt toolkit doesn't ship them itself, so nvcc can't find them without
     # this.
-    NVIDIA_INCLUDE_DIRS=$(find /usr/local/lib/python3.12/dist-packages/nvidia -maxdepth 2 -type d -name include 2>/dev/null | paste -sd: -)
+    # Searches both site-packages and dist-packages: which one pip installs
+    # into depends on how Python itself was installed (upstream python.org
+    # builds use site-packages; Debian/Ubuntu's apt-installed python3, which
+    # is what the original proven pod used, patches pip to use
+    # dist-packages instead) - hardcoding one guessed wrong here once
+    # already (this image's python:3.12-slim base uses site-packages, not
+    # the pod's dist-packages), so search both instead of assuming.
+    NVIDIA_INCLUDE_DIRS=$(find /usr/local/lib/python3.12/site-packages/nvidia /usr/local/lib/python3.12/dist-packages/nvidia -maxdepth 2 -type d -name include 2>/dev/null | paste -sd: -)
     if [ -z "$NVIDIA_INCLUDE_DIRS" ]; then
         echo "[comfylab-engine] FATAL: could not find PyTorch's bundled nvidia/*/include dirs under dist-packages - CPATH fix has nothing to point at. Toolkit layout may have changed." >&2
         exit 1
@@ -64,20 +79,32 @@ else
     export CPATH="${NVIDIA_INCLUDE_DIRS}:${CPATH:-}"
     echo "[comfylab-engine] CPATH set to: $CPATH"
 
-    pip uninstall -y sageattention >/dev/null 2>&1 || true
+    mkdir -p "$WHEEL_CACHE_DIR"
 
     # --no-build-isolation: pip's isolated build sandbox can't see the
     # already-installed torch, which SageAttention's build needs to detect
     # the GPU arch and link against.
-    pip install --no-build-isolation "git+${SAGEATTENTION_REPO_URL}@${SAGEATTENTION_COMMIT}" \
+    # `pip wheel` (not `pip install`) - builds the .whl into WHEEL_CACHE_DIR
+    # without installing it into this container's local site-packages,
+    # which is what actually gets cached on the volume for every future
+    # worker boot to install from (see WHEEL_CACHE_DIR's comment above).
+    pip wheel --no-build-isolation -w "$WHEEL_CACHE_DIR" "git+${SAGEATTENTION_REPO_URL}@${SAGEATTENTION_COMMIT}" \
         2>&1 | tee /tmp/sageattention_build.log
 
-    echo "[comfylab-engine] Verifying the install (from outside any SageAttention source clone, to avoid picking up its own sageattention/ subfolder instead of the installed package)..."
-    (cd /tmp && python3 -c "import sageattention; print(sageattention)")
-
     touch "$MARKER_FILE"
-    echo "[comfylab-engine] SageAttention build OK, marker written to $MARKER_FILE."
+    echo "[comfylab-engine] SageAttention wheel built OK, cached at $WHEEL_CACHE_DIR, marker written to $MARKER_FILE."
 fi
+
+# Runs on every boot, not just the first - a fast local install (no
+# compilation, no network) from the cached wheel into this specific
+# container's own site-packages, since that's ephemeral and doesn't survive
+# from whichever worker did the original build.
+echo "[comfylab-engine] Installing SageAttention from the cached wheel..."
+pip uninstall -y sageattention >/dev/null 2>&1 || true
+pip install --no-index --find-links "$WHEEL_CACHE_DIR" sageattention
+
+echo "[comfylab-engine] Verifying the install (from outside any SageAttention source clone, to avoid picking up its own sageattention/ subfolder instead of the installed package)..."
+(cd /tmp && python3 -c "import sageattention; print(sageattention)")
 
 echo "[comfylab-engine] Ensuring MiniMax H3 model files are present on the volume..."
 mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae"
