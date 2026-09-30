@@ -15,13 +15,18 @@
 # persistent RunPod network volume by ensure_comfyui_engine.sh.
 FROM python:3.12-slim
 
-# Pinned to the exact commits confirmed on the proven RunPod "ComfyUI -
-# CUDA 13.0" pod (2026-09-30 session) - floating on a branch tip means a
-# future rebuild can silently pull a different (or broken) ComfyUI/KJNodes
-# version with no record of what changed, same reason SageAttention's build
-# commit is pinned below.
-ARG COMFYUI_COMMIT=700a8f6669607a599c1834723f4c006418b5e3fe
-ARG KJNODES_COMMIT=a3250418d58d81aada1826aecaa4ccfce9963def
+# NOT the commits `git rev-parse HEAD` reported on the proven RunPod pod -
+# those (700a8f66.../a3250418...) turned out to be unreachable in the real
+# public repos ("fatal: unable to read tree", confirmed via a real build
+# failure), meaning RunPod's pod template bakes in its own fork/rebuild
+# rather than a plain clone of upstream. Pinned instead to each repo's real
+# current HEAD (verified by cloning both directly and confirming the exact
+# node classes this workflow needs - ComfyMathExpression/MiniMaxH3ImageToVideo/
+# ResolutionSelector/SaveVideo in ComfyUI, PathchSageAttentionKJ in KJNodes -
+# actually exist at these commits), which is the closest available
+# reproduction of the proven pod's behavior.
+ARG COMFYUI_COMMIT=fb2315f11db0ebfaafa9099a5df5227dc6bb42bc
+ARG KJNODES_COMMIT=d3cfe21625e5170126ce06fbfcfe1d88108688c3
 
 WORKDIR /opt/comfylab
 
