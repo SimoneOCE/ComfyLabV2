@@ -567,6 +567,22 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
         if base_result.get("cancelled"):
             return {"cancelled": True}
 
+        # Frees the diffusion model/VAE/text encoder's VRAM (unload_models
+        # only, NOT free_memory - that second flag calls ComfyUI's own
+        # PromptExecutor.reset(), which replaces the whole node-output
+        # cache and would defeat the cache-hit trick above entirely;
+        # unload_models alone only evicts model weights via
+        # comfy.model_management.unload_all_models(), a separate subsystem
+        # from the node cache, verified by reading both directly). A real
+        # run OOM'd/crashed ComfyUI's whole process running the upscale
+        # tail while the full base-pass model stack was still resident -
+        # this clears that VRAM right before the upscale pass needs its
+        # own working memory for tiled 4x inference across every frame.
+        try:
+            requests.post(f"{COMFYUI_URL}/free", json={"unload_models": True}, timeout=15)
+        except requests.exceptions.RequestException as e:
+            print(f"Could not free VRAM before upscale pass: {e}")
+
         resolved_input = {**job_input, **resolved}
         upscale_workflow, _ = build_prompt_payload(resolved_input, include_upscale=True)
         upscale_start = time.time()
