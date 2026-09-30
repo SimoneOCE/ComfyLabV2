@@ -19,12 +19,17 @@
 # minimal (no library dev headers) because PyTorch's own pip wheel bundles
 # its own copies of them - so the build fails with "fatal error: cusparse.h:
 # No such file or directory" unless CPATH is pointed at those bundled
-# headers first. That part of the pod's finding held up. What didn't: this
-# worker's actual GPU driver only supports up to CUDA 12.8, not 13.0 (the
-# pod's driver apparently was newer) - torch built for cu130 can't
-# initialize CUDA at all here, so everything downstream (torch, nvcc, the
-# CPATH search) is now pinned to the 12.8 line instead. See the Dockerfile's
-# FROM line for the full story on why and how nvcc itself is baked in.
+# headers first.
+#
+# This session briefly ran on cu128 instead of cu130 (this worker's driver
+# didn't support cu130 until the endpoint's CUDA Version floor was raised to
+# 13.0) - now reverted back to cu130 to match the endpoint and the proven
+# pod. See the Dockerfile's FROM line for that full story. The marker file
+# and wheel cache below are deliberately CUDA-version-scoped so that
+# reverting doesn't silently install into torch cu130 a wheel that was
+# actually compiled against cu128's ABI - a real, not cosmetic, mismatch
+# risk that a bare marker file would have hidden completely on any volume
+# that already has a cached build from before this change.
 set -euo pipefail
 
 SAGEATTENTION_REPO_URL="https://github.com/thu-ml/SageAttention.git"
@@ -36,7 +41,23 @@ SAGEATTENTION_COMMIT="d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
 VOLUME_DIR="${1:?usage: ensure_comfyui_engine.sh <persistent-volume-dir> <comfyui-dir>}"
 COMFYUI_DIR="${2:?usage: ensure_comfyui_engine.sh <persistent-volume-dir> <comfyui-dir>}"
 
-MARKER_FILE="$VOLUME_DIR/.comfylab_engine_ready"
+# Scopes the marker/wheel cache to the actual torch CUDA build baked into
+# THIS image, derived at runtime rather than hardcoded - so switching CUDA
+# versions (as already happened once this session, cu128 -> cu130) can never
+# silently reuse a wheel compiled against a different torch ABI. A wrong
+# match here wouldn't necessarily fail loudly; it could just run with the
+# wrong kernel or crash confusingly deep inside a generation. Old
+# differently-scoped markers/wheel dirs from a prior CUDA version are simply
+# never looked at again - harmless leftover, not cleaned up automatically,
+# but never a correctness risk either.
+TORCH_CUDA_TAG=$(python3 -c "import torch; print(torch.version.cuda)")
+if [ -z "$TORCH_CUDA_TAG" ] || [ "$TORCH_CUDA_TAG" = "None" ]; then
+    echo "[comfylab-engine] FATAL: could not determine torch's CUDA version (torch.version.cuda) - cannot safely scope the wheel cache." >&2
+    exit 1
+fi
+echo "[comfylab-engine] Torch CUDA build: $TORCH_CUDA_TAG"
+
+MARKER_FILE="$VOLUME_DIR/.comfylab_engine_ready_cu${TORCH_CUDA_TAG}"
 # The actual built wheel is cached here, on the volume - NOT just a marker.
 # `pip install` writes into this container's own local site-packages, which
 # is ephemeral (gone the moment this worker's container is replaced), so a
@@ -44,7 +65,7 @@ MARKER_FILE="$VOLUME_DIR/.comfylab_engine_ready"
 # build (marker already exists) while never actually having SageAttention
 # installed. Caching the real wheel here lets every worker boot do a fast
 # local install (no compilation) from it instead.
-WHEEL_CACHE_DIR="$VOLUME_DIR/sageattention_wheel"
+WHEEL_CACHE_DIR="$VOLUME_DIR/sageattention_wheel_cu${TORCH_CUDA_TAG}"
 # Deliberately NOT $COMFYUI_DIR/models - COMFYUI_DIR is inside the image's
 # own container filesystem (ComfyUI is baked into the Dockerfile), which
 # doesn't survive past this worker's lifetime. Model weights (~40GB) go on
@@ -96,17 +117,17 @@ else
 
     # nvcc itself (the compiler, not just headers) is baked into the
     # Dockerfile now - CUDA_HOME/PATH are already set via ENV in the image
-    # (/usr/local/cuda-12.8). Earlier attempts tried pip-installing nvcc at
+    # (/usr/local/cuda-13.0). Earlier attempts tried pip-installing nvcc at
     # runtime instead: nvidia-cuda-nvcc (CUDA 13.x line) works, but
-    # nvidia-cuda-nvcc-cu12 (the 12.x line, which is what this worker's
-    # driver actually needs) turns out to not ship an nvcc binary at all
-    # when its wheel is inspected directly - confirmed, not assumed.
-    # NVIDIA's apt packages don't have that inconsistency, and installing
-    # the compiler itself needs no GPU, so it belongs in the Dockerfile
-    # alongside everything else that's safe to bake in. Just verify it's
-    # actually where the image's ENV vars claim before relying on it.
+    # nvidia-cuda-nvcc-cu12 (the 12.x line) turns out to not ship an nvcc
+    # binary at all when its wheel is inspected directly - confirmed, not
+    # assumed, back when this was briefly on cu128. NVIDIA's apt packages
+    # don't have that inconsistency, and installing the compiler itself
+    # needs no GPU, so it belongs in the Dockerfile alongside everything
+    # else that's safe to bake in. Just verify it's actually where the
+    # image's ENV vars claim before relying on it.
     if ! command -v nvcc >/dev/null 2>&1; then
-        echo "[comfylab-engine] FATAL: nvcc not found on PATH (expected \$CUDA_HOME/bin from the image's baked-in cuda-nvcc-12-8) - Dockerfile's CUDA toolkit install may have changed or failed silently." >&2
+        echo "[comfylab-engine] FATAL: nvcc not found on PATH (expected \$CUDA_HOME/bin from the image's baked-in cuda-nvcc-13-0) - Dockerfile's CUDA toolkit install may have changed or failed silently." >&2
         exit 1
     fi
     echo "[comfylab-engine] Using nvcc: $(command -v nvcc) ($(nvcc --version | tail -1))"
