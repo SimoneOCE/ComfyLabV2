@@ -209,9 +209,10 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/va
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
 
-# Real-ESRGAN 4x upscale model - see handler.py's UPSCALE_MODEL comment.
-# wget follows the GitHub releases redirect (-L equivalent is wget's
-# default behavior) to the real signed asset URL.
-download_if_missing "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" "$MODELS_DIR/upscale_models"
+# Real-ESRGAN 2x upscale model - see handler.py's UPSCALE_MODEL comment
+# for why 2x, not 4x (system-RAM OOM + runtime, verified against
+# ComfyUI's own source). wget follows the GitHub releases redirect (-L
+# equivalent is wget's default behavior) to the real signed asset URL.
+download_if_missing "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth" "$MODELS_DIR/upscale_models"
 
 echo "[comfylab-engine] Done. Engine + models ready on volume."

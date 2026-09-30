@@ -125,16 +125,26 @@ LORA_CHOICES = {
     },
 }
 
-# Real-ESRGAN's flagship 4x model, verified as a real, resolving GitHub
-# release asset (xinntao/Real-ESRGAN v0.1.0) before wiring it in - not
-# guessed at. NVIDIA's newer upscaler is a planned follow-up once this one
-# is proven; swapping it in later only means changing this filename/url
-# and re-running ensure_comfyui_engine.sh's download, the node mechanism
-# (UpscaleModelLoader + ImageUpscaleWithModel) stays the same for any
-# spandrel-supported architecture.
+# Real-ESRGAN's 2x model, verified as a real, resolving GitHub release
+# asset (xinntao/Real-ESRGAN v0.2.1) before wiring it in - not guessed at.
+# Not the 4x model: ComfyUI's ImageUpscaleWithModel accumulates its whole
+# output tensor - every frame of the video at once - on
+# comfy.model_management.intermediate_device(), which is system RAM
+# (CPU), not VRAM, unless ComfyUI is started with --gpu-only (confirmed
+# in comfy/model_management.py). At 4x that's 16x the source video's
+# pixel volume held in RAM simultaneously, which is what was OOM-killing
+# the container even on a 141GB-RAM machine, and why it was slow (every
+# frame tiled at the heavier 4x cost before anything returns). 2x cuts
+# that to 4x the source pixel volume - a real, verified reduction, and it
+# matches koboldcpp's own proven default (upscaling_resize=2 on the same
+# ESRGAN family). NVIDIA's newer upscaler is a planned follow-up once this
+# one is proven; swapping it in later only means changing this
+# filename/url and re-running ensure_comfyui_engine.sh's download, the
+# node mechanism (UpscaleModelLoader + ImageUpscaleWithModel) stays the
+# same for any spandrel-supported architecture.
 UPSCALE_MODEL = {
-    "filename": "RealESRGAN_x4plus.pth",
-    "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+    "filename": "RealESRGAN_x2plus.pth",
+    "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
 }
 
 comfyui_process = None
