@@ -141,6 +141,17 @@ echo "[comfylab-engine] Verifying the install (from outside any SageAttention so
 echo "[comfylab-engine] Ensuring MiniMax H3 model files are present on the volume..."
 mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae"
 
+# HF_TOKEN is optional - Comfy-Org/MiniMax-H3 is a public repo (verified:
+# HTTP 200 with zero credentials), so this isn't required for these specific
+# files to download. It's here as a defensive measure in case anonymous
+# downloads ever get rate-limited/throttled differently than authenticated
+# ones - set the HF_TOKEN env var on the endpoint if that turns out to
+# matter; wget just won't send the header at all if it's unset.
+HF_AUTH_HEADER=()
+if [ -n "${HF_TOKEN:-}" ]; then
+    HF_AUTH_HEADER=(--header="Authorization: Bearer ${HF_TOKEN}")
+fi
+
 download_if_missing() {
     local url="$1"
     local dest_dir="$2"
@@ -150,7 +161,14 @@ download_if_missing() {
         echo "[comfylab-engine]   $filename already present, skipping."
     else
         echo "[comfylab-engine]   downloading $filename..."
-        wget -q --show-progress -P "$dest_dir" "$url"
+        # Downloads to a .part file first, only renamed to the real
+        # filename on success - if wget dies partway (rate limit, network
+        # blip, worker preemption, anything), the truncated data stays
+        # under the .part name, so the `-f` check above won't mistake it
+        # for a complete file on the next run and silently skip
+        # re-downloading a corrupt model.
+        wget -q --show-progress "${HF_AUTH_HEADER[@]}" -O "$dest_dir/$filename.part" "$url"
+        mv "$dest_dir/$filename.part" "$dest_dir/$filename"
     fi
 }
 
