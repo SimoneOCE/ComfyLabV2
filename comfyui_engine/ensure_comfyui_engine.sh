@@ -160,7 +160,7 @@ echo "[comfylab-engine] Verifying the install (from outside any SageAttention so
 (cd /tmp && python3 -c "import sageattention; print(sageattention)")
 
 echo "[comfylab-engine] Ensuring MiniMax H3 model files are present on the volume..."
-mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae"
+mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae" "$MODELS_DIR/loras"
 
 # HF_TOKEN is optional - Comfy-Org/MiniMax-H3 is a public repo (verified:
 # HTTP 200 with zero credentials), so this isn't required for these specific
@@ -176,8 +176,10 @@ fi
 download_if_missing() {
     local url="$1"
     local dest_dir="$2"
-    local filename
-    filename=$(basename "$url")
+    # Optional 3rd arg: save under this filename instead of the URL's own
+    # basename - needed for the LoRA files below, whose HF repo filenames
+    # don't match LORA_CHOICES' friendlier names in handler.py.
+    local filename="${3:-$(basename "$url")}"
     if [ -f "$dest_dir/$filename" ]; then
         echo "[comfylab-engine]   $filename already present, skipping."
     else
@@ -197,5 +199,14 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/di
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" "$MODELS_DIR/text_encoders"
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors" "$MODELS_DIR/vae"
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors" "$MODELS_DIR/vae"
+
+# Turbo LoRAs - filenames match LORA_CHOICES in handler.py (deliberately
+# renamed from each HF repo's own raw filename), which splices
+# LoraLoaderModelOnly into the workflow graph by this name when a job
+# requests one. See handler.py's LORA_CHOICES comment for why this is a
+# real graph node per job rather than a prompt-string tag the way
+# koboldcpp/stable-diffusion.cpp handled it.
+download_if_missing "https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora/resolve/main/minimax_h3_turbo_4step_ema_ckpt500.safetensors" "$MODELS_DIR/loras" "minimax_h3_turbo_ema_ckpt500.safetensors"
+download_if_missing "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v0.1.safetensors" "$MODELS_DIR/loras" "minimax_h3_lightx2v_turbo.safetensors"
 
 echo "[comfylab-engine] Done. Engine + models ready on volume."
