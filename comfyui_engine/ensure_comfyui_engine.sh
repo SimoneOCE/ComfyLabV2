@@ -200,14 +200,14 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/te
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors" "$MODELS_DIR/vae"
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors" "$MODELS_DIR/vae"
 
-# Turbo LoRAs - filenames match LORA_CHOICES in handler.py (deliberately
-# renamed from each HF repo's own raw filename), which splices
-# LoraLoaderModelOnly into the workflow graph by this name when a job
-# requests one. See handler.py's LORA_CHOICES comment for why this is a
-# real graph node per job rather than a prompt-string tag the way
-# koboldcpp/stable-diffusion.cpp handled it.
-download_if_missing "https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora/resolve/main/minimax_h3_turbo_4step_ema_ckpt500.safetensors" "$MODELS_DIR/loras" "minimax_h3_turbo_ema_ckpt500.safetensors"
-download_if_missing "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v0.1.safetensors" "$MODELS_DIR/loras" "minimax_h3_lightx2v_turbo.safetensors"
+# Turbo LoRAs - Comfy-Org's own conversions, published alongside the
+# checkpoint itself (see handler.py's LORA_CHOICES comment for why the
+# original production-ported picks got swapped out: a real run showed
+# they weren't actually compatible with this checkpoint's adaln_proj
+# layers at all). Filenames here match LORA_CHOICES exactly, since these
+# are already named sensibly upstream - no renaming needed this time.
+download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
+download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
 
 # Real-ESRGAN 4x upscale model - see handler.py's UPSCALE_MODEL comment.
 # wget follows the GitHub releases redirect (-L equivalent is wget's

@@ -88,16 +88,33 @@ NODE_IDS = {
 # "er_sde") aren't verified against ComfyUI's KSamplerSelect option list, and
 # guessing that mapping risks a silently-wrong sampler rather than an error.
 LORA_CHOICES = {
+    # Comfy-Org's OWN turbo LoRAs, published in the same HF repo as our
+    # checkpoint - replaced the original production-ported picks after a
+    # real run confirmed those weren't actually compatible with this
+    # checkpoint at all (see the adaln_proj shape-mismatch investigation:
+    # a LoRA trained for adaln_proj.linear.in_features=2688 hit our
+    # checkpoint's actual in_features=8 on every single block). Verified
+    # before swapping in, not assumed: pulled these files' safetensors
+    # headers directly - they're already keyed "diffusion_model.*" (no
+    # naming-convention mismatch), they don't touch adaln_proj at all
+    # (sidesteps that exact incompatibility), and their embedded metadata
+    # states target_format "ComfyUI generic LoRA" and base_model
+    # "Comfy-Org/MiniMax-H3 minimax_h3_fl2va_bf16.safetensors" - a
+    # deliberate, documented conversion for this exact model family, not
+    # a random community LoRA.
     "turbo": {
-        "filename": "minimax_h3_turbo_ema_ckpt500.safetensors",
-        "url": "https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora/resolve/main/minimax_h3_turbo_4step_ema_ckpt500.safetensors",
+        "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
         "multiplier": 1.0,
         "default_steps": 8,
     },
     "fast": {
-        "filename": "minimax_h3_lightx2v_turbo.safetensors",
-        "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v0.1.safetensors",
-        "multiplier": 0.75,
+        # Filename says "768p" - possibly tuned for that resolution
+        # specifically rather than resolution-agnostic; worth confirming
+        # at other sizes rather than assuming it's fine everywhere.
+        "filename": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+        "multiplier": 1.0,
         "default_steps": 4,
     },
 }
