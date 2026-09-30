@@ -318,18 +318,18 @@ def save_input_image(b64_data, prefix):
 
 
 def build_prompt_payload(job_input, include_upscale=False):
-    """Returns (workflow, resolved) - resolved carries the seed/image
-    filenames this call settled on (freshly generated if job_input didn't
-    already supply them under their "_resolved" keys). Upscale's timing
-    (see run_generation) submits this SAME base graph twice, unchanged
-    except for the upscale tail - ComfyUI's node-output cache (CacheSet in
-    execution.py, confirmed real, not guessed) then skips re-running
-    sampling/decode on the second submission as long as every upstream
-    node's inputs are byte-identical between the two calls. A fresh random
-    seed or a freshly-saved-with-a-new-uuid-filename image on each call
-    would bust that cache for nearly the whole graph, which is exactly why
-    the resolved values get threaded through explicitly instead of each
-    call re-resolving its own.
+    """Builds the full workflow graph for one generation. include_upscale
+    splices the ESRGAN nodes into the SAME submission as everything else
+    (matching how production's koboldcpp path does upscale - one request,
+    not two) rather than a separate follow-up submission - see
+    run_generation's docstring for why that two-submission design got
+    reverted: splitting it into two separate HTTP requests defeated
+    ComfyUI's own automatic per-node memory management (which frees a
+    model's VRAM the moment nothing downstream still needs it, within a
+    single continuous execution), which is what actually caused a real
+    upscale test to OOM and crash the whole process. One request lets
+    ComfyUI handle that hand-off the normal way, the same as any other
+    node transition already visible in every log.
     """
     with open(WORKFLOW_TEMPLATE_PATH, "r") as f:
         workflow = json.load(f)
@@ -343,7 +343,6 @@ def build_prompt_payload(job_input, include_upscale=False):
     ref_image = job_input.get("ref_image")
     start_frame = job_input.get("start_frame")
     end_frame = job_input.get("end_frame")
-    resolved = {"seed": seed}
 
     # REF FRAME vs START/END FRAME are NOT the same mechanism on ComfyUI,
     # unlike whatever unified handling koboldcpp had - verified against
@@ -357,8 +356,7 @@ def build_prompt_payload(job_input, include_upscale=False):
     #     ref_image request takes the ReferenceToVideo path and ignores any
     #     start/end frame given alongside it in this first pass.
     if ref_image:
-        ref_filename = job_input.get("_ref_image_filename") or save_input_image(ref_image, "ref")
-        resolved["_ref_image_filename"] = ref_filename
+        ref_filename = save_input_image(ref_image, "ref")
         workflow["_ref_image_load"] = {
             "inputs": {"image": ref_filename},
             "class_type": "LoadImage",
@@ -392,16 +390,14 @@ def build_prompt_payload(job_input, include_upscale=False):
         prompt_node["width"] = width
         prompt_node["height"] = height
         if start_frame:
-            start_filename = job_input.get("_start_frame_filename") or save_input_image(start_frame, "start")
-            resolved["_start_frame_filename"] = start_filename
+            start_filename = save_input_image(start_frame, "start")
             workflow["_start_frame_load"] = {
                 "inputs": {"image": start_filename},
                 "class_type": "LoadImage",
             }
             prompt_node["first_frame"] = ["_start_frame_load", 0]
         if end_frame:
-            end_filename = job_input.get("_end_frame_filename") or save_input_image(end_frame, "end")
-            resolved["_end_frame_filename"] = end_filename
+            end_filename = save_input_image(end_frame, "end")
             workflow["_end_frame_load"] = {
                 "inputs": {"image": end_filename},
                 "class_type": "LoadImage",
@@ -437,10 +433,10 @@ def build_prompt_payload(job_input, include_upscale=False):
 
     # ESRGAN upscale - verified nodes (UpscaleModelLoader + ImageUpscale
     # WithModel, comfy_extras/nodes_upscale_model.py). Spliced between
-    # VAEDecode's frame output and CreateVideo's input only when requested;
-    # everything upstream of "105:10" is untouched either way, which is
-    # what lets the two-submission cache trick in run_generation() isolate
-    # this node's own cost.
+    # VAEDecode's frame output and CreateVideo's input, in the same
+    # submission as everything else - ComfyUI's own dynamic VRAM
+    # management frees the diffusion model automatically once nothing
+    # downstream needs it anymore, same as every other node transition.
     if include_upscale:
         workflow["_upscale_loader"] = {
             "inputs": {"model_name": UPSCALE_MODEL["filename"]},
@@ -455,7 +451,7 @@ def build_prompt_payload(job_input, include_upscale=False):
         }
         workflow["105:91"]["inputs"]["images"] = ["_upscale_apply", 0]
 
-    return workflow, resolved
+    return workflow
 
 
 def submit_and_wait(workflow, timeout_seconds=1200, should_cancel=None, should_force_kill=None):
@@ -538,66 +534,21 @@ def upload_result_and_get_key(raw_bytes, filename):
 
 
 def run_generation(job_input, should_cancel=None, should_force_kill=None):
-    """One full generation: build the workflow, run it, upload the result.
-    Shared by both the classic one-shot handler() path and run_session()'s
-    per-job loop below - identical either way, since ComfyUI itself only
-    ever has one thing loaded/running at a time regardless of which path
-    queued it. should_cancel/should_force_kill default to None (never
-    cancels) for the classic path, which has no per-job cancel flag to
-    poll.
+    """One full generation: build the workflow (upscale tail included in
+    the same submission when requested - see build_prompt_payload's
+    docstring for why splitting that into a separate follow-up request
+    got reverted), run it, upload the result. Shared by both the classic
+    one-shot handler() path and run_session()'s per-job loop below -
+    identical either way, since ComfyUI itself only ever has one thing
+    loaded/running at a time regardless of which path queued it.
+    should_cancel/should_force_kill default to None (never cancels) for
+    the classic path, which has no per-job cancel flag to poll.
 
-    When job_input["upscale"] is set, this submits the SAME base graph
-    twice - once without the upscale tail, once with it - instead of one
-    submission with upscale always attached. That's not wasted work: the
-    two calls share the same resolved seed/image filenames (see
-    build_prompt_payload's docstring), so ComfyUI's node cache serves the
-    second submission's sampling/decode nodes straight from the first
-    call's results, and only the genuinely new upscale+re-encode tail runs
-    for real - which is what makes upscale_seconds below a real measured
-    number instead of a guess, without doubling the actual GPU cost of the
-    expensive diffusion sampling step.
+    No separate upscale-only timing here (production's koboldcpp path
+    doesn't expose that either) - upscale's cost is folded into the same
+    total time as everything else, same as any other node in the graph.
     """
-    if job_input.get("upscale"):
-        base_workflow, resolved = build_prompt_payload(job_input, include_upscale=False)
-        base_start = time.time()
-        base_result = submit_and_wait(base_workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
-        base_seconds = round(time.time() - base_start, 1)
-        if base_result.get("force_killed"):
-            return {"cancelled": True, "force_killed": True}
-        if base_result.get("cancelled"):
-            return {"cancelled": True}
-
-        # Frees the diffusion model/VAE/text encoder's VRAM (unload_models
-        # only, NOT free_memory - that second flag calls ComfyUI's own
-        # PromptExecutor.reset(), which replaces the whole node-output
-        # cache and would defeat the cache-hit trick above entirely;
-        # unload_models alone only evicts model weights via
-        # comfy.model_management.unload_all_models(), a separate subsystem
-        # from the node cache, verified by reading both directly). A real
-        # run OOM'd/crashed ComfyUI's whole process running the upscale
-        # tail while the full base-pass model stack was still resident -
-        # this clears that VRAM right before the upscale pass needs its
-        # own working memory for tiled 4x inference across every frame.
-        try:
-            requests.post(f"{COMFYUI_URL}/free", json={"unload_models": True}, timeout=15)
-        except requests.exceptions.RequestException as e:
-            print(f"Could not free VRAM before upscale pass: {e}")
-
-        resolved_input = {**job_input, **resolved}
-        upscale_workflow, _ = build_prompt_payload(resolved_input, include_upscale=True)
-        upscale_start = time.time()
-        upscale_result = submit_and_wait(upscale_workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
-        upscale_seconds = round(time.time() - upscale_start, 1)
-        if upscale_result.get("force_killed"):
-            return {"cancelled": True, "force_killed": True}
-        if upscale_result.get("cancelled"):
-            return {"cancelled": True}
-
-        raw_bytes, filename = fetch_output_video(upscale_result)
-        video_key = upload_result_and_get_key(raw_bytes, filename)
-        return {"videoKey": video_key, "base_seconds": base_seconds, "upscale_seconds": upscale_seconds}
-
-    workflow, _ = build_prompt_payload(job_input)
+    workflow = build_prompt_payload(job_input, include_upscale=job_input.get("upscale", False))
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
     if result.get("force_killed"):
         return {"cancelled": True, "force_killed": True}
