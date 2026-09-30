@@ -62,6 +62,16 @@
 
   <button id="submitBtn" onclick="runJob()">Run Generation</button>
 
+  <h2>Resolve an existing video key</h2>
+  <p style="color:#888; font-size:0.85rem;">
+    Test/debug the S3 presigned-URL logic against a video you already generated, without paying for
+    another full run.
+  </p>
+  <label>Video Key (just the filename, e.g. abc123.mp4)
+    <input id="existingVideoKey" type="text" placeholder="1e7cca9c-2c8e-484c-8810-70cd435c4bd7.mp4" />
+  </label>
+  <button onclick="resolveExistingKey()">Resolve URL</button>
+
   <div id="status"></div>
   <video id="resultVideo" controls></video>
   <div id="downloadLinkWrap"></div>
@@ -183,23 +193,7 @@ async function runJob() {
       if (statusData.status === 'COMPLETED') {
         statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(statusData.output, null, 2)}`;
         const videoKey = statusData.output && statusData.output.videoKey;
-        if (videoKey) {
-          try {
-            const url = await resolveVideoUrl(videoKey);
-            statusEl.textContent += `\n\nResolved signed URL (valid 1hr) - see below.`;
-            videoEl.src = url;
-            videoEl.style.display = 'block';
-            const link = document.createElement('a');
-            link.href = url;
-            link.textContent = `Download ${videoKey}`;
-            link.className = 'download-link';
-            link.target = '_blank';
-            downloadWrap.appendChild(link);
-            statusEl.textContent += `\n\nNote: if the inline preview above stays blank, the S3 endpoint may not allow cross-origin video playback from this page - the download link below bypasses that (it's a direct navigation, not a fetch), so use it either way.`;
-          } catch (s3err) {
-            statusEl.textContent += `\n\nFailed to resolve S3 URL: ${s3err.message}\n(check S3 credentials/bucket fields above)`;
-          }
-        }
+        if (videoKey) await handleVideoKey(videoKey);
         break;
       }
       if (statusData.status === 'FAILED') {
@@ -212,6 +206,42 @@ async function runJob() {
   } finally {
     btn.disabled = false;
   }
+}
+
+async function handleVideoKey(videoKey) {
+  const statusEl = document.getElementById('status');
+  const videoEl = document.getElementById('resultVideo');
+  const downloadWrap = document.getElementById('downloadLinkWrap');
+  try {
+    const url = await resolveVideoUrl(videoKey);
+    statusEl.textContent += `\n\nResolved signed URL (valid 1hr):\n${url}`;
+    videoEl.src = url;
+    videoEl.style.display = 'block';
+    const link = document.createElement('a');
+    link.href = url;
+    link.textContent = `Download ${videoKey}`;
+    link.className = 'download-link';
+    link.target = '_blank';
+    downloadWrap.appendChild(link);
+    statusEl.textContent += `\n\nNote: if the inline preview above stays blank, the S3 endpoint may not allow cross-origin video playback from this page - the download link below bypasses that (it's a direct navigation, not a fetch), so use it either way.`;
+  } catch (s3err) {
+    statusEl.textContent += `\n\nFailed to resolve S3 URL: ${s3err.message}\n(check S3 credentials/bucket fields above)`;
+  }
+}
+
+async function resolveExistingKey() {
+  const statusEl = document.getElementById('status');
+  const videoEl = document.getElementById('resultVideo');
+  const downloadWrap = document.getElementById('downloadLinkWrap');
+  const videoKey = document.getElementById('existingVideoKey').value.trim();
+  videoEl.style.display = 'none';
+  downloadWrap.innerHTML = '';
+  if (!videoKey) {
+    statusEl.textContent = 'Enter a video key first.';
+    return;
+  }
+  statusEl.textContent = `Resolving ${videoKey}...`;
+  await handleVideoKey(videoKey);
 }
 </script>
 </body>
