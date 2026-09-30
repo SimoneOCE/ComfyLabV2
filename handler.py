@@ -37,6 +37,12 @@ VOLUME_MODELS_DIR = os.path.join(VOLUME_DIR, "models")
 
 OUTPUT_DIR = os.path.join(VOLUME_DIR, "outputs")
 
+# Where ComfyUI itself writes generated videos - NOT the ComfyLabV2-facing
+# OUTPUT_DIR above (that's our own re-encoded copy on its way to Wasabi).
+# See start_comfyui_if_needed()'s --output-directory comment for why this
+# has to be redirected off the container's own small disk at all.
+COMFYUI_OUTPUT_DIR = os.path.join(VOLUME_DIR, "comfyui_output")
+
 # Wasabi (third-party S3-compatible storage), NOT RunPod's own S3-compatible
 # volume storage - that only exists in 15 specific datacenters (see RunPod's
 # docs), and EUR-IS-2 (the one datacenter with real RTX 5090 + CUDA 13.0
@@ -289,8 +295,29 @@ def start_comfyui_if_needed():
             pass
         else:
             print("Starting ComfyUI...")
+            os.makedirs(COMFYUI_OUTPUT_DIR, exist_ok=True)
             comfyui_process = subprocess.Popen(
-                ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"],
+                [
+                    "python3", "main.py",
+                    "--listen", "0.0.0.0",
+                    "--port", "8188",
+                    # Verified via comfy/cli_args.py - without this,
+                    # ComfyUI's default output dir is base_path/output
+                    # INSIDE the container's own small ephemeral disk
+                    # (folder_paths.py: output_directory = os.path.join
+                    # (base_path, "output")), never cleaned up between
+                    # jobs. Every video from every job in a real test
+                    # session - warmups, T2V runs, LoRA tests, and the
+                    # much larger 4x-upscaled file - piled up there
+                    # unnoticed, very likely what actually filled a
+                    # small container disk right around the upscale
+                    # test. Pointed at the volume instead, which is
+                    # sized for this; fetch_output_video() below also
+                    # deletes each file here once its bytes are safely
+                    # uploaded to Wasabi, so even the volume doesn't
+                    # grow unbounded.
+                    "--output-directory", COMFYUI_OUTPUT_DIR,
+                ],
                 cwd=COMFYUI_DIR,
             )
 
@@ -515,6 +542,18 @@ def fetch_output_video(history_entry):
         timeout=60,
     )
     r.raise_for_status()
+
+    # Bytes are safely in hand now (about to be re-uploaded to Wasabi by
+    # the caller) - delete ComfyUI's own copy so COMFYUI_OUTPUT_DIR on the
+    # volume doesn't grow unbounded across a long session's worth of jobs,
+    # same reasoning as redirecting it off the container disk in the first
+    # place (see start_comfyui_if_needed).
+    raw_path = os.path.join(COMFYUI_OUTPUT_DIR, video_info.get("subfolder", ""), video_info["filename"])
+    try:
+        os.remove(raw_path)
+    except OSError as e:
+        print(f"Could not clean up {raw_path}: {e}")
+
     return r.content, video_info["filename"]
 
 
