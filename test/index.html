@@ -129,12 +129,21 @@ function getS3Client() {
 async function resolveVideoUrl(videoKey) {
   const bucket = document.getElementById('s3Bucket').value.trim();
   const s3 = getS3Client();
-  const url = s3.getSignedUrl('getObject', {
-    Bucket: bucket,
-    Key: `outputs/${videoKey}`,
-    Expires: 3600,
-  });
-  return url;
+  // NOT getSignedUrl - confirmed via a real presigned URL (fully valid
+  // SigV4 query params, verified by inspection) still getting "AccessDenied:
+  // missing Authorization header" from RunPod's S3-compatible endpoint.
+  // That error, on an otherwise well-formed presigned URL, means this
+  // endpoint doesn't accept query-string SigV4 auth at all - only a real
+  // Authorization HEADER, which a browser can't attach to a plain
+  // navigation/<a href>/<video src> anyway. handler.py's own upload
+  // (boto3's normal upload_file, header-signed) never hit this because it
+  // was never a presigned URL to begin with.
+  // Fetching the actual bytes through the S3 client itself does sign with
+  // a header, so this works: pull the object down directly, then hand the
+  // browser a local blob: URL instead of a remote presigned one.
+  const data = await s3.getObject({ Bucket: bucket, Key: `outputs/${videoKey}` }).promise();
+  const blob = new Blob([data.Body], { type: data.ContentType || 'video/mp4' });
+  return URL.createObjectURL(blob);
 }
 
 async function runJob() {
@@ -213,19 +222,22 @@ async function handleVideoKey(videoKey) {
   const videoEl = document.getElementById('resultVideo');
   const downloadWrap = document.getElementById('downloadLinkWrap');
   try {
+    statusEl.textContent += `\n\nFetching video bytes through the S3 client (header-signed, not a presigned URL - see resolveVideoUrl's comment)...`;
     const url = await resolveVideoUrl(videoKey);
-    statusEl.textContent += `\n\nResolved signed URL (valid 1hr):\n${url}`;
+    statusEl.textContent += `\n\nResolved local blob URL - see below.`;
     videoEl.src = url;
     videoEl.style.display = 'block';
     const link = document.createElement('a');
     link.href = url;
     link.textContent = `Download ${videoKey}`;
     link.className = 'download-link';
-    link.target = '_blank';
+    // download attribute (not target="_blank") - a blob: URL opened as a
+    // plain navigation just plays inline in a new tab since it has a real
+    // video content-type; this forces an actual Save-As instead.
+    link.download = videoKey;
     downloadWrap.appendChild(link);
-    statusEl.textContent += `\n\nNote: if the inline preview above stays blank, the S3 endpoint may not allow cross-origin video playback from this page - the download link below bypasses that (it's a direct navigation, not a fetch), so use it either way.`;
   } catch (s3err) {
-    statusEl.textContent += `\n\nFailed to resolve S3 URL: ${s3err.message}\n(check S3 credentials/bucket fields above)`;
+    statusEl.textContent += `\n\nFailed to fetch video: ${s3err.message}\n(check S3 credentials/bucket fields above)`;
   }
 }
 
