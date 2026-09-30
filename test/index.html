@@ -61,6 +61,23 @@
     <input id="s3SecretKey" type="password" placeholder="secret key" />
   </label>
 
+  <h2>GPU Session (held-open worker)</h2>
+  <p style="color:#888; font-size:0.85rem;">
+    Optional. Starting a session holds one RunPod worker open across multiple generations instead of
+    each Run Generation cold-starting/reusing-by-luck - mirrors minimax-h3-worker's run_session pattern,
+    using its own comfylab_gpu_sessions/comfylab_active_gpu_sessions/comfylab_gpu_session_jobs tables
+    (same Supabase project, but isolated from the production billing tables - safe to use the public
+    anon key here). Leave this section empty to fall back to classic one-shot mode below.
+  </p>
+  <label>Supabase URL
+    <input id="supabaseUrl" type="text" placeholder="https://xxxx.supabase.co" />
+  </label>
+  <label>Supabase Anon Key
+    <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
+  </label>
+  <button id="gpuSessionBtn" onclick="toggleGpuSession()">Run GPU</button>
+  <div id="gpuSessionStatus" style="margin-top:8px; font-size:0.85rem; color:#9c9;">No session.</div>
+
   <button id="submitBtn" onclick="runJob()">Run Generation</button>
 
   <h2>Resolve an existing video key</h2>
@@ -86,6 +103,7 @@
 const PERSISTED_FIELDS = [
   'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
+  'supabaseUrl', 'supabaseAnonKey',
 ];
 
 function loadPersistedFields() {
@@ -109,6 +127,233 @@ function wireUpPersistence() {
 
 loadPersistedFields();
 wireUpPersistence();
+
+// --- GPU Session (held-open worker) --------------------------------------
+// Mirrors minimax-h3-worker's server.js /api/session/start + GeneratorPanel.tsx's
+// direct-Supabase job insert/poll, but does both from right here in the
+// browser instead of through a backend - this test page has no server of
+// its own, and RUNPOD_API_KEY is already typed directly into this page for
+// the classic path anyway, so there's no new trust boundary crossed by
+// calling RunPod's /run for session_id from here too.
+let sessionId = null;
+let sessionReady = false;
+let sessionReconnectPollHandle = null;
+
+function sbConfig() {
+  return {
+    url: document.getElementById('supabaseUrl').value.trim().replace(/\/$/, ''),
+    key: document.getElementById('supabaseAnonKey').value.trim(),
+  };
+}
+
+async function sbRequest(method, table, { params, body, single } = {}) {
+  const { url, key } = sbConfig();
+  const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+  const headers = {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    'Content-Type': 'application/json',
+  };
+  if (body !== undefined) headers['Prefer'] = 'return=representation';
+  const resp = await fetch(`${url}/rest/v1/${table}${qs}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Supabase ${method} ${table} failed: ${resp.status} ${text}`);
+  }
+  if (method === 'DELETE') return null;
+  const data = await resp.json();
+  return single ? (data[0] || null) : data;
+}
+
+async function getActiveClaim() {
+  const rows = await sbRequest('GET', 'comfylab_active_gpu_sessions', {
+    params: { slot: 'eq.default', select: 'session_id,worker_started_at' },
+  });
+  return rows[0] || null;
+}
+
+function setGpuSessionStatus(text) {
+  document.getElementById('gpuSessionStatus').textContent = text;
+}
+
+async function pollUntilWorkerStarted() {
+  while (true) {
+    const claim = await getActiveClaim();
+    if (!claim || claim.session_id !== sessionId) {
+      // Claim vanished or got taken over - session ended before it ever
+      // became ready (e.g. ComfyUI failed to start on the worker).
+      setGpuSessionStatus('Session ended before becoming ready. Check RunPod logs.');
+      sessionId = null;
+      sessionReady = false;
+      updateGpuSessionButton();
+      return;
+    }
+    if (claim.worker_started_at) {
+      sessionReady = true;
+      setGpuSessionStatus(`Session ready (started ${new Date(claim.worker_started_at).toLocaleTimeString()}). Run Generation now uses this held-open worker.`);
+      updateGpuSessionButton();
+      return;
+    }
+    setGpuSessionStatus('Starting... (ComfyUI booting + warmup generation on the worker)');
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+function updateGpuSessionButton() {
+  const btn = document.getElementById('gpuSessionBtn');
+  btn.textContent = sessionId ? 'Stop GPU' : 'Run GPU';
+}
+
+async function toggleGpuSession() {
+  const { url, key } = sbConfig();
+  if (!url || !key) {
+    setGpuSessionStatus('Supabase URL and anon key are required for session mode.');
+    return;
+  }
+  const endpointId = document.getElementById('endpointId').value.trim();
+  const apiKey = document.getElementById('apiKey').value.trim();
+  if (!endpointId || !apiKey) {
+    setGpuSessionStatus('RunPod Endpoint ID and API key (above) are required.');
+    return;
+  }
+
+  const btn = document.getElementById('gpuSessionBtn');
+  btn.disabled = true;
+  try {
+    if (sessionId) {
+      // Stop: signal only - the worker's own run_session loop notices
+      // within one poll tick (~3s) and returns on its own, which is what
+      // actually frees the GPU. Same reasoning as server.js's stop route.
+      setGpuSessionStatus('Stopping...');
+      await sbRequest('PATCH', 'comfylab_gpu_sessions', {
+        params: { id: `eq.${sessionId}`, 'ended_at': 'is.null' },
+        body: { ended_at: new Date().toISOString(), end_reason: 'manual' },
+      });
+      await sbRequest('DELETE', 'comfylab_active_gpu_sessions', {
+        params: { slot: 'eq.default', session_id: `eq.${sessionId}` },
+      });
+      sessionId = null;
+      sessionReady = false;
+      setGpuSessionStatus('Stopped. Worker will free itself within a few seconds.');
+      updateGpuSessionButton();
+      return;
+    }
+
+    // Start: reconnect to an existing claim if one's already there
+    // (e.g. this page was reloaded mid-session), same as server.js's
+    // existingClaim check.
+    const existing = await getActiveClaim();
+    if (existing) {
+      sessionId = existing.session_id;
+      updateGpuSessionButton();
+      setGpuSessionStatus('Reconnecting to existing session...');
+      await pollUntilWorkerStarted();
+      return;
+    }
+
+    setGpuSessionStatus('Starting session...');
+    const sessionRow = await sbRequest('POST', 'comfylab_gpu_sessions', { body: {}, single: true });
+    sessionId = sessionRow.id;
+    updateGpuSessionButton();
+
+    try {
+      await sbRequest('POST', 'comfylab_active_gpu_sessions', {
+        body: { slot: 'default', session_id: sessionId },
+        single: true,
+      });
+    } catch (claimErr) {
+      // Lost the race to a concurrent Run GPU click, or a stale claim
+      // row is already sitting there - close out the orphaned history
+      // row and bail, same as server.js's own conflict handling.
+      await sbRequest('PATCH', 'comfylab_gpu_sessions', {
+        params: { id: `eq.${sessionId}` },
+        body: { ended_at: new Date().toISOString(), end_reason: 'error' },
+      });
+      throw new Error(`Could not claim GPU slot (already claimed?): ${claimErr.message}`);
+    }
+
+    const runResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({ input: { session_id: sessionId } }),
+    });
+    const runData = await runResp.json();
+    if (!runData.id) {
+      await sbRequest('DELETE', 'comfylab_active_gpu_sessions', { params: { slot: 'eq.default' } });
+      await sbRequest('PATCH', 'comfylab_gpu_sessions', {
+        params: { id: `eq.${sessionId}` },
+        body: { ended_at: new Date().toISOString(), end_reason: 'error' },
+      });
+      sessionId = null;
+      updateGpuSessionButton();
+      throw new Error(`RunPod /run failed: ${JSON.stringify(runData)}`);
+    }
+    // Best-effort only (unlike server.js, no reaper here depends on this
+    // being persisted) - just useful to have on the row for reference.
+    sbRequest('PATCH', 'comfylab_gpu_sessions', {
+      params: { id: `eq.${sessionId}` },
+      body: { runpod_job_id: runData.id },
+    }).catch(() => {});
+
+    setGpuSessionStatus(`Session ${sessionId} submitted as RunPod job ${runData.id}. Starting...`);
+    await pollUntilWorkerStarted();
+  } catch (err) {
+    setGpuSessionStatus(`Error: ${err.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Reconnect automatically on page load if Supabase fields are already
+// filled in (e.g. this page was reloaded mid-session).
+(function tryAutoReconnect() {
+  const { url, key } = sbConfig();
+  if (!url || !key) return;
+  getActiveClaim().then(claim => {
+    if (!claim) return;
+    sessionId = claim.session_id;
+    updateGpuSessionButton();
+    if (claim.worker_started_at) {
+      sessionReady = true;
+      setGpuSessionStatus(`Reconnected to session ${sessionId} (already ready).`);
+    } else {
+      setGpuSessionStatus('Reconnecting to existing session...');
+      pollUntilWorkerStarted();
+    }
+  }).catch(() => {});
+})();
+
+async function runSessionJob(payload, statusEl) {
+  const jobRow = await sbRequest('POST', 'comfylab_gpu_session_jobs', {
+    body: { session_id: sessionId, input: payload },
+    single: true,
+  });
+  statusEl.textContent = `Session job ${jobRow.id} queued (held-open worker)...`;
+
+  const startTime = Date.now();
+  while (true) {
+    await new Promise(r => setTimeout(r, 2000));
+    const rows = await sbRequest('GET', 'comfylab_gpu_session_jobs', {
+      params: { id: `eq.${jobRow.id}`, select: 'status,output' },
+    });
+    const row = rows[0];
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    statusEl.textContent = `Session job ${jobRow.id} - status: ${row.status} (${elapsed}s elapsed)`;
+
+    if (row.status === 'completed') {
+      statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(row.output, null, 2)}`;
+      return row.output && row.output.videoKey;
+    }
+    if (row.status === 'failed') {
+      statusEl.textContent += `\n\n${JSON.stringify(row.output, null, 2)}`;
+      return null;
+    }
+  }
+}
 
 function getS3Client() {
   return new AWS.S3({
@@ -151,6 +396,33 @@ async function runJob() {
   videoEl.style.display = 'none';
   downloadWrap.innerHTML = '';
 
+  const genInput = {
+    prompt: document.getElementById('prompt').value,
+    width: Number(document.getElementById('width').value),
+    height: Number(document.getElementById('height').value),
+    duration: Number(document.getElementById('duration').value),
+    steps: Number(document.getElementById('steps').value),
+  };
+
+  // Session mode: a held-open worker is ready, so route through the job
+  // queue instead of RunPod's own /run (which would spin up/reuse-by-luck
+  // a SEPARATE worker rather than reach the one already held open for
+  // this session - see comfylab_gpu_session_jobs/claim_next_queued_job in
+  // handler.py).
+  if (sessionId && sessionReady) {
+    btn.disabled = true;
+    statusEl.textContent = 'Queuing job on held-open session worker...';
+    try {
+      const videoKey = await runSessionJob(genInput, statusEl);
+      if (videoKey) await handleVideoKey(videoKey);
+    } catch (err) {
+      statusEl.textContent = `Error: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+    return;
+  }
+
   const endpointId = document.getElementById('endpointId').value.trim();
   const apiKey = document.getElementById('apiKey').value.trim();
   if (!endpointId || !apiKey) {
@@ -158,19 +430,11 @@ async function runJob() {
     return;
   }
 
-  const payload = {
-    input: {
-      prompt: document.getElementById('prompt').value,
-      width: Number(document.getElementById('width').value),
-      height: Number(document.getElementById('height').value),
-      duration: Number(document.getElementById('duration').value),
-      steps: Number(document.getElementById('steps').value),
-    }
-  };
+  const payload = { input: genInput };
 
   btn.disabled = true;
   const startTime = Date.now();
-  statusEl.textContent = 'Submitting job...';
+  statusEl.textContent = 'Submitting job (classic one-shot mode)...';
 
   try {
     const runResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/run`, {

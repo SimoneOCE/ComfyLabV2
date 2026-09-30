@@ -77,6 +77,83 @@ NODE_IDS = {
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
 
+# --- Supabase (session mode only) ---------------------------------------
+# Mirrors minimax-h3-worker/handler.py's own session-mode Supabase block
+# exactly in mechanism (poll-based REST, service-role key, same held-open
+# loop shape) - but points at comfylab_gpu_sessions/comfylab_active_gpu_
+# sessions/comfylab_gpu_session_jobs, three tables added specifically for
+# this test tool rather than the production gpu_sessions/active_gpu_
+# sessions/gpu_session_jobs tables (which are coupled to real user auth
+# and billing/credits in that same Supabase project). No user_id at all
+# here - this is a single-tester local test tool, not a multi-tenant
+# product, so comfylab_active_gpu_sessions uses one fixed global claim
+# slot ('default') instead of one row per user.
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+SESSION_POLL_INTERVAL_SECONDS = 3
+# See minimax-h3-worker/handler.py's own SESSION_IDLE_TIMEOUT_SECONDS
+# comment for the full reasoning (uniform regardless of whether the
+# session has ever had a job). Shorter than production's 15 minutes since
+# this is a manual test tool, not a paying session someone might step
+# away from mid-prompt - idling too long here just burns GPU-minutes on a
+# dev test with nobody watching.
+SESSION_IDLE_TIMEOUT_SECONDS = 10 * 60
+SESSION_SAFETY_MAX_SECONDS = 23 * 60 * 60
+HEARTBEAT_INTERVAL_SECONDS = 20
+
+# Deliberately NOT replicating minimax-h3-worker's keep-warm ping
+# (KEEPWARM_INTERVAL_SECONDS / warmup_kobold's "keep-warm" mode): that
+# mechanism exists because a real investigation found koboldcpp/CUDA
+# specifically loses first-inference warmup benefit after sitting idle a
+# while. No equivalent investigation has been done for ComfyUI/PyTorch on
+# this stack - adding an unverified periodic throwaway generation here
+# would be copying a fix without copying the evidence that motivated it.
+# Worth testing for real once this held-open pattern proves out.
+
+
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def sb_get(table, params, timeout=10):
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        params=params,
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def sb_patch(table, params, body, timeout=10):
+    headers = _sb_headers()
+    headers["Prefer"] = "return=representation"
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=headers,
+        params=params,
+        json=body,
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def sb_delete(table, params, timeout=10):
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        params=params,
+        timeout=timeout,
+    )
+    r.raise_for_status()
+
 
 def ensure_comfyui_engine():
     """Runs ensure_comfyui_engine.sh (marker-gated on the volume - see that
@@ -234,19 +311,253 @@ def upload_result_and_get_key(raw_bytes, filename):
     return out_filename
 
 
+def run_generation(job_input):
+    """One full generation: build the workflow, run it, upload the result.
+    Shared by both the classic one-shot handler() path and run_session()'s
+    per-job loop below - identical either way, since ComfyUI itself only
+    ever has one thing loaded/running at a time regardless of which path
+    queued it.
+    """
+    workflow = build_prompt_payload(job_input)
+    history_entry = submit_and_wait(workflow)
+    raw_bytes, filename = fetch_output_video(history_entry)
+    video_key = upload_result_and_get_key(raw_bytes, filename)
+    return {"videoKey": video_key}
+
+
+# --- Session mode (held-open worker) -------------------------------------
+# Mirrors minimax-h3-worker/handler.py's run_session() pattern: one RunPod
+# job that never returns until the session ends, which is what keeps this
+# worker excluded from RunPod's pool for anyone/anything else's /run call
+# the whole time. New generation requests can't reach an already-busy
+# worker through RunPod's own routing, so they arrive here by polling
+# Supabase instead (see claim_next_queued_job). Deliberately NOT
+# replicating production's cancel/force-cancel or step-level progress
+# reporting - this is a pre-port speed test of the held-open pattern
+# itself, not a full port of the generation UX. Add those when this
+# actually gets ported.
+
+
+def is_session_active(session_id):
+    """A session is active only while comfylab_gpu_sessions.ended_at is
+    still null AND the single active_gpu_sessions-style claim slot still
+    points at THIS session (not just any claim - a later session could in
+    principle have re-claimed the slot after this one ended)."""
+    try:
+        sessions = sb_get(
+            "comfylab_gpu_sessions",
+            {"id": f"eq.{session_id}", "select": "ended_at"},
+        )
+        if not sessions or sessions[0].get("ended_at") is not None:
+            return False
+
+        claims = sb_get(
+            "comfylab_active_gpu_sessions",
+            {"slot": "eq.default", "select": "session_id"},
+        )
+        return len(claims) > 0 and claims[0].get("session_id") == session_id
+    except Exception as e:
+        print(f"Could not check session state (treating as still active): {e}")
+        return True
+
+
+def touch_session_heartbeat(session_id):
+    try:
+        sb_patch(
+            "comfylab_active_gpu_sessions",
+            {"slot": "eq.default", "session_id": f"eq.{session_id}"},
+            {"last_activity_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        )
+    except Exception as e:
+        print(f"Could not write heartbeat for session {session_id}: {e}")
+
+
+def mark_session_worker_started(session_id):
+    try:
+        sb_patch(
+            "comfylab_active_gpu_sessions",
+            {"slot": "eq.default", "session_id": f"eq.{session_id}"},
+            {"worker_started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        )
+    except Exception as e:
+        print(f"Could not mark worker started for session {session_id}: {e}")
+
+
+def mark_session_ended(session_id, reason):
+    try:
+        sb_patch(
+            "comfylab_gpu_sessions",
+            {"id": f"eq.{session_id}", "ended_at": "is.null"},
+            {"ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "end_reason": reason},
+        )
+    except Exception as e:
+        print(f"Could not mark session {session_id} ended: {e}")
+    try:
+        sb_delete("comfylab_active_gpu_sessions", {"slot": "eq.default", "session_id": f"eq.{session_id}"})
+    except Exception as e:
+        print(f"Could not release active_gpu_sessions claim for {session_id}: {e}")
+
+
+def claim_next_queued_job(session_id):
+    queued = sb_get(
+        "comfylab_gpu_session_jobs",
+        {
+            "session_id": f"eq.{session_id}",
+            "status": "eq.queued",
+            "order": "created_at.asc",
+            "limit": "1",
+        },
+    )
+    if not queued:
+        return None
+
+    job_row = queued[0]
+    claimed = sb_patch(
+        "comfylab_gpu_session_jobs",
+        {"id": f"eq.{job_row['id']}", "status": "eq.queued"},
+        {"status": "processing"},
+    )
+    if not claimed:
+        return None
+    return claimed[0]
+
+
+def finish_job(job_row_id, output):
+    status = "failed" if output.get("error") else "completed"
+    try:
+        sb_patch(
+            "comfylab_gpu_session_jobs",
+            {"id": f"eq.{job_row_id}"},
+            {"status": status, "output": output},
+        )
+    except Exception as e:
+        print(f"Could not write final result for job {job_row_id}: {e}")
+
+
+def run_session(session_id):
+    """The held-open loop - see the module docstring above this section."""
+    session_start = time.time()
+    last_activity = time.time()
+    last_heartbeat = 0.0
+    jobs_processed = 0
+    print(f"Session {session_id}: held-open loop starting.")
+
+    try:
+        ensure_comfyui_engine()
+        symlink_models_to_volume()
+        start_comfyui_if_needed()
+    except Exception as e:
+        print(f"Session {session_id}: ComfyUI failed to start ({e}) - ending session.")
+        mark_session_ended(session_id, "error")
+        return {
+            "sessionEnded": True,
+            "reason": "worker_error",
+            "session_id": session_id,
+            "jobs_processed": 0,
+            "session_duration_seconds": round(time.time() - session_start, 1),
+            "last_error": str(e),
+        }
+
+    # Absorbs the one-time model-load/CUDA warmup cost here, during the
+    # "Starting..." wait, instead of the user's first real prompt - a tiny
+    # 1-step throwaway generation at the model's minimum practical size.
+    # Mirrors warmup_kobold()'s role in minimax-h3-worker/handler.py.
+    warmup_seconds = None
+    try:
+        warmup_start = time.time()
+        run_generation({
+            "prompt": "warmup",
+            "width": 320,
+            "height": 320,
+            "duration": 1.0,
+            "steps": 1,
+        })
+        warmup_seconds = round(time.time() - warmup_start, 1)
+        print(f"Session {session_id}: warmup generation done ({warmup_seconds}s).")
+    except Exception as e:
+        print(f"Session {session_id}: warmup generation failed, continuing anyway ({e}).")
+
+    mark_session_worker_started(session_id)
+
+    def session_summary(reason, **extra):
+        summary = {
+            "sessionEnded": True,
+            "reason": reason,
+            "session_id": session_id,
+            "jobs_processed": jobs_processed,
+            "warmup_seconds": warmup_seconds,
+            "session_duration_seconds": round(time.time() - session_start, 1),
+        }
+        summary.update(extra)
+        return summary
+
+    while True:
+        now = time.time()
+        if now - last_heartbeat > HEARTBEAT_INTERVAL_SECONDS:
+            touch_session_heartbeat(session_id)
+            last_heartbeat = now
+
+        if now - session_start > SESSION_SAFETY_MAX_SECONDS:
+            print(f"Session {session_id}: hit the {SESSION_SAFETY_MAX_SECONDS}s safety cutoff, ending.")
+            mark_session_ended(session_id, "safety_timeout")
+            return session_summary("safety_timeout")
+
+        if not is_session_active(session_id):
+            print(f"Session {session_id}: no longer active, ending loop.")
+            return session_summary("stopped")
+
+        try:
+            job_row = claim_next_queued_job(session_id)
+        except Exception as e:
+            print(f"Session {session_id}: could not check queue: {e}")
+            job_row = None
+
+        if job_row is None:
+            if time.time() - last_activity > SESSION_IDLE_TIMEOUT_SECONDS:
+                print(f"Session {session_id}: idle past {SESSION_IDLE_TIMEOUT_SECONDS}s, ending.")
+                mark_session_ended(session_id, "timeout")
+                return session_summary("timeout")
+            time.sleep(SESSION_POLL_INTERVAL_SECONDS)
+            continue
+
+        print(f"Session {session_id}: processing job {job_row['id']}.")
+
+        heartbeat_stop = threading.Event()
+
+        def keep_heartbeat_alive():
+            while not heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+                touch_session_heartbeat(session_id)
+
+        heartbeat_thread = threading.Thread(target=keep_heartbeat_alive, daemon=True)
+        heartbeat_thread.start()
+        try:
+            try:
+                result = run_generation(job_row["input"])
+            except Exception as e:
+                result = {"error": str(e)}
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=5)
+
+        finish_job(job_row["id"], result)
+        jobs_processed += 1
+        last_activity = time.time()
+
+
 def handler(job):
     job_input = job["input"]
+
+    # Session mode: this one RunPod job IS the held-open worker for the
+    # named session - stays inside run_session() until the session ends.
+    session_id = job_input.get("session_id")
+    if session_id:
+        return run_session(session_id)
 
     ensure_comfyui_engine()
     symlink_models_to_volume()
     start_comfyui_if_needed()
 
-    workflow = build_prompt_payload(job_input)
-    history_entry = submit_and_wait(workflow)
-    raw_bytes, filename = fetch_output_video(history_entry)
-    video_key = upload_result_and_get_key(raw_bytes, filename)
-
-    return {"videoKey": video_key}
+    return run_generation(job_input)
 
 
 runpod.serverless.start({"handler": handler})
