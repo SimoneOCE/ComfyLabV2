@@ -143,6 +143,7 @@ NVIDIA_VSR_QUALITY = "ULTRA"
 # (comfyui_engine/custom_nodes/comfylab_rtx_vsr) - same processing loop,
 # full mode list.
 NVIDIA_VSR_HB_QUALITY = "HIGHBITRATE_ULTRA"
+UPSCALE_METHODS = {"none", "nvidia_vsr", "nvidia_vsr_hb"}
 
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
@@ -633,6 +634,14 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
     job_input = dict(job_input)
     job_input["seed"] = resolve_seed(job_input.get("seed"))
     upscale_method = job_input.get("upscale_method", "none")
+    # Unknown values used to fall through build_prompt_payload's if/elif
+    # and silently produce an un-upscaled video - seen on a real run when a
+    # newer test page sent "nvidia_vsr_hb" to a worker still on the build
+    # before that option existed. Fail the job loudly instead.
+    if upscale_method not in UPSCALE_METHODS:
+        raise ValueError(
+            f"Unknown upscale_method {upscale_method!r} - this worker supports {sorted(UPSCALE_METHODS)}"
+        )
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
     if result.get("force_killed"):
