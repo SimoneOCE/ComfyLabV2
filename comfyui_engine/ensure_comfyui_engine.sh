@@ -160,7 +160,7 @@ echo "[comfylab-engine] Verifying the install (from outside any SageAttention so
 (cd /tmp && python3 -c "import sageattention; print(sageattention)")
 
 echo "[comfylab-engine] Ensuring MiniMax H3 model files are present on the volume..."
-mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae" "$MODELS_DIR/loras" "$MODELS_DIR/upscale_models"
+mkdir -p "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae" "$MODELS_DIR/loras"
 
 # HF_TOKEN is optional - Comfy-Org/MiniMax-H3 is a public repo (verified:
 # HTTP 200 with zero credentials), so this isn't required for these specific
@@ -209,83 +209,10 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/va
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
 
-# Real-ESRGAN 2x upscale model - see handler.py's UPSCALE_MODEL comment
-# for why 2x, not 4x (system-RAM OOM + runtime, verified against
-# ComfyUI's own source). wget follows the GitHub releases redirect (-L
-# equivalent is wget's default behavior) to the real signed asset URL.
-download_if_missing "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth" "$MODELS_DIR/upscale_models"
-
-# FlashVSR (naxci1/ComfyUI-FlashVSR_Stable, MIT) - the second upscale path,
-# see handler.py's FLASHVSR comment for why it's a real diffusion model
-# (Wan2.1-1.3B based) rather than a small CNN like ESRGAN, and why this
-# specific fork over the original repo's other community ports: its
-# CHANGELOG explicitly replaced Block-Sparse-Attention with Sparse_Sage
-# Attention "for RTX 50 series support" - this worker's actual GPU (see
-# handler.py's EUR-IS-2 comment) - using the same SageAttention family
-# already built above, not guessed compatibility.
-#
-# Custom node source is cloned into COMFYUI_DIR (the image's own ephemeral
-# filesystem, same as KJNodes baked into the Dockerfile) rather than the
-# volume - it's plain Python, no GPU-specific compile step, so there's
-# nothing here worth caching across workers the way SageAttention's wheel
-# is. Re-cloning on every worker boot is cheap.
-FLASHVSR_NODE_DIR="$COMFYUI_DIR/custom_nodes/ComfyUI-FlashVSR_Stable"
-if [ -d "$FLASHVSR_NODE_DIR" ]; then
-    echo "[comfylab-engine] FlashVSR custom node already present, skipping clone."
-else
-    echo "[comfylab-engine] Cloning FlashVSR custom node..."
-    git clone --depth 1 https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git "$FLASHVSR_NODE_DIR"
-fi
-
-# requirements.txt as published lists plain "sageattention" and "flash-attn
-# --no-build-isolation" - installing either here would be wrong: sageattention
-# would fight with the exact pinned thu-ml/SageAttention build above (same
-# package name, different source/version), and flash-attn is a slow
-# from-source build this node doesn't even default to (sparse_sage_attention
-# is its default and RTX-50-verified mode, not flash_attention_2) - so both
-# lines are filtered out rather than installed and hoped not to conflict.
-grep -v -E '^(sageattention|flash-attn)\b' "$FLASHVSR_NODE_DIR/requirements.txt" > /tmp/flashvsr_requirements_filtered.txt
-pip install -r /tmp/flashvsr_requirements_filtered.txt
-
-# Points FlashVSR's own model-path config at the persistent volume, same
-# reasoning as symlink_models_to_volume() in handler.py - its default
-# (ComfyUI's own models/ dir) lives inside this worker's ephemeral
-# container filesystem and would re-download FlashVSR-v1.1's weights on
-# every single worker boot otherwise.
-cat > "$FLASHVSR_NODE_DIR/model_paths.yaml" <<EOF
-flashvsr_model_path: "$MODELS_DIR"
-EOF
-
-# FlashVSR-v1.1's own weights (diffusion_pytorch_model_streaming_dmd.safetensors,
-# LQ_proj_in.ckpt, TCDecoder.ckpt) - pre-baked here with the same
-# snapshot_download() call the node itself would otherwise make lazily on
-# first use (verified in its nodes.py: model_download() does
-# huggingface_hub.snapshot_download(repo_id="JunhaoZhuang/FlashVSR-v1.1",
-# local_dir=<models_dir>/FlashVSR-v1.1)), so a cold worker's first real
-# job doesn't pay a multi-GB download mid-request. Wan2.1_VAE.pth (the
-# default vae_model choice) auto-downloads the same lazy way from a
-# different repo (lightx2v/Autoencoders) - left to the node's own
-# auto-download since it's a single ~250MB file, not worth duplicating
-# the download logic here for.
-FLASHVSR_MODEL_DIR="$MODELS_DIR/FlashVSR-v1.1"
-if [ -f "$FLASHVSR_MODEL_DIR/diffusion_pytorch_model_streaming_dmd.safetensors" ]; then
-    echo "[comfylab-engine] FlashVSR-v1.1 weights already present, skipping download."
-else
-    echo "[comfylab-engine] Downloading FlashVSR-v1.1 weights from HuggingFace..."
-    python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id='JunhaoZhuang/FlashVSR-v1.1', local_dir='$FLASHVSR_MODEL_DIR', local_dir_use_symlinks=False, resume_download=True)
-"
-fi
-
-# NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI,
-# Apache-2.0 node) - third upscale option, test-only (see handler.py's
-# NVIDIA_VSR comment for why it's not recommended for production yet: its
-# one dependency, nvidia-vfx, is PyPI-classified Development Status ::
-# 3 - Alpha, and NVIDIA's own SDK license says pre-release SDKs aren't
-# intended for production). No separate model-weight download needed -
-# its VFX SDK libraries ship bundled inside the nvidia-vfx wheel itself,
-# unlike FlashVSR's multi-GB checkpoint.
+# NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI) -
+# the one upscale option (see handler.py's NVIDIA_VSR comment). No separate
+# model-weight download needed - its VFX SDK libraries ship bundled inside
+# the nvidia-vfx wheel itself.
 #
 # Both pinned now. COMFYUI_DIR is inside the container (not the volume), so
 # this clone + pip install re-runs on every fresh worker - unpinned, that

@@ -125,65 +125,15 @@ LORA_CHOICES = {
     },
 }
 
-# Real-ESRGAN's 2x model, verified as a real, resolving GitHub release
-# asset (xinntao/Real-ESRGAN v0.2.1) before wiring it in - not guessed at.
-# Not the 4x model: ComfyUI's ImageUpscaleWithModel accumulates its whole
-# output tensor - every frame of the video at once - on
-# comfy.model_management.intermediate_device(), which is system RAM
-# (CPU), not VRAM, unless ComfyUI is started with --gpu-only (confirmed
-# in comfy/model_management.py). At 4x that's 16x the source video's
-# pixel volume held in RAM simultaneously, which is what was OOM-killing
-# the container even on a 141GB-RAM machine, and why it was slow (every
-# frame tiled at the heavier 4x cost before anything returns). 2x cuts
-# that to 4x the source pixel volume - a real, verified reduction, and it
-# matches koboldcpp's own proven default (upscaling_resize=2 on the same
-# ESRGAN family). NVIDIA's newer upscaler is a planned follow-up once this
-# one is proven; swapping it in later only means changing this
-# filename/url and re-running ensure_comfyui_engine.sh's download, the
-# node mechanism (UpscaleModelLoader + ImageUpscaleWithModel) stays the
-# same for any spandrel-supported architecture.
-UPSCALE_MODEL = {
-    "filename": "RealESRGAN_x2plus.pth",
-    "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
-}
-
-# FlashVSR (naxci1/ComfyUI-FlashVSR_Stable, MIT) - the second upscale
-# option, added to compare against ESRGAN 2x rather than replace it. Not
-# a small CNN like ESRGAN - it's a real diffusion model (Wan2.1-1.3B
-# based per its paper, 11-18GB of its own VRAM), so it can't just splice
-# into the same graph submission as MiniMax H3's own ~40GB the way ESRGAN
-# does. See run_generation's "flashvsr" branch: it runs as a genuinely
-# separate submission, with an explicit /free {"unload_models": true}
-# between them to evict MiniMax H3's weights first - not a repeat of the
-# two-submission design mentioned in build_prompt_payload's history below
-# (that one was chasing a VRAM theory later proven wrong), this one has
-# an actual second model that needs the room.
-#
-# Picked over the original repo's other community ComfyUI ports (several
-# exist, under GPL-3.0/Apache-2.0/MIT) specifically because its CHANGELOG
-# says it replaced the original Block-Sparse-Attention with Sparse_Sage
-# Attention "for RTX 50 series support" - this worker's actual GPU (see
-# the EUR-IS-2 comment above) - using the same SageAttention family
-# MiniMax H3 already runs on here, not an unverified guess at Blackwell
-# compatibility.
-FLASHVSR_MODEL_NAME = "FlashVSR-v1.1"
-
-# NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI,
-# Apache-2.0 node) - the third upscale option, test-only, NOT recommended
-# for production. Its one dependency (nvidia-vfx, the pip wheel the node
-# imports as "nvvfx") is PyPI-classified Development Status :: 3 - Alpha,
-# and NVIDIA's own SDK license (developer.download.nvidia.com/licenses/
-# Maxine_SDK_License_1Apr2021_updated.pdf, section 1.4) says pre-release
-# SDKs "are not intended for use in production or business-critical
-# systems" - that's their license, not caution added here.
-#
-# Spliced into the SAME submission as the base generation, like ESRGAN -
-# no /free, no second submission. It's a small per-frame SR network, not a
-# diffusion model, so it doesn't need MiniMax H3 evicted to fit, and
-# keeping it in one graph means the base model stays resident in VRAM for
-# the next job in the session (the whole point of a warm session). It also
-# skips the save -> stage -> LoadVideo -> re-encode round trip that the
-# second-stage path does.
+# NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI) -
+# the one upscale option, chosen after a side-by-side test against ESRGAN 2x
+# and FlashVSR (both since removed). Spliced into the SAME submission as the
+# base generation - no /free, no second submission. It's a small per-frame
+# SR network, not a diffusion model, so it doesn't need MiniMax H3 evicted
+# to fit, and keeping it in one graph means the base model stays resident
+# in VRAM for the next job in the session (the whole point of a warm
+# session). Confirmed on a real run: clean 2x output, and a following
+# no-upscale job stayed at native resolution.
 NVIDIA_VSR_SCALE = 2.0
 NVIDIA_VSR_QUALITY = "ULTRA"
 
@@ -309,7 +259,7 @@ def symlink_models_to_volume():
     just downloaded, instead of ComfyUI looking in its own (ephemeral)
     models/ dir baked into the image.
     """
-    for subdir in ("diffusion_models", "text_encoders", "vae", "loras", "upscale_models"):
+    for subdir in ("diffusion_models", "text_encoders", "vae", "loras"):
         link_path = os.path.join(COMFYUI_DIR, "models", subdir)
         target_path = os.path.join(VOLUME_MODELS_DIR, subdir)
         if os.path.islink(link_path):
@@ -396,21 +346,9 @@ def save_input_image(b64_data, prefix):
 
 def build_prompt_payload(job_input, upscale_method="none"):
     """Builds the full workflow graph for one generation. upscale_method
-    "esrgan2x" or "nvidia_vsr" splices that upscaler's nodes into the SAME
-    submission as everything else
-    (matching how production's koboldcpp path does upscale - one request,
-    not two). An earlier two-submission design (base gen + a separate
-    follow-up upscale request) got reverted at the time on the theory that
-    splitting into two HTTP requests was itself what caused a real upscale
-    test to OOM - that theory turned out to be wrong: the actual cause,
-    confirmed directly against comfy/model_management.py, was ESRGAN's
-    output tensor landing on intermediate_device() (system RAM) for the
-    WHOLE video at once regardless of submission count, fixed by switching
-    to 2x (see UPSCALE_MODEL's comment). ESRGAN stays single-submission
-    because there's no reason to split it now that the real cause is
-    fixed, not because two submissions are inherently unsafe - see
-    run_generation's "flashvsr" branch for a case where a second
-    submission is the right call for a different, real reason.
+    "nvidia_vsr" splices RTX VSR into the SAME submission as everything
+    else (matching how production's koboldcpp path does upscale - one
+    request, not two).
     """
     with open(WORKFLOW_TEMPLATE_PATH, "r") as f:
         workflow = json.load(f)
@@ -512,29 +450,8 @@ def build_prompt_payload(job_input, upscale_method="none"):
         if "steps" not in job_input:
             workflow[NODE_IDS["steps"]]["inputs"]["steps"] = preset["default_steps"]
 
-    # ESRGAN upscale - verified nodes (UpscaleModelLoader + ImageUpscale
-    # WithModel, comfy_extras/nodes_upscale_model.py). Spliced between
-    # VAEDecode's frame output and CreateVideo's input, in the same
-    # submission as everything else - ComfyUI's own dynamic VRAM
-    # management frees the diffusion model automatically once nothing
-    # downstream needs it anymore, same as every other node transition.
-    if upscale_method == "esrgan2x":
-        workflow["_upscale_loader"] = {
-            "inputs": {"model_name": UPSCALE_MODEL["filename"]},
-            "class_type": "UpscaleModelLoader",
-        }
-        workflow["_upscale_apply"] = {
-            "inputs": {
-                "upscale_model": ["_upscale_loader", 0],
-                "image": ["105:10", 0],
-            },
-            "class_type": "ImageUpscaleWithModel",
-        }
-        workflow["105:91"]["inputs"]["images"] = ["_upscale_apply", 0]
-
-
-    # NVIDIA RTX VSR - same splice point as ESRGAN (VAEDecode frames ->
-    # CreateVideo). resize_type is a DynamicCombo: API-format prompts carry
+    # NVIDIA RTX VSR - spliced between VAEDecode's frame output and
+    # CreateVideo's input. resize_type is a DynamicCombo: API-format prompts carry
     # it as FLAT keys - the selected option's key under "resize_type" and
     # that option's own inputs under "resize_type.<name>" - which ComfyUI
     # nests back into one dict before execute() (verified against
@@ -542,10 +459,8 @@ def build_prompt_payload(job_input, upscale_method="none"):
     # _expand_schema_for_dynamic matches live_inputs["resize_type"] against
     # the option keys, finalize_prefix joins sub-inputs with ".", and
     # build_nested_inputs rebuilds the dict). Same convention the template
-    # already uses for ComfyMathExpression's "values.a". The previous
-    # second-stage version sent a nested dict here instead, which matches
-    # no option key.
-    elif upscale_method == "nvidia_vsr":
+    # already uses for ComfyMathExpression's "values.a".
+    if upscale_method == "nvidia_vsr":
         workflow["_nvidia_vsr"] = {
             "inputs": {
                 "images": ["105:10", 0],
@@ -603,8 +518,8 @@ def submit_and_wait(workflow, timeout_seconds=1200, should_cancel=None, should_f
 
 
 def _output_video_info_and_path(history_entry):
-    """Shared by fetch_output_video and stage_video_for_reload: resolves a
-    finished submission's SaveVideo output to (video_info, its real path
+    """Used by fetch_output_video: resolves a finished submission's
+    SaveVideo output to (video_info, its real path
     under COMFYUI_OUTPUT_DIR)."""
     outputs = history_entry["outputs"]
     output_node = outputs[NODE_IDS["output"]]
@@ -644,113 +559,6 @@ def fetch_output_video(history_entry):
     return r.content, video_info["filename"]
 
 
-def stage_video_for_reload(history_entry):
-    """FlashVSR path only: moves a just-finished base generation's SaveVideo
-    output from COMFYUI_OUTPUT_DIR into ComfyUI's input/ directory - same
-    convention save_input_image() already uses for ref/start/end frame
-    images - so the second submission's LoadVideo node can read it back in
-    by filename. Returns the bare filename LoadVideo should reference."""
-    video_info, raw_path = _output_video_info_and_path(history_entry)
-    input_dir = os.path.join(COMFYUI_DIR, "input")
-    os.makedirs(input_dir, exist_ok=True)
-    staged_filename = f"flashvsr_src_{uuid.uuid4()}{os.path.splitext(video_info['filename'])[1]}"
-    shutil.move(raw_path, os.path.join(input_dir, staged_filename))
-    return staged_filename
-
-
-def free_comfyui_models():
-    """POST /free {"unload_models": true} - ComfyUI's own endpoint
-    (server.py's post_free route), which sets a flag main.py's worker loop
-    consumes right after its current item finishes, calling
-    comfy.model_management.unload_all_models() (moves resident weights
-    from VRAM to CPU RAM, not deletes them). Used between the base
-    generation and a FlashVSR submission so FlashVSR's own VRAM footprint
-    doesn't have to coexist with MiniMax H3's - see FLASHVSR_MODEL_NAME's
-    comment for why that's a real constraint here, unlike ESRGAN."""
-    requests.post(f"{COMFYUI_URL}/free", json={"unload_models": True}, timeout=30).raise_for_status()
-
-
-def build_flashvsr_payload(input_filename):
-    """Second-submission graph for the FlashVSR path: LoadVideo/GetVideo
-    Components (native ComfyUI nodes, comfy_extras/nodes_video.py) reload
-    the base generation's staged file as IMAGE frames, FlashVSRNodeInitPipe/
-    FlashVSRNodeAdv (naxci1/ComfyUI-FlashVSR_Stable, verified against its
-    actual nodes.py) upscale them, CreateVideo/SaveVideo re-encode - same
-    output shape as the base graph's own tail, so fetch_output_video works
-    on this submission's result unchanged.
-
-    Parameters left at the node's own recommended defaults (tuned by its
-    maintainer, not guessed here) except: scale=2, to match ESRGAN's scale
-    for a fair side-by-side comparison; enable_debug=True, to surface the
-    per-run VRAM/timing summary this test is specifically comparing
-    against ESRGAN's; keep_models_on_cpu/force_offload left True (their
-    own defaults) since offloading its own weights afterward is exactly
-    what's wanted here.
-    """
-    return {
-        "_load_video": {
-            "inputs": {"file": input_filename},
-            "class_type": "LoadVideo",
-        },
-        "_video_components": {
-            "inputs": {"video": ["_load_video", 0]},
-            "class_type": "GetVideoComponents",
-        },
-        "_flashvsr_pipe": {
-            "inputs": {
-                "model": FLASHVSR_MODEL_NAME,
-                "mode": "tiny",
-                "vae_model": "Wan2.1",
-                "force_offload": True,
-                "precision": "auto",
-                "device": "auto",
-                "attention_mode": "sparse_sage_attention",
-            },
-            "class_type": "FlashVSRNodeInitPipe",
-        },
-        "_flashvsr_upscale": {
-            "inputs": {
-                "pipe": ["_flashvsr_pipe", 0],
-                "frames": ["_video_components", 0],
-                "scale": 2,
-                "color_fix": True,
-                "tiled_vae": True,
-                "tiled_dit": True,
-                "tile_size": 256,
-                "tile_overlap": 24,
-                "unload_dit": False,
-                "sparse_ratio": 2.0,
-                "kv_ratio": 3.0,
-                "local_range": 11,
-                "seed": 0,
-                "frame_chunk_size": 0,
-                "enable_debug": True,
-                "keep_models_on_cpu": True,
-                "resize_factor": 1.0,
-            },
-            "class_type": "FlashVSRNodeAdv",
-        },
-        "_flashvsr_create_video": {
-            "inputs": {
-                "fps": ["_video_components", 2],
-                "bit_depth": 8,
-                "images": ["_flashvsr_upscale", 0],
-                "audio": ["_video_components", 1],
-            },
-            "class_type": "CreateVideo",
-        },
-        NODE_IDS["output"]: {
-            "inputs": {
-                "filename_prefix": "video/FlashVSR",
-                "format": "auto",
-                "codec": "auto",
-                "video": ["_flashvsr_create_video", 0],
-            },
-            "class_type": "SaveVideo",
-        },
-    }
-
-
 def upload_result_and_get_key(raw_bytes, filename):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     ext = os.path.splitext(filename)[1].lstrip(".") or "mp4"
@@ -766,58 +574,15 @@ def upload_result_and_get_key(raw_bytes, filename):
     return out_filename
 
 
-# Upscale methods that need their own separate submission rather than
-# splicing into the base generation's graph (unlike "esrgan2x"/
-# "nvidia_vsr") - see FLASHVSR_MODEL_NAME's comment for why. Maps to the
-# workflow-builder function each one uses.
-SECOND_STAGE_UPSCALE_BUILDERS = {
-    "flashvsr": build_flashvsr_payload,
-}
-
-
-def run_second_stage_upscale(base_result, build_payload_fn, should_cancel, should_force_kill):
-    """Shared by every entry in SECOND_STAGE_UPSCALE_BUILDERS: stages the
-    base generation's saved video into ComfyUI's input dir, evicts MiniMax
-    H3's weights from VRAM, submits build_payload_fn's graph against it,
-    and cleans up the staged input file. Returns that submission's raw
-    result (still needs the same force_killed/cancelled handling as any
-    submit_and_wait result, and fetch_output_video/upload - this only owns
-    the staging/free/submit/cleanup part, shared regardless of which
-    upscaler runs)."""
-    staged_filename = stage_video_for_reload(base_result)
-    free_comfyui_models()
-    workflow = build_payload_fn(staged_filename)
-    result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
-
-    staged_path = os.path.join(COMFYUI_DIR, "input", staged_filename)
-    try:
-        os.remove(staged_path)
-    except OSError as e:
-        print(f"Could not clean up {staged_path}: {e}")
-
-    return result
-
-
 def run_generation(job_input, should_cancel=None, should_force_kill=None):
-    """One full generation. upscale_method selects how the tail is built:
-    "none"/"esrgan2x"/"nvidia_vsr" stay a single submission (see
-    build_prompt_payload's docstring); anything in
-    SECOND_STAGE_UPSCALE_BUILDERS ("flashvsr") runs the base generation,
-    then a genuinely separate
-    second submission for that upscaler (see run_second_stage_upscale).
-    Shared by both the classic one-shot handler() path and run_session()'s
-    per-job loop below - identical either way, since ComfyUI itself only
-    ever has one thing loaded/running at a time regardless of which path
-    queued it. should_cancel/should_force_kill default to None (never
-    cancels) for the classic path, which has no per-job cancel flag to
-    poll.
-
-    No separate upscale-only timing here (production's koboldcpp path
-    doesn't expose that either) - upscale's cost is folded into the same
-    total time as everything else, same as any other node in the graph.
-    FlashVSR's enable_debug=True prints its own VRAM/timing summary to the
-    worker log for this comparison, since that can't ride through
-    gpu_session_jobs.output the same simple way.
+    """One full generation, always a single ComfyUI submission -
+    upscale_method "nvidia_vsr" just adds RTX VSR to that same graph (see
+    build_prompt_payload). Shared by both the classic one-shot handler()
+    path and run_session()'s per-job loop below - identical either way,
+    since ComfyUI itself only ever has one thing loaded/running at a time
+    regardless of which path queued it. should_cancel/should_force_kill
+    default to None (never cancels) for the classic path, which has no
+    per-job cancel flag to poll.
     """
     upscale_method = job_input.get("upscale_method", "none")
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
@@ -826,14 +591,6 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
         return {"cancelled": True, "force_killed": True}
     if result.get("cancelled"):
         return {"cancelled": True}
-
-    build_payload_fn = SECOND_STAGE_UPSCALE_BUILDERS.get(upscale_method)
-    if build_payload_fn:
-        result = run_second_stage_upscale(result, build_payload_fn, should_cancel, should_force_kill)
-        if result.get("force_killed"):
-            return {"cancelled": True, "force_killed": True}
-        if result.get("cancelled"):
-            return {"cancelled": True}
 
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
