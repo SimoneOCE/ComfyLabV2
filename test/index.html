@@ -54,8 +54,14 @@
   <label>Upscale
     <select id="upscaleMethod">
       <option value="none">None</option>
-      <option value="nvidia_vsr">NVIDIA RTX VSR 2x (ULTRA - standard, for compressed video)</option>
-      <option value="nvidia_vsr_hb">NVIDIA RTX VSR 2x (HIGHBITRATE_ULTRA - for clean sources)</option>
+      <option value="nvidia_vsr">NVIDIA RTX VSR (ULTRA - standard, for compressed video)</option>
+      <option value="nvidia_vsr_hb">NVIDIA RTX VSR (HIGHBITRATE_ULTRA - for clean sources)</option>
+    </select>
+  </label>
+  <label>Upscale factor (ignored when Upscale is None)
+    <select id="upscaleScale">
+      <option value="2">2x</option>
+      <option value="4">4x - holds the whole upscaled clip in worker RAM; keep the base resolution low</option>
     </select>
   </label>
 
@@ -119,7 +125,7 @@
 // depending on the browser, and this is a convenience, not something the
 // page depends on to function.
 const PERSISTED_FIELDS = [
-  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'seed', 'lora', 'upscaleMethod',
+  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'seed', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
@@ -444,7 +450,10 @@ async function runJob() {
   const loraChoice = document.getElementById('lora').value;
   if (loraChoice) genInput.lora = loraChoice;
   const upscaleMethod = document.getElementById('upscaleMethod').value;
-  if (upscaleMethod !== 'none') genInput.upscale_method = upscaleMethod;
+  if (upscaleMethod !== 'none') {
+    genInput.upscale_method = upscaleMethod;
+    genInput.upscale_scale = Number(document.getElementById('upscaleScale').value);
+  }
 
   // Session mode: a held-open worker is ready, so route through the job
   // queue instead of RunPod's own /run (which would spin up/reuse-by-luck

@@ -144,6 +144,12 @@ NVIDIA_VSR_QUALITY = "ULTRA"
 # full mode list.
 NVIDIA_VSR_HB_QUALITY = "HIGHBITRATE_ULTRA"
 UPSCALE_METHODS = {"none", "nvidia_vsr", "nvidia_vsr_hb"}
+# Allowed upscale_scale values. 4x holds the whole upscaled clip in system
+# RAM at once (the node writes to the decoded frames' device, which is
+# ComfyUI's intermediate_device() - system RAM - same mechanism that
+# OOM-killed ESRGAN 4x): ~31.6GB of float32 frames for a 1280x736, ~175
+# frame clip, before encoding. Fine at low base resolutions; risky at high.
+UPSCALE_SCALES = {2.0, 4.0}
 
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
@@ -473,7 +479,7 @@ def build_prompt_payload(job_input, upscale_method="none"):
             "inputs": {
                 "images": ["105:10", 0],
                 "resize_type": "scale by multiplier",
-                "resize_type.scale": NVIDIA_VSR_SCALE,
+                "resize_type.scale": job_input.get("upscale_scale", NVIDIA_VSR_SCALE),
                 "quality": NVIDIA_VSR_QUALITY,
             },
             "class_type": "RTXVideoSuperResolution",
@@ -483,7 +489,7 @@ def build_prompt_payload(job_input, upscale_method="none"):
         workflow["_nvidia_vsr"] = {
             "inputs": {
                 "images": ["105:10", 0],
-                "scale": NVIDIA_VSR_SCALE,
+                "scale": job_input.get("upscale_scale", NVIDIA_VSR_SCALE),
                 "quality": NVIDIA_VSR_HB_QUALITY,
             },
             "class_type": "ComfyLabRTXVideoSuperResolution",
@@ -642,6 +648,15 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
         raise ValueError(
             f"Unknown upscale_method {upscale_method!r} - this worker supports {sorted(UPSCALE_METHODS)}"
         )
+    try:
+        upscale_scale = float(job_input.get("upscale_scale", NVIDIA_VSR_SCALE))
+    except (TypeError, ValueError):
+        upscale_scale = None
+    if upscale_scale not in UPSCALE_SCALES:
+        raise ValueError(
+            f"Unsupported upscale_scale {job_input.get('upscale_scale')!r} - this worker supports {sorted(UPSCALE_SCALES)}"
+        )
+    job_input["upscale_scale"] = upscale_scale
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
     if result.get("force_killed"):
