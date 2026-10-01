@@ -574,6 +574,32 @@ def upload_result_and_get_key(raw_bytes, filename):
     return out_filename
 
 
+# RandomNoise's own noise_seed range (comfy_extras/nodes_custom_sampler.py
+# at the pinned commit: min=0, max=0xffffffffffffffff).
+SEED_MAX = 0xFFFFFFFFFFFFFFFF
+
+
+def resolve_seed(raw):
+    """None/"" -> a fresh random seed; otherwise must be a whole number in
+    RandomNoise's range (an int, or a string of digits). Anything else
+    fails the job with a clear error rather than ComfyUI's generic 400."""
+    if raw is None or raw == "":
+        return uuid.uuid4().int & 0xFFFFFFFF
+    if isinstance(raw, bool):
+        raise ValueError(f"seed must be a whole number, got {raw!r}")
+    if isinstance(raw, int):
+        seed = raw
+    elif isinstance(raw, float) and raw.is_integer():
+        seed = int(raw)
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        seed = int(raw.strip())
+    else:
+        raise ValueError(f"seed must be a whole number, got {raw!r}")
+    if not 0 <= seed <= SEED_MAX:
+        raise ValueError(f"seed must be between 0 and {SEED_MAX}, got {seed}")
+    return seed
+
+
 def run_generation(job_input, should_cancel=None, should_force_kill=None):
     """One full generation, always a single ComfyUI submission -
     upscale_method "nvidia_vsr" just adds RTX VSR to that same graph (see
@@ -584,6 +610,11 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
     default to None (never cancels) for the classic path, which has no
     per-job cancel flag to poll.
     """
+    # Resolved here (not left to build_prompt_payload's fallback) so the
+    # seed actually used can be returned with the result - needed to re-run
+    # the exact same video, e.g. with vs. without upscale.
+    job_input = dict(job_input)
+    job_input["seed"] = resolve_seed(job_input.get("seed"))
     upscale_method = job_input.get("upscale_method", "none")
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
@@ -594,7 +625,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
 
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
-    return {"videoKey": video_key}
+    return {"videoKey": video_key, "seed": job_input["seed"]}
 
 
 # --- Session mode (held-open worker) -------------------------------------

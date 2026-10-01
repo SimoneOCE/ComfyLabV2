@@ -41,6 +41,9 @@
   <label>Height <input id="height" type="number" value="736" /></label>
   <label>Duration (seconds) <input id="duration" type="number" value="7.29" step="0.01" /></label>
   <label>Steps <input id="steps" type="number" value="20" /></label>
+  <label>Seed (blank = random; the seed actually used is shown in the result)
+    <input id="seed" type="text" inputmode="numeric" placeholder="random" />
+  </label>
   <label>LoRA
     <select id="lora">
       <option value="">None</option>
@@ -115,7 +118,7 @@
 // depending on the browser, and this is a convenience, not something the
 // page depends on to function.
 const PERSISTED_FIELDS = [
-  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'lora', 'upscaleMethod',
+  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'seed', 'lora', 'upscaleMethod',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
@@ -426,6 +429,17 @@ async function runJob() {
     duration: Number(document.getElementById('duration').value),
     steps: Number(document.getElementById('steps').value),
   };
+  // Seed: whole number or blank. Capped at Number.MAX_SAFE_INTEGER because
+  // the payload goes out as JSON numbers, which lose precision above that
+  // (the worker itself accepts RandomNoise's full 0..2^64-1 range).
+  const seedRaw = document.getElementById('seed').value.trim();
+  if (seedRaw !== '') {
+    if (!/^\d+$/.test(seedRaw) || !Number.isSafeInteger(Number(seedRaw))) {
+      statusEl.textContent = `Seed must be a whole number from 0 to ${Number.MAX_SAFE_INTEGER}, or blank for random.`;
+      return;
+    }
+    genInput.seed = Number(seedRaw);
+  }
   const loraChoice = document.getElementById('lora').value;
   if (loraChoice) genInput.lora = loraChoice;
   const upscaleMethod = document.getElementById('upscaleMethod').value;
