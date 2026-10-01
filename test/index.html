@@ -387,6 +387,13 @@ function getS3Client() {
 
 async function resolveVideoUrl(videoKey) {
   const bucket = document.getElementById('s3Bucket').value.trim();
+  // getSignedUrl doesn't throw on empty credentials - it still hands back a
+  // URL, just one Wasabi rejects with AccessDenied (looks like the link is
+  // "locked behind a Wasabi login"). These fields are only remembered per
+  // browser (localStorage), so a new machine/browser starts with them empty.
+  if (!bucket || !document.getElementById('s3AccessKey').value.trim() || !document.getElementById('s3SecretKey').value.trim()) {
+    throw new Error('Wasabi bucket / access key / secret key is empty - fill them in (they are saved per browser, so a new machine needs them re-entered)');
+  }
   const s3 = getS3Client();
   // Plain presigned URL - unlike RunPod's own S3-compatible endpoint (which
   // rejected query-string SigV4 auth entirely, confirmed by a real

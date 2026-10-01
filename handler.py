@@ -833,10 +833,26 @@ def run_session(session_id):
         heartbeat_thread.start()
         try:
             try:
+                # Stop GPU mid-generation counts as a force cancel. Stop only
+                # ends the session (ended_at + claim row deleted) - it never
+                # sets this job's own cancel flags - and the loop's own
+                # is_session_active() check above only runs BETWEEN jobs, so
+                # without this a running generation kept the GPU busy until
+                # it finished or hit submit_and_wait's 20-minute timeout
+                # (seen on a real run: a huge-resolution job kept going after
+                # Stop until it was cancelled by hand in RunPod). There's no
+                # reaper on this test endpoint to backstop it the way
+                # production's REAP_STOP_GRACE_MS does. Force-kill, not a
+                # graceful /interrupt: the session is over either way, and an
+                # interrupt only lands at a step boundary, which can be
+                # minutes away at high resolution.
                 result = run_generation(
                     job_row["input"],
                     should_cancel=lambda: is_job_cancel_requested(job_row["id"]),
-                    should_force_kill=lambda: is_job_force_cancel_requested(job_row["id"]),
+                    should_force_kill=lambda: (
+                        is_job_force_cancel_requested(job_row["id"])
+                        or not is_session_active(session_id)
+                    ),
                 )
             except Exception as e:
                 result = {"error": str(e)}
@@ -846,6 +862,13 @@ def run_session(session_id):
 
         finish_job(job_row["id"], result)
         jobs_processed += 1
+
+        # Session stopped during this job (see should_force_kill above) -
+        # end now rather than restarting and re-warming a ComfyUI that was
+        # just killed for a session nobody is using anymore.
+        if not is_session_active(session_id):
+            print(f"Session {session_id}: stopped during job {job_row['id']}, ending loop.")
+            return session_summary("stopped")
 
         # Two separate ways ComfyUI can be down after a job: we killed it
         # ourselves (force_killed), or it crashed on its own - a real run
