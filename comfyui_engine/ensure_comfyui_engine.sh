@@ -232,6 +232,15 @@ else
     git -C "$NVIDIA_VSR_NODE_DIR" checkout "$NVIDIA_VSR_NODE_COMMIT"
 fi
 pip install "nvidia-vfx==$NVIDIA_VFX_VERSION"
+
+# Our own copy of the RTX VSR node with NVIDIA's HIGHBITRATE modes exposed
+# (see comfyui_engine/custom_nodes/comfylab_rtx_vsr/__init__.py). Shipped in
+# this repo, so it's copied fresh from the image on every worker boot -
+# overwritten, never "already present", so an updated image always wins.
+COMFYLAB_NODES_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/comfylab_rtx_vsr"
+rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
+cp -r "$COMFYLAB_NODES_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
+echo "[comfylab-engine] Installed comfylab_rtx_vsr custom node."
 echo "[comfylab-engine] nvidia-vfx installed: $(pip show nvidia-vfx 2>/dev/null | grep '^Version:' || echo 'NOT INSTALLED')"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
 

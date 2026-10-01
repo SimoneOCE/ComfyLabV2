@@ -136,6 +136,13 @@ LORA_CHOICES = {
 # no-upscale job stayed at native resolution.
 NVIDIA_VSR_SCALE = 2.0
 NVIDIA_VSR_QUALITY = "ULTRA"
+# "nvidia_vsr_hb": same upscale, NVIDIA's HIGHBITRATE_ULTRA mode - their
+# upscale for clean sources, which skips the compression-artifact
+# suppression the standard modes apply. The official node can't select it,
+# so this goes through our own ComfyLabRTXVideoSuperResolution
+# (comfyui_engine/custom_nodes/comfylab_rtx_vsr) - same processing loop,
+# full mode list.
+NVIDIA_VSR_HB_QUALITY = "HIGHBITRATE_ULTRA"
 
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
@@ -346,8 +353,8 @@ def save_input_image(b64_data, prefix):
 
 def build_prompt_payload(job_input, upscale_method="none"):
     """Builds the full workflow graph for one generation. upscale_method
-    "nvidia_vsr" splices RTX VSR into the SAME submission as everything
-    else (matching how production's koboldcpp path does upscale - one
+    "nvidia_vsr" / "nvidia_vsr_hb" splices RTX VSR into the SAME submission
+    as everything else (matching how production's koboldcpp path does upscale - one
     request, not two).
     """
     with open(WORKFLOW_TEMPLATE_PATH, "r") as f:
@@ -469,6 +476,16 @@ def build_prompt_payload(job_input, upscale_method="none"):
                 "quality": NVIDIA_VSR_QUALITY,
             },
             "class_type": "RTXVideoSuperResolution",
+        }
+        workflow["105:91"]["inputs"]["images"] = ["_nvidia_vsr", 0]
+    elif upscale_method == "nvidia_vsr_hb":
+        workflow["_nvidia_vsr"] = {
+            "inputs": {
+                "images": ["105:10", 0],
+                "scale": NVIDIA_VSR_SCALE,
+                "quality": NVIDIA_VSR_HB_QUALITY,
+            },
+            "class_type": "ComfyLabRTXVideoSuperResolution",
         }
         workflow["105:91"]["inputs"]["images"] = ["_nvidia_vsr", 0]
 
