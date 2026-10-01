@@ -175,15 +175,16 @@ FLASHVSR_MODEL_NAME = "FlashVSR-v1.1"
 # and NVIDIA's own SDK license (developer.download.nvidia.com/licenses/
 # Maxine_SDK_License_1Apr2021_updated.pdf, section 1.4) says pre-release
 # SDKs "are not intended for use in production or business-critical
-# systems" - that's their license, not caution added here. Wired in
-# anyway for this comparison tool specifically because that restriction
-# is about shipping it live, not about testing it: the node itself
-# processes one frame at a time internally (verified against its actual
-# __init__.py) rather than accumulating a whole-video batch, and is a
-# small dedicated SR effect, not a diffusion model - much lighter than
-# FlashVSR - but it still gets the same separate-submission + /free
-# treatment for consistency, since its real VRAM footprint on this exact
-# hardware/driver combination hasn't been measured yet either.
+# systems" - that's their license, not caution added here.
+#
+# Spliced into the SAME submission as the base generation, like ESRGAN -
+# no /free, no second submission. It's a small per-frame SR network, not a
+# diffusion model, so it doesn't need MiniMax H3 evicted to fit, and
+# keeping it in one graph means the base model stays resident in VRAM for
+# the next job in the session (the whole point of a warm session). It also
+# skips the save -> stage -> LoadVideo -> re-encode round trip that the
+# second-stage path does.
+NVIDIA_VSR_SCALE = 2.0
 NVIDIA_VSR_QUALITY = "ULTRA"
 
 comfyui_process = None
@@ -393,9 +394,10 @@ def save_input_image(b64_data, prefix):
     return filename
 
 
-def build_prompt_payload(job_input, include_upscale=False):
-    """Builds the full workflow graph for one generation. include_upscale
-    splices the ESRGAN nodes into the SAME submission as everything else
+def build_prompt_payload(job_input, upscale_method="none"):
+    """Builds the full workflow graph for one generation. upscale_method
+    "esrgan2x" or "nvidia_vsr" splices that upscaler's nodes into the SAME
+    submission as everything else
     (matching how production's koboldcpp path does upscale - one request,
     not two). An earlier two-submission design (base gen + a separate
     follow-up upscale request) got reverted at the time on the theory that
@@ -516,7 +518,7 @@ def build_prompt_payload(job_input, include_upscale=False):
     # submission as everything else - ComfyUI's own dynamic VRAM
     # management frees the diffusion model automatically once nothing
     # downstream needs it anymore, same as every other node transition.
-    if include_upscale:
+    if upscale_method == "esrgan2x":
         workflow["_upscale_loader"] = {
             "inputs": {"model_name": UPSCALE_MODEL["filename"]},
             "class_type": "UpscaleModelLoader",
@@ -529,6 +531,31 @@ def build_prompt_payload(job_input, include_upscale=False):
             "class_type": "ImageUpscaleWithModel",
         }
         workflow["105:91"]["inputs"]["images"] = ["_upscale_apply", 0]
+
+
+    # NVIDIA RTX VSR - same splice point as ESRGAN (VAEDecode frames ->
+    # CreateVideo). resize_type is a DynamicCombo: API-format prompts carry
+    # it as FLAT keys - the selected option's key under "resize_type" and
+    # that option's own inputs under "resize_type.<name>" - which ComfyUI
+    # nests back into one dict before execute() (verified against
+    # comfy_api/latest/_io.py at the pinned commit: DynamicCombo's
+    # _expand_schema_for_dynamic matches live_inputs["resize_type"] against
+    # the option keys, finalize_prefix joins sub-inputs with ".", and
+    # build_nested_inputs rebuilds the dict). Same convention the template
+    # already uses for ComfyMathExpression's "values.a". The previous
+    # second-stage version sent a nested dict here instead, which matches
+    # no option key.
+    elif upscale_method == "nvidia_vsr":
+        workflow["_nvidia_vsr"] = {
+            "inputs": {
+                "images": ["105:10", 0],
+                "resize_type": "scale by multiplier",
+                "resize_type.scale": NVIDIA_VSR_SCALE,
+                "quality": NVIDIA_VSR_QUALITY,
+            },
+            "class_type": "RTXVideoSuperResolution",
+        }
+        workflow["105:91"]["inputs"]["images"] = ["_nvidia_vsr", 0]
 
     return workflow
 
@@ -724,62 +751,6 @@ def build_flashvsr_payload(input_filename):
     }
 
 
-def build_nvidia_vsr_payload(input_filename):
-    """Second-submission graph for the NVIDIA RTX VSR path - see
-    NVIDIA_VSR_QUALITY's comment for why this still gets its own
-    submission despite being a lighter-weight node than FlashVSR.
-    RTXVideoSuperResolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI, verified
-    against its actual __init__.py) takes a single IMAGE input and a
-    DynamicCombo "resize_type" choosing between scale-by-multiplier and
-    target-dimensions.
-
-    UNVERIFIED wire format, same caveat as build_prompt_payload's
-    ref_image DynamicCombo-adjacent note: the node's execute() signature
-    takes resize_type as ONE merged dict (`resize_type["resize_type"]`,
-    `resize_type["scale"]` read off the same object), unlike SaveVideo's
-    format/codec split in the base graph's own template - no real API-
-    format export of this node exists to confirm this shape against, so
-    this is reasoned from source, not captured. Test this path first.
-    scale=2.0 matches ESRGAN/FlashVSR's scale for a fair comparison.
-    """
-    return {
-        "_load_video": {
-            "inputs": {"file": input_filename},
-            "class_type": "LoadVideo",
-        },
-        "_video_components": {
-            "inputs": {"video": ["_load_video", 0]},
-            "class_type": "GetVideoComponents",
-        },
-        "_nvidia_vsr": {
-            "inputs": {
-                "images": ["_video_components", 0],
-                "resize_type": {"resize_type": "scale by multiplier", "scale": 2.0},
-                "quality": NVIDIA_VSR_QUALITY,
-            },
-            "class_type": "RTXVideoSuperResolution",
-        },
-        "_nvidia_vsr_create_video": {
-            "inputs": {
-                "fps": ["_video_components", 2],
-                "bit_depth": 8,
-                "images": ["_nvidia_vsr", 0],
-                "audio": ["_video_components", 1],
-            },
-            "class_type": "CreateVideo",
-        },
-        NODE_IDS["output"]: {
-            "inputs": {
-                "filename_prefix": "video/NvidiaVSR",
-                "format": "auto",
-                "codec": "auto",
-                "video": ["_nvidia_vsr_create_video", 0],
-            },
-            "class_type": "SaveVideo",
-        },
-    }
-
-
 def upload_result_and_get_key(raw_bytes, filename):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     ext = os.path.splitext(filename)[1].lstrip(".") or "mp4"
@@ -796,12 +767,11 @@ def upload_result_and_get_key(raw_bytes, filename):
 
 
 # Upscale methods that need their own separate submission rather than
-# splicing into the base generation's graph (unlike "esrgan2x") - see
-# FLASHVSR_MODEL_NAME's and NVIDIA_VSR_QUALITY's comments for why each one
-# does. Maps to the workflow-builder function each one uses.
+# splicing into the base generation's graph (unlike "esrgan2x"/
+# "nvidia_vsr") - see FLASHVSR_MODEL_NAME's comment for why. Maps to the
+# workflow-builder function each one uses.
 SECOND_STAGE_UPSCALE_BUILDERS = {
     "flashvsr": build_flashvsr_payload,
-    "nvidia_vsr": build_nvidia_vsr_payload,
 }
 
 
@@ -830,9 +800,10 @@ def run_second_stage_upscale(base_result, build_payload_fn, should_cancel, shoul
 
 def run_generation(job_input, should_cancel=None, should_force_kill=None):
     """One full generation. upscale_method selects how the tail is built:
-    "none"/"esrgan2x" stay a single submission (see build_prompt_payload's
-    docstring); anything in SECOND_STAGE_UPSCALE_BUILDERS ("flashvsr",
-    "nvidia_vsr") runs the base generation, then a genuinely separate
+    "none"/"esrgan2x"/"nvidia_vsr" stay a single submission (see
+    build_prompt_payload's docstring); anything in
+    SECOND_STAGE_UPSCALE_BUILDERS ("flashvsr") runs the base generation,
+    then a genuinely separate
     second submission for that upscaler (see run_second_stage_upscale).
     Shared by both the classic one-shot handler() path and run_session()'s
     per-job loop below - identical either way, since ComfyUI itself only
@@ -849,7 +820,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
     gpu_session_jobs.output the same simple way.
     """
     upscale_method = job_input.get("upscale_method", "none")
-    workflow = build_prompt_payload(job_input, include_upscale=(upscale_method == "esrgan2x"))
+    workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
     if result.get("force_killed"):
         return {"cancelled": True, "force_killed": True}

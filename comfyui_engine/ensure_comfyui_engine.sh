@@ -286,13 +286,26 @@ fi
 # intended for production). No separate model-weight download needed -
 # its VFX SDK libraries ship bundled inside the nvidia-vfx wheel itself,
 # unlike FlashVSR's multi-GB checkpoint.
+#
+# Both pinned now. COMFYUI_DIR is inside the container (not the volume), so
+# this clone + pip install re-runs on every fresh worker - unpinned, that
+# silently picked up whatever was newest at boot time (nvidia-vfx 0.2.0.0
+# shipped 2026-09-30 16:36 UTC, ~30 min before RTX VSR was first wired in
+# here). NVIDIA_VFX_VERSION is overridable from the RunPod endpoint's env
+# vars so versions can be A/B'd without a rebuild; the installed version is
+# printed below so every worker log shows which one actually ran.
+NVIDIA_VSR_NODE_COMMIT="892515e3eb9a4920a131a502a047e47adca9eb0d"
+NVIDIA_VFX_VERSION="${NVIDIA_VFX_VERSION:-0.2.0.0}"
 NVIDIA_VSR_NODE_DIR="$COMFYUI_DIR/custom_nodes/Nvidia_RTX_Nodes_ComfyUI"
 if [ -d "$NVIDIA_VSR_NODE_DIR" ]; then
     echo "[comfylab-engine] NVIDIA RTX VSR custom node already present, skipping clone."
 else
     echo "[comfylab-engine] Cloning NVIDIA RTX VSR custom node..."
-    git clone --depth 1 https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI.git "$NVIDIA_VSR_NODE_DIR"
+    git clone https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI.git "$NVIDIA_VSR_NODE_DIR"
+    git -C "$NVIDIA_VSR_NODE_DIR" checkout "$NVIDIA_VSR_NODE_COMMIT"
 fi
-pip install nvidia-vfx
+pip install "nvidia-vfx==$NVIDIA_VFX_VERSION"
+echo "[comfylab-engine] nvidia-vfx installed: $(pip show nvidia-vfx 2>/dev/null | grep '^Version:' || echo 'NOT INSTALLED')"
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
 
 echo "[comfylab-engine] Done. Engine + models ready on volume."
