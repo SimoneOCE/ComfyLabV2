@@ -624,7 +624,7 @@ def resolve_seed(raw):
     return seed
 
 
-def run_generation(job_input, should_cancel=None, should_force_kill=None):
+def run_generation(job_input, should_cancel=None, should_force_kill=None, upload=True):
     """One full generation, always a single ComfyUI submission -
     upscale_method "nvidia_vsr" just adds RTX VSR to that same graph (see
     build_prompt_payload). Shared by both the classic one-shot handler()
@@ -663,6 +663,19 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None):
         return {"cancelled": True, "force_killed": True}
     if result.get("cancelled"):
         return {"cancelled": True}
+
+    if not upload:
+        # Warmup runs: the output is a throwaway 1-step 320x320 clip. It used
+        # to go through the same upload as a real job, so every session start
+        # (and every re-warm after a crash/force-kill) left an orphaned, blurry
+        # video in Wasabi with no record of where it came from. Just delete
+        # ComfyUI's local copy instead.
+        _, raw_path = _output_video_info_and_path(result)
+        try:
+            os.remove(raw_path)
+        except OSError as e:
+            print(f"Could not clean up warmup output {raw_path}: {e}")
+        return {"seed": job_input["seed"]}
 
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
@@ -844,7 +857,7 @@ def run_session(session_id):
             "height": 320,
             "duration": 1.0,
             "steps": 1,
-        })
+        }, upload=False)
         warmup_seconds = round(time.time() - warmup_start, 1)
         print(f"Session {session_id}: warmup generation done ({warmup_seconds}s).")
     except Exception as e:
@@ -961,7 +974,7 @@ def run_session(session_id):
                     "height": 320,
                     "duration": 1.0,
                     "steps": 1,
-                })
+                }, upload=False)
             except Exception as e:
                 print(f"Session {session_id}: failed to restart after ComfyUI {reason} ({e}) - ending session.")
                 mark_session_ended(session_id, "error")
