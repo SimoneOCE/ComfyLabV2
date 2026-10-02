@@ -421,8 +421,16 @@ def _hf_expected_size(url, headers):
     rather than fail."""
     try:
         r = requests.head(url, headers=headers, allow_redirects=False, timeout=30)
-        size = r.headers.get("X-Linked-Size") or r.headers.get("x-linked-size") or r.headers.get("Content-Length")
-        return int(size) if size and r.status_code < 400 else None
+        if r.status_code >= 400:
+            return None
+        # LFS/xet files answer with a redirect whose own Content-Length is
+        # the redirect body, not the file - only X-Linked-Size is the file
+        # size there. A direct 200 (small non-LFS file) carries the real
+        # size in Content-Length.
+        size = r.headers.get("X-Linked-Size")
+        if size is None and r.status_code == 200:
+            size = r.headers.get("Content-Length")
+        return int(size) if size else None
     except Exception as e:
         print(f"Could not get expected size for {url}: {e}")
         return None
@@ -458,7 +466,9 @@ def ensure_model_file(spec, subdir):
     tmp = dest + ".part"
     print(f"Downloading {spec['repo']}/{spec['repo_path']} -> {dest}...")
     start = time.time()
-    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+    # identity encoding: requests transparently un-gzips, which would make
+    # bytes written differ from Content-Length and fail every download.
+    with requests.get(url, headers={**headers, "Accept-Encoding": "identity"}, stream=True, timeout=60) as r:
         if r.status_code in (401, 403):
             raise RuntimeError(
                 f"HuggingFace refused {spec['repo']} ({r.status_code}) - gated repo: accept its terms "
