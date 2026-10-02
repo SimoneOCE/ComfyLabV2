@@ -7,6 +7,7 @@ import requests
 import os
 import json
 import shutil
+import urllib.parse
 import uuid
 import base64
 import boto3
@@ -373,6 +374,78 @@ def save_input_image(b64_data, prefix):
     return filename
 
 
+# Diffusion-model bake-off (job field "model"). All are pruned int8 ConvRot
+# H3 checkpoints - same architecture and ~21GB as the base, so speed and
+# memory are unchanged (checkpoint headers inspected: 50 blocks,
+# adaln_t_table pruned layout, comfy_quant int8). Non-base files download
+# on first use to the volume (see ensure_model_file), not at boot, so a
+# worker only pays for the ones actually tested.
+#   base        - Comfy-Org's official pruned int8 (the existing default)
+#   dasiwa_v3   - DaSiWa Hybrid V3 fine-tune (FL2VA+Ref2VA hybrid; what
+#                 production runs is its V1). Gated repo: needs HF_TOKEN
+#                 with the repo's terms accepted.
+#   singularity - Singularity v1.3 fine-tune; claims reduced face distortion
+#                 in medium-to-long shots. The *Pruned* int8 file (the
+#                 non-pruned one is 34GB).
+MODEL_CHOICES = {
+    "base": {"filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
+    "dasiwa_v3": {
+        "filename": "dasiwa_minimax_h3_hybrid_v3_int8_convrot.safetensors",
+        "repo": "darksidewalker/MiniMaxH3",
+        "repo_path": "model/DasiwaMinimaxH3_dasiwaHybridV3_3263052-INT8 ConvRot.safetensors",
+    },
+    "singularity": {
+        "filename": "minimax_h3_singularity_ref2va_pruned_v1.3_int8.safetensors",
+        "repo": "WarmBloodAban/Minimax-h3_Singularity",
+        "repo_path": "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors",
+    },
+}
+
+# fal's MiniMax H3 Realism People LoRA (job field "realism_lora": true).
+# Touches only the shared attention projections, so it loads on the pruned
+# builds and works for T2V/I2V/R2V. Its trigger word is prepended to the
+# prompt automatically; 1.0 is fal's intended strength.
+REALISM_LORA = {
+    "filename": "fal_h3_realism_people_t2v_i2v_r2v.safetensors",
+    "repo": "fal/MiniMax-H3-Realism-People-LoRA",
+    "repo_path": "h3-realism-people-t2v-i2v-r2v.safetensors",
+    "trigger": "r34l1sm",
+    "strength": 1.0,
+}
+
+
+def ensure_model_file(spec, subdir):
+    """Downloads a HuggingFace file to VOLUME_MODELS_DIR/subdir on first use
+    (skipped if already there). Streams to a .part file and renames only
+    once complete, so an interrupted download is never mistaken for a
+    finished one. HF_TOKEN (endpoint env var) is sent when set - required
+    for gated repos."""
+    dest_dir = os.path.join(VOLUME_MODELS_DIR, subdir)
+    dest = os.path.join(dest_dir, spec["filename"])
+    if os.path.exists(dest) or "repo" not in spec:
+        return
+    os.makedirs(dest_dir, exist_ok=True)
+    url = f"https://huggingface.co/{spec['repo']}/resolve/main/{urllib.parse.quote(spec['repo_path'])}"
+    headers = {}
+    if os.environ.get("HF_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+    tmp = dest + ".part"
+    print(f"Downloading {spec['repo']}/{spec['repo_path']} -> {dest} (first use)...")
+    start = time.time()
+    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        if r.status_code in (401, 403):
+            raise RuntimeError(
+                f"HuggingFace refused {spec['repo']} ({r.status_code}) - gated repo: accept its terms "
+                f"on huggingface.co and set HF_TOKEN on the endpoint"
+            )
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
+                f.write(chunk)
+    os.replace(tmp, dest)
+    print(f"Downloaded {spec['filename']} in {round(time.time() - start)}s.")
+
+
 def build_prompt_payload(job_input, upscale_method="none"):
     """Builds the full workflow graph for one generation. upscale_method
     "nvidia_vsr" / "nvidia_vsr_hb" splices RTX VSR into the SAME submission
@@ -464,20 +537,39 @@ def build_prompt_payload(job_input, upscale_method="none"):
     # comment) - splice a LoraLoaderModelOnly node between the base UNET
     # loader and PathchSageAttentionKJ only when one's requested, leaving
     # today's direct wiring untouched otherwise.
+    # Diffusion model (bake-off) - swaps the UNETLoader's file.
+    workflow[NODE_IDS["unet_loader"]]["inputs"]["unet_name"] = MODEL_CHOICES[job_input.get("model", "base")]["filename"]
+
+    # LoRA chain: UNETLoader -> [turbo LoRA] -> [realism LoRA] -> Sage/guider.
+    model_src = [NODE_IDS["unet_loader"], 0]
     lora_key = job_input.get("lora")
     if lora_key and lora_key in LORA_CHOICES:
         preset = LORA_CHOICES[lora_key]
         workflow["_lora"] = {
             "inputs": {
-                "model": [NODE_IDS["unet_loader"], 0],
+                "model": model_src,
                 "lora_name": preset["filename"],
                 "strength_model": preset["multiplier"],
             },
             "class_type": "LoraLoaderModelOnly",
         }
-        workflow[NODE_IDS["sage_attention"]]["inputs"]["model"] = ["_lora", 0]
+        model_src = ["_lora", 0]
         if "steps" not in job_input:
             workflow[NODE_IDS["steps"]]["inputs"]["steps"] = preset["default_steps"]
+    if job_input.get("realism_lora"):
+        workflow["_realism_lora"] = {
+            "inputs": {
+                "model": model_src,
+                "lora_name": REALISM_LORA["filename"],
+                "strength_model": REALISM_LORA["strength"],
+            },
+            "class_type": "LoraLoaderModelOnly",
+        }
+        model_src = ["_realism_lora", 0]
+        prompt_inputs = workflow[NODE_IDS["prompt_and_dims"]]["inputs"]
+        if not prompt_inputs["prompt"].startswith(REALISM_LORA["trigger"]):
+            prompt_inputs["prompt"] = f"{REALISM_LORA['trigger']}, {prompt_inputs['prompt']}"
+    workflow[NODE_IDS["sage_attention"]]["inputs"]["model"] = model_src
 
     apply_attention_mode(workflow, job_input.get("attention", "sage"))
 
@@ -740,6 +832,12 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
     attention = job_input.get("attention", "sage")
     if attention not in ATTENTION_MODES:
         raise ValueError(f"Unknown attention {attention!r} - this worker supports {sorted(ATTENTION_MODES)}")
+    model = job_input.get("model", "base")
+    if model not in MODEL_CHOICES:
+        raise ValueError(f"Unknown model {model!r} - this worker supports {sorted(MODEL_CHOICES)}")
+    ensure_model_file(MODEL_CHOICES[model], "diffusion_models")
+    if job_input.get("realism_lora"):
+        ensure_model_file(REALISM_LORA, "loras")
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
     comfy_start = time.time()
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
@@ -764,7 +862,14 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
-    return {"videoKey": video_key, "seed": job_input["seed"], "attention": attention, "comfy_seconds": comfy_seconds}
+    return {
+        "videoKey": video_key,
+        "seed": job_input["seed"],
+        "attention": attention,
+        "model": model,
+        "realism_lora": bool(job_input.get("realism_lora")),
+        "comfy_seconds": comfy_seconds,
+    }
 
 
 # --- Session mode (held-open worker) -------------------------------------

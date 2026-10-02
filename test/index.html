@@ -38,6 +38,29 @@
   <label>API Key
     <input id="apiKey" type="password" placeholder="rpa_..." />
   </label>
+  <label>Bake-off preset (fills in the settings below; you can still change them after)
+    <select id="bakeoff">
+      <option value="">— pick a preset —</option>
+      <option value="1">1. Base (current setup: official model, SageAttention)</option>
+      <option value="2">2. Base + fal Realism People LoRA</option>
+      <option value="3">3. DaSiWa Hybrid V3</option>
+      <option value="4">4. Singularity v1.3</option>
+      <option value="5a">5a. DaSiWa Hybrid V3 + fal Realism People LoRA</option>
+      <option value="5b">5b. Singularity v1.3 + fal Realism People LoRA</option>
+    </select>
+  </label>
+  <div style="font-size:0.8rem; color:#888; margin-top:4px;">Every preset: 16:9 · 768p native · 20 steps · SageAttention · no turbo LoRA · no upscale · seed 424242 if blank. Prompt and duration are left as you set them.</div>
+  <label>Model
+    <select id="model">
+      <option value="base">Base — Comfy-Org official H3 (pruned int8)</option>
+      <option value="dasiwa_v3">DaSiWa Hybrid V3 (int8; first use downloads ~21GB, needs HF_TOKEN)</option>
+      <option value="singularity">Singularity v1.3 (pruned int8; first use downloads ~21GB)</option>
+    </select>
+  </label>
+  <label style="display:flex; align-items:center; gap:8px;">
+    <input id="realismLora" type="checkbox" style="width:auto;" />
+    fal Realism People LoRA (adds trigger word automatically)
+  </label>
   <label>Prompt
     <textarea id="prompt">a cat surfing a wave</textarea>
   </label>
@@ -78,9 +101,8 @@
   </label>
   <label>Attention
     <select id="attention">
-      <option value="sage">A: SageAttention (fastest; INT8 - can morph late in clips on H3)</option>
-      <option value="off">B: Standard attention (exact, slowest)</option>
-      <option value="sparse">C: Sparse sol-attn, no Sage (ComfyUI built-in; gain grows with clip length)</option>
+      <option value="sage">SageAttention (fastest; INT8 - can morph late in clips on H3)</option>
+      <option value="off">Standard attention (exact, ~2x slower)</option>
     </select>
   </label>
   <label>Upscale
@@ -157,7 +179,7 @@
 // depending on the browser, and this is a convenience, not something the
 // page depends on to function.
 const PERSISTED_FIELDS = [
-  'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'lora', 'upscaleMethod', 'upscaleScale',
+  'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'model', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
@@ -206,6 +228,15 @@ function wireUpPersistence() {
 
 loadPersistedFields();
 wireUpPersistence();
+
+// A saved value that's no longer an option (e.g. "sparse" after it was
+// removed) leaves a <select> blank, which would send "" to the worker.
+// Fall back to the first option instead.
+for (const sel of document.querySelectorAll('select')) {
+  if (sel.selectedIndex === -1 || sel.value === '' && sel.options.length && sel.options[0].value !== '') {
+    sel.selectedIndex = 0;
+  }
+}
 
 // Resolution presets - same table as the live site
 // (minimax-h3-website web/src/components/generate/constants.ts: RESOLUTIONS,
@@ -256,6 +287,50 @@ for (const id of ['ratio', 'quality', 'width', 'height']) {
   document.getElementById(id).addEventListener('input', applyResolution);
 }
 applyResolution();
+
+// Checkbox persistence (PERSISTED_FIELDS only handles .value fields).
+(function wireRealismLora() {
+  const box = document.getElementById('realismLora');
+  try { box.checked = localStorage.getItem('comfylab_realismLora') === '1'; } catch (e) {}
+  box.addEventListener('change', () => {
+    try { localStorage.setItem('comfylab_realismLora', box.checked ? '1' : '0'); } catch (e) {}
+  });
+})();
+
+// Bake-off presets: write into the real controls (and fire their events so
+// persistence + the resolution readout update), rather than overriding the
+// payload behind the scenes - what you see in the boxes is what gets sent.
+const BAKEOFF_PRESETS = {
+  '1':  { model: 'base',        realism: false },
+  '2':  { model: 'base',        realism: true  },
+  '3':  { model: 'dasiwa_v3',   realism: false },
+  '4':  { model: 'singularity', realism: false },
+  '5a': { model: 'dasiwa_v3',   realism: true  },
+  '5b': { model: 'singularity', realism: true  },
+};
+function setField(id, value) {
+  const el = document.getElementById(id);
+  if (el.type === 'checkbox') {
+    el.checked = value;
+    el.dispatchEvent(new Event('change'));
+  } else {
+    el.value = value;
+    el.dispatchEvent(new Event('input'));
+  }
+}
+document.getElementById('bakeoff').addEventListener('change', (e) => {
+  const preset = BAKEOFF_PRESETS[e.target.value];
+  if (!preset) return;
+  setField('model', preset.model);
+  setField('realismLora', preset.realism);
+  setField('ratio', '16:9');
+  setField('quality', 'native');
+  setField('steps', '20');
+  setField('attention', 'sage');
+  setField('lora', '');
+  setField('upscaleMethod', 'none');
+  if (!document.getElementById('seed').value.trim()) setField('seed', '424242');
+});
 
 // --- GPU Session (held-open worker) --------------------------------------
 // Mirrors minimax-h3-worker's server.js /api/session/start + GeneratorPanel.tsx's
@@ -553,6 +628,8 @@ async function runJob() {
     genInput.seed = Number(seedRaw);
   }
   genInput.attention = document.getElementById('attention').value;
+  genInput.model = document.getElementById('model').value;
+  if (document.getElementById('realismLora').checked) genInput.realism_lora = true;
   const loraChoice = document.getElementById('lora').value;
   if (loraChoice) genInput.lora = loraChoice;
   const upscaleMethod = document.getElementById('upscaleMethod').value;
