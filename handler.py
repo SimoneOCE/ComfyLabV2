@@ -561,7 +561,17 @@ def apply_attention_mode(workflow, mode):
         workflow[NODE_IDS["guider"]]["inputs"]["model"] = ["_sparse_attention", 0]
 
 
-def submit_and_wait(workflow, timeout_seconds=1200, should_cancel=None, should_force_kill=None):
+# Per-job ceiling on one ComfyUI submission. Was a hardcoded 1200s, which a
+# 15s 768p clip with Sage off (standard attention, ~20-30 min sampling +
+# decode) blows straight through - seen on a real run (job dcd1a245, failed
+# at 1205s). Overridable per endpoint via COMFY_JOB_TIMEOUT_SECONDS. Stop GPU
+# and the job's cancel flags still end a job early at any point.
+COMFY_JOB_TIMEOUT_SECONDS = int(os.environ.get("COMFY_JOB_TIMEOUT_SECONDS", "3600"))
+
+
+def submit_and_wait(workflow, timeout_seconds=None, should_cancel=None, should_force_kill=None):
+    if timeout_seconds is None:
+        timeout_seconds = COMFY_JOB_TIMEOUT_SECONDS
     client_id = str(uuid.uuid4())
     resp = requests.post(
         f"{COMFYUI_URL}/prompt",
@@ -600,6 +610,13 @@ def submit_and_wait(workflow, timeout_seconds=1200, should_cancel=None, should_f
                 return {"cancelled": True}
             return entry
         time.sleep(1 if interrupted else 2)
+    # Stop the orphaned generation before giving up on it - without this,
+    # ComfyUI kept sampling the timed-out prompt on the GPU and the next job
+    # in the session queued behind it.
+    try:
+        requests.post(f"{COMFYUI_URL}/interrupt", json={"prompt_id": prompt_id}, timeout=10)
+    except requests.exceptions.RequestException as e:
+        print(f"Could not send /interrupt for timed-out {prompt_id}: {e}")
     raise TimeoutError(f"ComfyUI generation did not finish within {timeout_seconds}s.")
 
 
