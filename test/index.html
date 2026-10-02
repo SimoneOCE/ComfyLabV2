@@ -49,7 +49,7 @@
       <option value="5b">5b. Singularity v1.3 + fal Realism People LoRA</option>
     </select>
   </label>
-  <div style="font-size:0.8rem; color:#888; margin-top:4px;">Every preset: 16:9 · 768p native · 20 steps · SageAttention · no turbo LoRA · no upscale · seed 424242 if blank. Prompt and duration are left as you set them.</div>
+  <div style="font-size:0.8rem; color:#888; margin-top:4px;">Every preset reproduces the SageAttention baseline run exactly (job 55b2d44a): same Alpha Timber prompt · 15s · 16:9 768p native (1344×768) · 20 steps · seed 424242 · SageAttention · no turbo LoRA · RTX VSR (ULTRA) 2x upscale. Only the model and Realism LoRA change. Picking a preset overwrites the prompt box.</div>
   <label>Model
     <select id="model">
       <option value="base">Base — Comfy-Org official H3 (pruned int8)</option>
@@ -300,6 +300,11 @@ applyResolution();
 // Bake-off presets: write into the real controls (and fire their events so
 // persistence + the resolution readout update), rather than overriding the
 // payload behind the scenes - what you see in the boxes is what gets sent.
+// The exact prompt of the SageAttention baseline (job 55b2d44a, video
+// 938602e6-1f35-45bb-afb2-578061b00562.mp4) - copied from Supabase and
+// checked byte-for-byte (MD5 9efe6f868db67f5992a0aa5953dd5b3f).
+const BAKEOFF_PROMPT = "integrated_multimodal_description: [Shot 1] Live-action, cinematic, photoreal TV commercial look, a wide shot at shoulder height frames the inside of a large, tidy timber warehouse in south-western Sydney in the early morning. Tall steel pallet racking holds strapped bundles of pale green treated-pine framing and engineered LVL beams. Warm golden sunlight streams through an open roller door, lighting up floating sawdust, as a yellow forklift rolls into frame carrying a fresh strapped bundle of timber. The camera pushes in with small amplitude at slow speed. A friendly adult male narrator with a clear, unhurried Australian accent, who never appears on screen (S1), says in an off-screen voiceover: <d>[English] Framing, LVL, decking and cladding —<scenetrans></d> [Shot 2] At 00:03.000, the camera cuts to a close-up of a tradie in his thirties with short brown hair and light stubble, wearing an orange hi-vis work shirt and tan leather gloves. Both gloved hands slide along the clean, straight grain of a pale pine stud resting on a stack, then he lifts the stud onto his right shoulder and smiles. The camera trucks right with small amplitude at slow speed alongside him at chest height, with a shallow depth of field and the warm morning light from the roller door behind him. The narrator's line continues seamlessly across the cut as the narrator (S1) says in an off-screen voiceover: <d>[English] <scenetrans>delivered fast across Sydney.</d> [Shot 3] At 00:07.000, the camera cuts to a medium-wide shot of a sunny suburban building site under a clear blue sky, where a white flatbed delivery truck loaded with timber is parked beside a half-built timber-framed house. The truck's crane arm lowers a strapped bundle of framing timber onto the dirt as a builder in a hi-vis vest and white hard hat gives a thumbs-up. The camera pedestals up at slow speed, revealing the full pine frame of the house against the blue sky. The narrator (S1) says in an off-screen voiceover: <d>[English] Alpha Timber.</d> [Shot 4] At 00:11.000, the camera cuts to a medium shot of a sunlit modern home with rich reddish-brown hardwood decking and vertical timber cladding, under the same clear blue sky. A young family, a father in a blue shirt, a mother in a pink cardigan and a young daughter in a pink jumper, steps out through tall glass sliding doors onto the deck, laughing, their faces clearly visible. The camera pulls out with large amplitude at slow speed and settles into a static wide shot of the home and deck, with open blue sky filling the upper third of the frame. The narrator (S1) says in an off-screen voiceover: <d>[English] You build, we supply.</d>\n\noverall_soundscape: A low warehouse hum and the reversing beeps of the forklift fill the opening, followed by the soft thud of the pine stud landing on the tradie's shoulder. The building site brings the hiss of truck air brakes, the whir of the crane and the heavy clunk of the timber bundle landing on dirt. The final shot settles into birdsong, a light breeze and the family's laughter on the deck.\n\nnon_diegetic_music: Upbeat strummed acoustic guitar at a moderately fast tempo over a light stomp-and-clap beat, gradually increasing in volume through the shots and ending on a sustained major chord.";
+
 const BAKEOFF_PRESETS = {
   '1':  { model: 'base',        realism: false },
   '2':  { model: 'base',        realism: true  },
@@ -328,8 +333,12 @@ document.getElementById('bakeoff').addEventListener('change', (e) => {
   setField('steps', '20');
   setField('attention', 'sage');
   setField('lora', '');
-  setField('upscaleMethod', 'none');
-  if (!document.getElementById('seed').value.trim()) setField('seed', '424242');
+  // Everything below matches the baseline run exactly.
+  setField('prompt', BAKEOFF_PROMPT);
+  setField('duration', '15');
+  setField('seed', '424242');
+  setField('upscaleMethod', 'nvidia_vsr');
+  setField('upscaleScale', '2');
 });
 
 // --- GPU Session (held-open worker) --------------------------------------
