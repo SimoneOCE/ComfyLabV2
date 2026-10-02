@@ -285,11 +285,11 @@ def ensure_comfyui_engine():
 
 def symlink_models_to_volume():
     """Points ComfyUI's normal models/{diffusion_models,text_encoders,vae,
-    loras} lookup paths at the volume-backed copies ensure_comfyui_engine.sh
+    loras,ultralytics} lookup paths at the volume-backed copies ensure_comfyui_engine.sh
     just downloaded, instead of ComfyUI looking in its own (ephemeral)
     models/ dir baked into the image.
     """
-    for subdir in ("diffusion_models", "text_encoders", "vae", "loras"):
+    for subdir in ("diffusion_models", "text_encoders", "vae", "loras", "ultralytics"):
         link_path = os.path.join(COMFYUI_DIR, "models", subdir)
         target_path = os.path.join(VOLUME_MODELS_DIR, subdir)
         if os.path.islink(link_path):
@@ -541,14 +541,13 @@ def build_prompt_payload(job_input, upscale_method="none"):
                 "height": height,
                 "length": ["105:107", 1],
                 "ref_image_size": "match",
-                # UNVERIFIED wire format: Autogrow inputs are presented to
-                # execute() as a dict (ref_images={...}), built server-side
-                # from flat "ref_image_0"/"ref_image_1"/... keys per
-                # io.Autogrow.TemplatePrefix(prefix="ref_image_") - this is
-                # the standard Autogrow API-JSON shape, but there's no
-                # captured real export to confirm it for THIS node the way
-                # the plain T2V graph was verified. Test this path first.
-                "ref_image_0": ["_ref_image_load", 0],
+                # Autogrow API key is "<input id>.<template name>": the
+                # pinned commit's comfy_api/latest/_io.py builds expected
+                # ids with finalize_prefix(["ref_images"], "ref_image_0").
+                # The old bare "ref_image_0" key matched nothing, so the
+                # reference image was silently dropped. Still untested on a
+                # real run.
+                "ref_images.ref_image_0": ["_ref_image_load", 0],
             },
             "class_type": "MiniMaxH3ReferenceToVideo",
         }
@@ -922,6 +921,257 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
     }
 
 
+# --- Face refine (post-generation, opt-in) --------------------------------
+# Base H3 renders faces badly once a head is a small part of the frame (see
+# MERGE_NOTES.md "Known limitation"). This is the community fix: Carasibana's
+# ComfyUI-H3-FaceRefine (pinned in the Dockerfile) tracks one face through
+# the clip, crops so it fills a 768 canvas, lets H3 redraw just that crop at
+# low denoise (turbo LoRA, 8 steps), and stitches it back. Graph mirrors the
+# pack's own H3_Face_Refine_Auto_Select example, minus VideoHelperSuite /
+# Impact Pack (core LoadVideo/CreateVideo/SaveVideo do the same job here).
+#
+# Job shape (comfylab_gpu_session_jobs.input):
+#   {"mode": "face_refine", "source_video_key": "<key>.mp4",
+#    "subjects": 1-4, "denoise": 0.2-0.6, "seed": ..., "prompt": optional}
+# One subject = one tracked person per pass; passes are chained, each
+# stitching onto the previous pass's output (the pack's documented way to
+# do several people). The prompt defaults to the source job's own prompt,
+# looked up by videoKey, since H3 regenerates the crop against it.
+REFINE_MODE = "face_refine"
+REFINE_MAX_SUBJECTS = 4
+REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base; H3PerFrameDenoise scales it down per frame for big faces
+REFINE_STEPS = 8               # matches the 8-step turbo LoRA (LORA_CHOICES["turbo"])
+FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
+
+
+def find_source_prompt(video_key, hops=3):
+    """The prompt a video was generated with, from the session job that
+    produced it. Follows refine jobs back to the original generation."""
+    for _ in range(hops):
+        rows = sb_get(
+            "comfylab_gpu_session_jobs",
+            {"output->>videoKey": f"eq.{video_key}", "select": "input", "limit": "1"},
+        )
+        if not rows:
+            return None
+        src_input = rows[0].get("input") or {}
+        if src_input.get("prompt"):
+            return src_input["prompt"]
+        if src_input.get("mode") == REFINE_MODE and src_input.get("source_video_key"):
+            video_key = src_input["source_video_key"]
+            continue
+        return None
+    return None
+
+
+def downscale_video_for_refine(src_path, dst_path, max_w=1344, max_h=768):
+    """Re-encodes a (usually RTX-upscaled) video back down to H3's native
+    canvas before refining, audio stream copied untouched. Without this a
+    15s 2x clip is ~18GB of float32 frames per copy in ComfyUI, and the
+    chained per-subject stitches each hold another copy. Returns
+    (source_w, source_h, downscale_factor)."""
+    import av  # ships with ComfyUI (requirements.txt: av>=17)
+    with av.open(src_path) as inp:
+        vin = inp.streams.video[0]
+        w, h = vin.codec_context.width, vin.codec_context.height
+        scale = min(1.0, max_w / w, max_h / h)
+        if scale >= 1.0:
+            shutil.copyfile(src_path, dst_path)
+            return w, h, 1.0
+        tw = max(32, int(round(w * scale / 32)) * 32)
+        th = max(32, int(round(h * scale / 32)) * 32)
+        ain = inp.streams.audio[0] if inp.streams.audio else None
+        with av.open(dst_path, mode="w") as out:
+            vout = out.add_stream("libx264", rate=24)
+            vout.width, vout.height, vout.pix_fmt = tw, th, "yuv420p"
+            vout.options = {"crf": "12", "preset": "medium"}
+            aout = out.add_stream_from_template(ain) if ain is not None else None
+            streams = [vin] + ([ain] if ain is not None else [])
+            for packet in inp.demux(*streams):
+                if packet.stream is ain:
+                    if packet.dts is None:
+                        continue
+                    packet.stream = aout
+                    out.mux(packet)
+                    continue
+                for frame in packet.decode():
+                    # Source timestamps kept as-is; the encoder rescales them.
+                    small = frame.reformat(width=tw, height=th, format="yuv420p", interpolation="AREA")
+                    for p in vout.encode(small):
+                        out.mux(p)
+            for p in vout.encode():
+                out.mux(p)
+    return w, h, w / tw
+
+
+def prepare_refine_source(video_key):
+    """Downloads outputs/<video_key> from Wasabi and writes a native-size
+    copy into ComfyUI's input/ dir. Returns (input_filename, factor)."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tmp_path = os.path.join(OUTPUT_DIR, f"refine_src_{uuid.uuid4().hex}.mp4")
+    s3_client.download_file(S3_BUCKET, f"outputs/{video_key}", tmp_path)
+    input_dir = os.path.join(COMFYUI_DIR, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    filename = f"refine_{uuid.uuid4().hex[:12]}.mp4"
+    try:
+        _, _, factor = downscale_video_for_refine(tmp_path, os.path.join(input_dir, filename))
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    return filename, factor
+
+
+def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upscale_scale):
+    model_src = ["r_lora", 0]
+    wf = {
+        "r_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
+        "r_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["r_load", 0]}},
+        "r_unet": {"class_type": "UNETLoader", "inputs": {
+            "unet_name": MODEL_CHOICES["base"]["filename"], "weight_dtype": "default"}},
+        "r_lora": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["r_unet", 0], "lora_name": LORA_CHOICES["turbo"]["filename"],
+            "strength_model": LORA_CHOICES["turbo"]["multiplier"]}},
+        "r_sage": {"class_type": "PathchSageAttentionKJ", "inputs": {
+            "model": model_src, "sage_attention": "auto", "allow_compile": False}},
+        "r_clip": {"class_type": "CLIPLoader", "inputs": {
+            "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}},
+        "r_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+        "r_avae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+        "r_sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "er_sde"}},
+        "r_noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+    }
+    images = ["r_comp", 0]
+    audio = ["r_comp", 1]
+    for i in range(subjects):
+        p = f"r{i}_"
+        wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
+            "images": images, "detector": FACE_DETECTOR, "confidence": 0.35,
+            "crop_factor": 3.0, "canvas_width": 768, "canvas_height": 768,
+            "canvas_mode": "auto_capped_768", "smooth_window": 21, "size_smooth_window": 51,
+            "smooth_method": "gaussian", "size_mode": "per_frame",
+            # Identity matching (insightface) deliberately off - it needs a
+            # compiled package we don't install. Continuity + select rank
+            # still hold one face per shot.
+            "identity_track": False, "identity_threshold": 0.28,
+            "select": "largest_face", "select_index": i, "fallback_detector": "none",
+            "fallback_head_frac": 0.5, "identity_model": "insightface",
+            # Our prompts are multi-shot (hard cuts); re-pick the subject per shot.
+            "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
+            "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
+        wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
+        wf[p + "r2v"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
+            "clip": ["r_clip", 0], "vae": ["r_vae", 0], "audio_vae": ["r_avae", 0],
+            "prompt": prompt, "width": [p + "track", 4], "height": [p + "track", 5],
+            "length": [p + "track", 6], "ref_image_size": "match",
+            # Autogrow API key = "<input id>.<template name>" (comfy_api
+            # _io.py finalize_prefix at the pinned commit).
+            "ref_audios.ref_audio_0": audio}}
+        wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
+            "av_latent": [p + "r2v", 1], "images": [p + "track", 0], "vae": ["r_vae", 0]}}
+        wf[p + "lock"] = {"class_type": "MiniMaxH3NativeAudioLock", "inputs": {
+            "model": ["r_sage", 0], "av_latent": [p + "inject", 0], "audio_vae": ["r_avae", 0], "audio": audio}}
+        wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
+            "model": [p + "lock", 0], "av_latent": [p + "lock", 1], "transform": [p + "track", 1],
+            "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.35,
+            "scale_mode": "absolute_px", "face_px_small": 30.0, "face_px_large": 120.0,
+            "gamma": 1.0, "smooth_frames": 9}}
+        wf[p + "guider"] = {"class_type": "BasicGuider", "inputs": {
+            "model": [p + "pfd", 2], "conditioning": [p + "r2v", 0]}}
+        wf[p + "sched"] = {"class_type": "BasicScheduler", "inputs": {
+            "scheduler": "simple", "steps": REFINE_STEPS, "denoise": denoise, "model": [p + "pfd", 2]}}
+        wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["r_noise", 0], "guider": [p + "guider", 0], "sampler": ["r_sampler", 0],
+            "sigmas": [p + "sched", 0], "latent_image": [p + "pfd", 0]}}
+        wf[p + "decode"] = {"class_type": "VAEDecode", "inputs": {"samples": [p + "sample", 0], "vae": ["r_vae", 0]}}
+        wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
+            "base_images": images, "refined_crops": [p + "decode", 0], "transform": [p + "track", 1],
+            "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
+            "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
+        images = [p + "stitch", 0]
+
+    # Back up to the size the source was delivered at (it was downscaled to
+    # native before refining - see downscale_video_for_refine).
+    if upscale_scale:
+        wf["r_vsr"] = {"class_type": "RTXVideoSuperResolution", "inputs": {
+            "images": images, "resize_type": "scale by multiplier",
+            "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
+        images = ["r_vsr", 0]
+    wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
+        "fps": 24, "bit_depth": 8, "images": images, "audio": audio}}
+    # Same node id as the generation graph's SaveVideo, so submit_and_wait's
+    # cancel detection and _output_video_info_and_path work unchanged.
+    wf[NODE_IDS["output"]] = {"class_type": "SaveVideo", "inputs": {
+        "filename_prefix": f"video/FaceRefine_{uuid.uuid4().hex[:12]}",
+        "format": "auto", "codec": "auto", "video": ["r_create", 0]}}
+    return wf
+
+
+def run_face_refine(job_input, should_cancel=None, should_force_kill=None):
+    source_key = (job_input.get("source_video_key") or "").strip()
+    if not source_key:
+        raise ValueError("face_refine needs source_video_key")
+    try:
+        subjects = int(job_input.get("subjects", 1))
+    except (TypeError, ValueError):
+        raise ValueError(f"subjects must be a whole number, got {job_input.get('subjects')!r}")
+    if not 1 <= subjects <= REFINE_MAX_SUBJECTS:
+        raise ValueError(f"subjects must be 1-{REFINE_MAX_SUBJECTS}, got {subjects}")
+    try:
+        denoise = float(job_input.get("denoise", REFINE_DEFAULT_DENOISE))
+    except (TypeError, ValueError):
+        raise ValueError(f"denoise must be a number, got {job_input.get('denoise')!r}")
+    if not 0.05 <= denoise <= 1.0:
+        raise ValueError(f"denoise must be between 0.05 and 1.0, got {denoise}")
+    seed = resolve_seed(job_input.get("seed"))
+    prompt = (job_input.get("prompt") or "").strip() or find_source_prompt(source_key)
+    if not prompt:
+        raise ValueError(f"No prompt given and none found for {source_key} - pass one in the job")
+
+    source_filename, factor = prepare_refine_source(source_key)
+    upscale_scale = None
+    if job_input.get("upscale_back", True):
+        upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
+    workflow = build_refine_payload(source_filename, prompt, subjects, denoise, seed, upscale_scale)
+
+    comfy_start = time.time()
+    try:
+        result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
+    finally:
+        try:
+            os.remove(os.path.join(COMFYUI_DIR, "input", source_filename))
+        except OSError:
+            pass
+    comfy_seconds = round(time.time() - comfy_start, 1)
+    if result.get("force_killed"):
+        return {"cancelled": True, "force_killed": True}
+    if result.get("cancelled"):
+        return {"cancelled": True}
+
+    # Tracker reports (one per subject) - what it found, lost frames, the
+    # canvas it chose. Surfaced so a bad refine can be diagnosed.
+    reports = []
+    for i in range(subjects):
+        text = result.get("outputs", {}).get(f"r{i}_report", {}).get("text")
+        if text:
+            reports.append(text[0] if isinstance(text, list) else text)
+
+    raw_bytes, filename = fetch_output_video(result)
+    video_key = upload_result_and_get_key(raw_bytes, filename)
+    return {
+        "videoKey": video_key,
+        "mode": REFINE_MODE,
+        "source_video_key": source_key,
+        "subjects": subjects,
+        "denoise": denoise,
+        "seed": seed,
+        "upscaled_back": upscale_scale,
+        "comfy_seconds": comfy_seconds,
+        "tracker_reports": reports,
+    }
+
+
 # --- Session mode (held-open worker) -------------------------------------
 # Mirrors minimax-h3-worker/handler.py's run_session() pattern: one RunPod
 # job that never returns until the session ends, which is what keeps this
@@ -1186,7 +1436,12 @@ def run_session(session_id):
                 # graceful /interrupt: the session is over either way, and an
                 # interrupt only lands at a step boundary, which can be
                 # minutes away at high resolution.
-                result = run_generation(
+                job_runner = (
+                    run_face_refine
+                    if (job_row["input"] or {}).get("mode") == REFINE_MODE
+                    else run_generation
+                )
+                result = job_runner(
                     job_row["input"],
                     should_cancel=lambda: is_job_cancel_requested(job_row["id"]),
                     should_force_kill=lambda: (

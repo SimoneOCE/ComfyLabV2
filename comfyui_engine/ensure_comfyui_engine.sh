@@ -209,6 +209,11 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/va
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
 
+# Face detector for the refine pass (ComfyUI-H3-FaceRefine's H3FaceTrackCrop).
+# It looks in models/ultralytics/bbox, symlinked to the volume by handler.py.
+mkdir -p "$MODELS_DIR/ultralytics/bbox"
+download_if_missing "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt" "$MODELS_DIR/ultralytics/bbox"
+
 # NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI) -
 # the one upscale option (see handler.py's NVIDIA_VSR comment). No separate
 # model-weight download needed - its VFX SDK libraries ship bundled inside

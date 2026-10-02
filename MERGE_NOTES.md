@@ -43,6 +43,17 @@ agrees it's a property of head-size-in-frame, not output resolution
 - Bias the prompt enhancer toward close and medium-close framing for people.
 - A real fix is a second pass (face-crop refine, v2v detailer, or MiniMax's
   hosted Regenerate-2K); still being evaluated.
+- Feature idea (agreed direction, build only once the refine is proven on
+  the test page): an opt-in "See glitched faces? Refine faces" action on a
+  finished video. Run a face detector on the result (seconds) and only offer
+  it when there are small faces (under ~120px tall), with a time estimate
+  per person ("We spotted 3 small faces - refine? ~5 min"). Runs as a normal
+  job on the user's GPU session, so it's metered like any generation; if the
+  GPU is stopped, the button says it'll start a session first. Needs: keep
+  the raw 768p output + prompt + seed per generation (refine works pre-
+  upscale, then re-upscales), keep both original and refined versions
+  (decide how that counts toward library caps). Test-page version:
+  handler.py run_face_refine / "Refine faces" panel.
 
 ## Other to-dos (not merge-blocking)
 

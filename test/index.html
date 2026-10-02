@@ -158,6 +158,37 @@
 
   <button id="submitBtn" onclick="runJob()">Run Generation</button>
 
+  <h2>Refine faces (post-generation)</h2>
+  <p style="color:#888; font-size:0.85rem;">
+    Re-draws small and mid-range faces in a video you already generated (ComfyUI-H3-FaceRefine: tracks
+    each face, crops in so it fills a 768px canvas, H3 redraws it at low strength, stitches it back).
+    Runs on the GPU session above. One pass per person, largest face first - estimate ~1.5-3 min per
+    person on a 15s clip (unmeasured). The prompt is taken from the job that made the video unless you
+    override it. Upscaled sources are refined at native size and upscaled back.
+  </p>
+  <label>Video key to refine (fills in with your latest result)
+    <input id="refineVideoKey" type="text" placeholder="938602e6-1f35-45bb-afb2-578061b00562.mp4" />
+  </label>
+  <label>People to refine (one pass each, largest face first)
+    <select id="refineSubjects">
+      <option value="1">1</option>
+      <option value="2">2</option>
+      <option value="3" selected>3</option>
+      <option value="4">4</option>
+    </select>
+  </label>
+  <label>Strength (base denoise; scaled down automatically for faces that are already large)
+    <select id="refineDenoise">
+      <option value="0.3">0.3 - gentle</option>
+      <option value="0.4" selected>0.4 - default (the pack's own setting)</option>
+      <option value="0.5">0.5 - strong (risk: head drifts from body)</option>
+    </select>
+  </label>
+  <label>Prompt override (optional - blank uses the original generation's prompt)
+    <textarea id="refinePrompt" placeholder="(original prompt)"></textarea>
+  </label>
+  <button id="refineBtn" onclick="runRefine()">Refine faces</button>
+
   <h2>Resolve an existing video key</h2>
   <p style="color:#888; font-size:0.85rem;">
     Test/debug the S3 presigned-URL logic against a video you already generated, without paying for
@@ -182,6 +213,7 @@ const PERSISTED_FIELDS = [
   'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'model', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
+  'refineVideoKey', 'refineSubjects', 'refineDenoise',
 ];
 
 // Show/hide toggle for the key fields. Defaults to shown; the choice is
@@ -563,7 +595,7 @@ async function runSessionJob(payload, statusEl) {
       statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(row.output, null, 2)}`;
       return row.output && row.output.videoKey;
     }
-    if (row.status === 'failed') {
+    if (row.status === 'failed' || row.status === 'cancelled') {
       statusEl.textContent += `\n\n${JSON.stringify(row.output, null, 2)}`;
       return null;
     }
@@ -687,12 +719,60 @@ async function runJob() {
   statusEl.textContent = 'No active GPU session - click "Run GPU" first. This endpoint no longer accepts jobs without one.';
 }
 
+async function runRefine() {
+  const btn = document.getElementById('refineBtn');
+  const statusEl = document.getElementById('status');
+  document.getElementById('resultVideo').style.display = 'none';
+  document.getElementById('downloadLinkWrap').innerHTML = '';
+  if (!sessionId) {
+    statusEl.textContent = 'No active GPU session - click "Run GPU" first.';
+    return;
+  }
+  if (!sessionReady) {
+    statusEl.textContent = 'GPU session is still starting - wait for "Session ready" before refining.';
+    return;
+  }
+  const sourceKey = document.getElementById('refineVideoKey').value.trim();
+  if (!sourceKey) {
+    statusEl.textContent = 'Enter the video key to refine.';
+    return;
+  }
+  const refineInput = {
+    mode: 'face_refine',
+    source_video_key: sourceKey,
+    subjects: Number(document.getElementById('refineSubjects').value),
+    denoise: Number(document.getElementById('refineDenoise').value),
+  };
+  const seedRaw = document.getElementById('seed').value.trim();
+  if (seedRaw !== '') {
+    if (!/^\d+$/.test(seedRaw) || !Number.isSafeInteger(Number(seedRaw))) {
+      statusEl.textContent = `Seed must be a whole number from 0 to ${Number.MAX_SAFE_INTEGER}, or blank for random.`;
+      return;
+    }
+    refineInput.seed = Number(seedRaw);
+  }
+  const promptOverride = document.getElementById('refinePrompt').value.trim();
+  if (promptOverride) refineInput.prompt = promptOverride;
+
+  btn.disabled = true;
+  statusEl.textContent = 'Queuing face refine on held-open session worker...';
+  try {
+    const videoKey = await runSessionJob(refineInput, statusEl);
+    if (videoKey) await handleVideoKey(videoKey);
+  } catch (err) {
+    statusEl.textContent = `Error: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function handleVideoKey(videoKey) {
   const statusEl = document.getElementById('status');
   const videoEl = document.getElementById('resultVideo');
   const downloadWrap = document.getElementById('downloadLinkWrap');
   try {
     statusEl.textContent += `\n\nResolving a presigned Wasabi URL (valid 1hr)...`;
+    document.getElementById('refineVideoKey').value = videoKey;
     const url = await resolveVideoUrl(videoKey);
     statusEl.textContent += `\n\nResolved - see below.`;
     videoEl.src = url;
