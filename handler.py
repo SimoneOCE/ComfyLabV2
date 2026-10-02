@@ -480,6 +480,15 @@ def build_prompt_payload(job_input, upscale_method="none"):
 
     apply_attention_mode(workflow, job_input.get("attention", "sage"))
 
+    # Unique SaveVideo prefix per submission. ComfyUI caches node outputs, so
+    # an exact repeat of a previous job (same prompt/seed/settings) skipped
+    # every node including SaveVideo and pointed /history at the previous
+    # job's file - which fetch_output_video had already deleted after
+    # uploading it, so /view 404'd (seen on a real run). A changed prefix
+    # forces just SaveVideo to re-run and write a fresh file; everything
+    # upstream (the actual generation) is still served from the cache.
+    workflow[NODE_IDS["output"]]["inputs"]["filename_prefix"] = f"video/MiniMax_H3_{uuid.uuid4().hex[:12]}"
+
     # NVIDIA RTX VSR - spliced between VAEDecode's frame output and
     # CreateVideo's input. resize_type is a DynamicCombo: API-format prompts carry
     # it as FLAT keys - the selected option's key under "resize_type" and
