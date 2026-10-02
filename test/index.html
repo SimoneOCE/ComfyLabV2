@@ -41,8 +41,28 @@
   <label>Prompt
     <textarea id="prompt">a cat surfing a wave</textarea>
   </label>
-  <label>Width <input id="width" type="number" value="1280" /></label>
-  <label>Height <input id="height" type="number" value="736" /></label>
+  <label>Aspect ratio
+    <select id="ratio">
+      <option value="1:1">Square</option>
+      <option value="9:16">9:16</option>
+      <option value="16:9" selected>16:9</option>
+    </select>
+  </label>
+  <label>Quality
+    <select id="quality">
+      <option value="480p">480p</option>
+      <option value="544p">544p</option>
+      <option value="SD" selected>720p (SD)</option>
+      <option value="1080p">1080p (HD)</option>
+      <option value="custom">Custom size</option>
+    </select>
+  </label>
+  <div id="resolutionInfo" style="margin-top:6px; font-size:0.85rem; color:#9c9;"></div>
+  <div id="resolutionWarn" style="margin-top:4px; font-size:0.8rem; color:#e0a458;"></div>
+  <div id="customSize" style="display:none;">
+    <label>Width <input id="width" type="number" value="1280" /></label>
+    <label>Height <input id="height" type="number" value="736" /></label>
+  </div>
   <label>Duration (seconds) <input id="duration" type="number" value="7.29" step="0.01" /></label>
   <label>Steps <input id="steps" type="number" value="20" /></label>
   <label>Seed (blank = random; the seed actually used is shown in the result)
@@ -129,7 +149,7 @@
 // depending on the browser, and this is a convenience, not something the
 // page depends on to function.
 const PERSISTED_FIELDS = [
-  'endpointId', 'apiKey', 'prompt', 'width', 'height', 'duration', 'steps', 'seed', 'lora', 'upscaleMethod', 'upscaleScale',
+  'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
@@ -178,6 +198,48 @@ function wireUpPersistence() {
 
 loadPersistedFields();
 wireUpPersistence();
+
+// Resolution presets - same table as the live site
+// (minimax-h3-website web/src/components/generate/constants.ts: RESOLUTIONS,
+// QUALITY_LABELS, QUALITY_SLOW). A preset writes its numbers into the
+// width/height fields, which are what actually get sent; "Custom size"
+// reveals those fields for free entry instead.
+const RESOLUTIONS = {
+  '1:1':  { '480p': [512, 512], '544p': [544, 544], SD: [736, 736],   '1080p': [1088, 1088] },
+  '9:16': { '480p': [512, 896], '544p': [544, 960], SD: [736, 1280],  '1080p': [1088, 1920] },
+  '16:9': { '480p': [896, 512], '544p': [960, 544], SD: [1280, 736],  '1080p': [1920, 1088] },
+};
+const QUALITY_SLOW = { '480p': false, '544p': false, SD: false, '1080p': true };
+
+function applyResolution() {
+  const ratio = document.getElementById('ratio').value;
+  const quality = document.getElementById('quality').value;
+  const widthEl = document.getElementById('width');
+  const heightEl = document.getElementById('height');
+  const custom = quality === 'custom';
+  document.getElementById('customSize').style.display = custom ? 'block' : 'none';
+  document.getElementById('ratio').disabled = custom;
+  if (!custom) {
+    const [w, h] = RESOLUTIONS[ratio][quality];
+    widthEl.value = w;
+    heightEl.value = h;
+    // Keep the remembered width/height in step with the preset.
+    try {
+      localStorage.setItem('comfylab_width', String(w));
+      localStorage.setItem('comfylab_height', String(h));
+    } catch (e) {}
+  }
+  document.getElementById('resolutionInfo').textContent =
+    `Resolution: ${widthEl.value} × ${heightEl.value}`;
+  document.getElementById('resolutionWarn').textContent = (!custom && QUALITY_SLOW[quality])
+    ? '⚠ Higher resolution — longer wait times. High frame counts may fail to generate.'
+    : '';
+}
+
+for (const id of ['ratio', 'quality', 'width', 'height']) {
+  document.getElementById(id).addEventListener('input', applyResolution);
+}
+applyResolution();
 
 // --- GPU Session (held-open worker) --------------------------------------
 // Mirrors minimax-h3-worker's server.js /api/session/start + GeneratorPanel.tsx's
