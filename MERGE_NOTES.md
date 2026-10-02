@@ -29,6 +29,21 @@ koboldcpp worker (`minimax-h3-worker`) behind `minimax-h3-website`.
   meter see them. Both writes fail silently, so on the first merged test,
   verify that `last_activity_at` actually advances.
 
+## Known limitation: faces at medium/long range (pinned)
+
+Base MiniMax H3 renders faces poorly once a head is a small part of the frame
+(medium and wide shots). Confirmed by our own tests, 2026-10-02: base, base +
+fal Realism LoRA, DaSiWa Hybrid V3, 7s vs 15s, Sage on vs attention off - all
+bad. So it's not Sage, not clip length, not the fine-tune. The community
+agrees it's a property of head-size-in-frame, not output resolution
+(Comfy-Org/MiniMax-H3 HF discussion #30, ComfyUI-H3-FaceRefine README).
+
+- Ship a user-facing disclaimer: face detail drops in medium and wide shots;
+  close-ups look best.
+- Bias the prompt enhancer toward close and medium-close framing for people.
+- A real fix is a second pass (face-crop refine, v2v detailer, or MiniMax's
+  hosted Regenerate-2K); still being evaluated.
+
 ## Other to-dos (not merge-blocking)
 
 - **Tune the prompt enhancer to MiniMax's prompt guide.** The live site's Claude
