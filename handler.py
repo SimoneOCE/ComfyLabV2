@@ -1,6 +1,7 @@
 import runpod
 import subprocess
 import threading
+import datetime
 import time
 import requests
 import os
@@ -740,7 +741,9 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
     if attention not in ATTENTION_MODES:
         raise ValueError(f"Unknown attention {attention!r} - this worker supports {sorted(ATTENTION_MODES)}")
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
+    comfy_start = time.time()
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
+    comfy_seconds = round(time.time() - comfy_start, 1)
     if result.get("force_killed"):
         return {"cancelled": True, "force_killed": True}
     if result.get("cancelled"):
@@ -761,7 +764,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
-    return {"videoKey": video_key, "seed": job_input["seed"], "attention": attention}
+    return {"videoKey": video_key, "seed": job_input["seed"], "attention": attention, "comfy_seconds": comfy_seconds}
 
 
 # --- Session mode (held-open worker) -------------------------------------
@@ -837,6 +840,12 @@ def mark_session_ended(session_id, reason):
         print(f"Could not release active_gpu_sessions claim for {session_id}: {e}")
 
 
+def utc_now_iso():
+    """Worker-clock UTC timestamp for the comfylab_gpu_session_jobs timing
+    columns (started_at / finished_at)."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
 def claim_next_queued_job(session_id):
     queued = sb_get(
         "comfylab_gpu_session_jobs",
@@ -854,7 +863,7 @@ def claim_next_queued_job(session_id):
     claimed = sb_patch(
         "comfylab_gpu_session_jobs",
         {"id": f"eq.{job_row['id']}", "status": "eq.queued"},
-        {"status": "processing"},
+        {"status": "processing", "started_at": utc_now_iso()},
     )
     if not claimed:
         return None
@@ -896,7 +905,14 @@ def finish_job(job_row_id, output):
         sb_patch(
             "comfylab_gpu_session_jobs",
             {"id": f"eq.{job_row_id}"},
-            {"status": status, "output": output},
+            {
+                "status": status,
+                "output": output,
+                "finished_at": utc_now_iso(),
+                # total_seconds / queue_wait_seconds are generated columns
+                # in Postgres, derived from started_at/finished_at/created_at.
+                "comfy_seconds": output.get("comfy_seconds"),
+            },
         )
     except Exception as e:
         print(f"Could not write final result for job {job_row_id}: {e}")
