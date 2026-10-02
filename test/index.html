@@ -20,6 +20,10 @@
 </head>
 <body>
   <h1>ComfyLabV2 - Local Endpoint Test</h1>
+  <label style="display:inline-flex; align-items:center; gap:6px;">
+    <input id="showKeys" type="checkbox" checked style="width:auto;" />
+    Show keys (RunPod API key, Wasabi secret key, Supabase anon key)
+  </label>
   <p style="color:#888; font-size:0.85rem;">
     POSTs a job directly to a deployed RunPod Serverless endpoint, bypassing the production website.
     All keys below stay only in this page's memory (not stored, not sent anywhere except RunPod's own
@@ -129,6 +133,29 @@ const PERSISTED_FIELDS = [
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
+
+// Show/hide toggle for the key fields. Defaults to shown; the choice is
+// remembered per browser like the other fields.
+const SECRET_FIELDS = ['apiKey', 's3SecretKey', 'supabaseAnonKey'];
+
+function applyShowKeys(show) {
+  for (const id of SECRET_FIELDS) {
+    document.getElementById(id).type = show ? 'text' : 'password';
+  }
+}
+
+(function wireShowKeys() {
+  const box = document.getElementById('showKeys');
+  try {
+    const saved = localStorage.getItem('comfylab_showKeys');
+    if (saved !== null) box.checked = saved === '1';
+  } catch (e) { /* storage unavailable - keep default */ }
+  applyShowKeys(box.checked);
+  box.addEventListener('change', () => {
+    applyShowKeys(box.checked);
+    try { localStorage.setItem('comfylab_showKeys', box.checked ? '1' : '0'); } catch (e) {}
+  });
+})();
 
 function loadPersistedFields() {
   try {
