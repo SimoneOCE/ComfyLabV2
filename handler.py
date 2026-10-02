@@ -414,78 +414,62 @@ REALISM_LORA = {
 }
 
 
-def _hf_expected_size(url, headers):
-    """Size HuggingFace reports for a file (X-Linked-Size for LFS/xet files,
-    else Content-Length), from a HEAD that doesn't follow the CDN redirect.
-    None if it can't be determined - callers then skip the size check
-    rather than fail."""
-    try:
-        r = requests.head(url, headers=headers, allow_redirects=False, timeout=30)
-        if r.status_code >= 400:
-            return None
-        # LFS/xet files answer with a redirect whose own Content-Length is
-        # the redirect body, not the file - only X-Linked-Size is the file
-        # size there. A direct 200 (small non-LFS file) carries the real
-        # size in Content-Length.
-        size = r.headers.get("X-Linked-Size")
-        if size is None and r.status_code == 200:
-            size = r.headers.get("Content-Length")
-        return int(size) if size else None
-    except Exception as e:
-        print(f"Could not get expected size for {url}: {e}")
-        return None
-
-
 def ensure_model_file(spec, subdir):
-    """Downloads a HuggingFace file to VOLUME_MODELS_DIR/subdir on first use.
-    Streams to a .part file and renames only once complete AND the byte
-    count matches HuggingFace's reported size - so neither a killed download
-    (only a .part is left; the next attempt starts over and overwrites it)
-    nor a connection that ends early without an error can leave a file that
-    looks finished. An existing file is also size-checked against
-    HuggingFace and re-downloaded if it doesn't match. HF_TOKEN (endpoint
-    env var) is sent when set - required for gated repos."""
+    """Downloads a HuggingFace file to VOLUME_MODELS_DIR/subdir on first use
+    (skipped if already there). Streams to a .part file and renames only
+    once the download finishes, so a killed download leaves just the .part
+    (the next attempt starts over and overwrites it) rather than a file that
+    looks complete. HF_TOKEN (endpoint env var) is sent when set - required
+    for gated repos."""
     if "repo" not in spec:
         return
     dest_dir = os.path.join(VOLUME_MODELS_DIR, subdir)
     dest = os.path.join(dest_dir, spec["filename"])
+    if os.path.exists(dest):
+        return
+    os.makedirs(dest_dir, exist_ok=True)
     url = f"https://huggingface.co/{spec['repo']}/resolve/main/{urllib.parse.quote(spec['repo_path'])}"
     headers = {}
     if os.environ.get("HF_TOKEN"):
         headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
-
-    if os.path.exists(dest):
-        expected = _hf_expected_size(url, headers)
-        actual = os.path.getsize(dest)
-        if expected is None or actual == expected:
-            return
-        print(f"{dest} is {actual} bytes, HuggingFace says {expected} - deleting and re-downloading.")
-        os.remove(dest)
-
-    os.makedirs(dest_dir, exist_ok=True)
     tmp = dest + ".part"
     print(f"Downloading {spec['repo']}/{spec['repo_path']} -> {dest}...")
     start = time.time()
-    # identity encoding: requests transparently un-gzips, which would make
-    # bytes written differ from Content-Length and fail every download.
-    with requests.get(url, headers={**headers, "Accept-Encoding": "identity"}, stream=True, timeout=60) as r:
+    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
         if r.status_code in (401, 403):
             raise RuntimeError(
                 f"HuggingFace refused {spec['repo']} ({r.status_code}) - gated repo: accept its terms "
                 f"on huggingface.co and set HF_TOKEN on the endpoint"
             )
         r.raise_for_status()
-        expected = r.headers.get("Content-Length")
-        written = 0
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
                 f.write(chunk)
-                written += len(chunk)
-    if expected is not None and written != int(expected):
-        os.remove(tmp)
-        raise RuntimeError(f"Download of {spec['filename']} was cut short ({written} of {expected} bytes) - will retry next time.")
     os.replace(tmp, dest)
-    print(f"Downloaded {spec['filename']} ({written} bytes) in {round(time.time() - start)}s.")
+    print(f"Downloaded {spec['filename']} in {round(time.time() - start)}s.")
+
+
+# One-time cleanup: a session may have been stopped mid-way through the very
+# first bake-off downloads (2026-10-02). Deletes the bake-off files (and any
+# .part leftovers) once per volume so they re-download clean, then leaves a
+# marker so it never runs again. Base model files are never touched.
+BAKEOFF_CLEAR_MARKER = os.path.join(VOLUME_DIR, ".bakeoff_downloads_cleared_v1")
+
+
+def clear_bakeoff_downloads_once():
+    if os.path.exists(BAKEOFF_CLEAR_MARKER):
+        return
+    targets = [(MODEL_CHOICES[k], "diffusion_models") for k in MODEL_CHOICES if "repo" in MODEL_CHOICES[k]]
+    targets.append((REALISM_LORA, "loras"))
+    for spec, subdir in targets:
+        path = os.path.join(VOLUME_MODELS_DIR, subdir, spec["filename"])
+        for p in (path, path + ".part"):
+            if os.path.exists(p):
+                os.remove(p)
+                print(f"One-time bake-off cleanup: removed {p}")
+    with open(BAKEOFF_CLEAR_MARKER, "w") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
+    print("One-time bake-off cleanup done; marker written, will not run again.")
 
 
 # Downloaded at session start, before the session reports ready, so the
@@ -1100,6 +1084,7 @@ def run_session(session_id):
     try:
         ensure_comfyui_engine()
         symlink_models_to_volume()
+        clear_bakeoff_downloads_once()
         preload_models()
         start_comfyui_if_needed()
     except Exception as e:

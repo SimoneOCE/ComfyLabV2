@@ -46,6 +46,13 @@ koboldcpp worker (`minimax-h3-worker`) behind `minimax-h3-website`.
   - Give each speaker or character a stable identity on first appearance.
   - Don't overload short clips: too many characters/events in ~7s makes
     faces small and glitchy.
+- **Consider later: freeze bake-off model downloads to a fixed version.**
+  `ensure_model_file` in `handler.py` downloads DaSiWa V3, Singularity and
+  the fal LoRA from each repo's `main`. If an author re-uploads a file, a
+  fresh volume (or a re-download) silently gets the new version. Pinning
+  each URL to its HuggingFace commit (`resolve/<sha>/...` instead of
+  `resolve/main/...`) would make results reproducible. Matters most once a
+  model is chosen for production. Not done yet.
 - **Undecided: library caps.** `cleanup.js` (Railway "cleanup crew", hourly)
   rolls every account's library over at a flat 30 videos and deletes anything
   older than 15 days. That's intentional per the owner. But `server.js`'s
