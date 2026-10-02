@@ -41,6 +41,7 @@ agrees it's a property of head-size-in-frame, not output resolution
 - Ship a user-facing disclaimer: face detail drops in medium and wide shots;
   close-ups look best.
 - Bias the prompt enhancer toward close and medium-close framing for people.
+  Rules and test log: PROMPT_FRAMING_RULES.md.
 - A real fix is a second pass (face-crop refine, v2v detailer, or MiniMax's
   hosted Regenerate-2K); still being evaluated.
 - Feature idea (agreed direction, build only once the refine is proven on
