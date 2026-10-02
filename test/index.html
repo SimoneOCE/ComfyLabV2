@@ -52,7 +52,8 @@
     <select id="quality">
       <option value="480p">480p</option>
       <option value="544p">544p</option>
-      <option value="SD" selected>720p (SD)</option>
+      <option value="SD">720p (SD)</option>
+      <option value="native" selected>768p native (recommended for H3)</option>
       <option value="1080p">1080p (HD)</option>
       <option value="custom">Custom size</option>
     </select>
@@ -73,6 +74,13 @@
       <option value="">None</option>
       <option value="turbo">Turbo</option>
       <option value="fast">Fast</option>
+    </select>
+  </label>
+  <label>Attention
+    <select id="attention">
+      <option value="sage">A: SageAttention (fastest; INT8 - can morph late in clips on H3)</option>
+      <option value="off">B: Standard attention (exact, slowest)</option>
+      <option value="sparse">C: Sparse sol-attn, no Sage (ComfyUI built-in; gain grows with clip length)</option>
     </select>
   </label>
   <label>Upscale
@@ -149,7 +157,7 @@
 // depending on the browser, and this is a convenience, not something the
 // page depends on to function.
 const PERSISTED_FIELDS = [
-  'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'lora', 'upscaleMethod', 'upscaleScale',
+  'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
 ];
@@ -204,12 +212,15 @@ wireUpPersistence();
 // QUALITY_LABELS, QUALITY_SLOW). A preset writes its numbers into the
 // width/height fields, which are what actually get sent; "Custom size"
 // reveals those fields for free entry instead.
+// "native" is not a live-site preset: it's H3's own canvas per ComfyUI's H3
+// guide - 768px short edge, 1344x768 at 16:9, capped at 768x1344 pixels of
+// area (so square is 992x992, the largest multiple of 32 under the cap).
 const RESOLUTIONS = {
-  '1:1':  { '480p': [512, 512], '544p': [544, 544], SD: [736, 736],   '1080p': [1088, 1088] },
-  '9:16': { '480p': [512, 896], '544p': [544, 960], SD: [736, 1280],  '1080p': [1088, 1920] },
-  '16:9': { '480p': [896, 512], '544p': [960, 544], SD: [1280, 736],  '1080p': [1920, 1088] },
+  '1:1':  { '480p': [512, 512], '544p': [544, 544], SD: [736, 736],   native: [992, 992],  '1080p': [1088, 1088] },
+  '9:16': { '480p': [512, 896], '544p': [544, 960], SD: [736, 1280],  native: [768, 1344], '1080p': [1088, 1920] },
+  '16:9': { '480p': [896, 512], '544p': [960, 544], SD: [1280, 736],  native: [1344, 768], '1080p': [1920, 1088] },
 };
-const QUALITY_SLOW = { '480p': false, '544p': false, SD: false, '1080p': true };
+const QUALITY_SLOW = { '480p': false, '544p': false, SD: false, native: false, '1080p': true };
 
 function applyResolution() {
   const ratio = document.getElementById('ratio').value;
@@ -231,9 +242,14 @@ function applyResolution() {
   }
   document.getElementById('resolutionInfo').textContent =
     `Resolution: ${widthEl.value} × ${heightEl.value}`;
-  document.getElementById('resolutionWarn').textContent = (!custom && QUALITY_SLOW[quality])
-    ? '⚠ Higher resolution — longer wait times. High frame counts may fail to generate.'
-    : '';
+  const px = Number(widthEl.value) * Number(heightEl.value);
+  const warns = [];
+  if (!custom && QUALITY_SLOW[quality]) warns.push('⚠ Higher resolution — longer wait times. High frame counts may fail to generate.');
+  // ComfyUI's H3 guide: native canvas caps at 768x1344 pixels of area, and
+  // frames well above it don't hold detail.
+  if (px > 768 * 1344) warns.push('⚠ Above H3\'s native 768×1344 pixel area — extra resolution won\'t add real detail.');
+  if (px < 0.6 * 768 * 1344) warns.push('⚠ Well below H3\'s native ~1MP canvas — faces and fine detail suffer.');
+  document.getElementById('resolutionWarn').textContent = warns.join(' ');
 }
 
 for (const id of ['ratio', 'quality', 'width', 'height']) {
@@ -536,6 +552,7 @@ async function runJob() {
     }
     genInput.seed = Number(seedRaw);
   }
+  genInput.attention = document.getElementById('attention').value;
   const loraChoice = document.getElementById('lora').value;
   if (loraChoice) genInput.lora = loraChoice;
   const upscaleMethod = document.getElementById('upscaleMethod').value;

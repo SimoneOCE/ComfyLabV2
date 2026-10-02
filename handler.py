@@ -81,6 +81,8 @@ NODE_IDS = {
     "clip_loader": "105:13",       # CLIPLoader
     "vae_loader": "105:11",        # VAELoader (video)
     "sage_attention": "105:120",   # PathchSageAttentionKJ - "model" input rewired to the LoRA node's output when a LoRA is active
+    "guider": "105:16",            # BasicGuider - "model" input (the attention patch point)
+    "scheduler": "105:9",          # BasicScheduler - "model" input (only reads model_sampling)
     "output": "92",                # SaveVideo - terminal output node
 }
 
@@ -144,6 +146,18 @@ NVIDIA_VSR_QUALITY = "ULTRA"
 # full mode list.
 NVIDIA_VSR_HB_QUALITY = "HIGHBITRATE_ULTRA"
 UPSCALE_METHODS = {"none", "nvidia_vsr", "nvidia_vsr_hb"}
+# Attention A/B (see apply_attention_mode). ComfyUI's own H3 guide
+# (docs.comfy.org/tutorials/video/minimax/minimax-h3, "Quality degradation
+# with INT8 attention") says Sage's INT8 attention causes morphing late in a
+# clip on H3: its last blocks concentrate the key signal in a few channels
+# that per-row INT8 scaling loses. The official templates ship without Sage.
+#   "sage"   - PathchSageAttentionKJ, sage_attention=auto (the previous default)
+#   "off"    - no patch: ComfyUI's standard attention, exact
+#   "sparse" - no Sage; ComfyUI's built-in Model Sparse Attention
+#              (BlockSparseAttention) in sol-attn mode, the mode the docs say
+#              the base H3 weights use. Node defaults: tau 1.3, dense for the
+#              first 20% of steps, text/audio/ref rows kept exact.
+ATTENTION_MODES = {"sage", "off", "sparse"}
 # Allowed upscale_scale values. 4x holds the whole upscaled clip in system
 # RAM at once (the node writes to the decoded frames' device, which is
 # ComfyUI's intermediate_device() - system RAM - same mechanism that
@@ -464,6 +478,8 @@ def build_prompt_payload(job_input, upscale_method="none"):
         if "steps" not in job_input:
             workflow[NODE_IDS["steps"]]["inputs"]["steps"] = preset["default_steps"]
 
+    apply_attention_mode(workflow, job_input.get("attention", "sage"))
+
     # NVIDIA RTX VSR - spliced between VAEDecode's frame output and
     # CreateVideo's input. resize_type is a DynamicCombo: API-format prompts carry
     # it as FLAT keys - the selected option's key under "resize_type" and
@@ -497,6 +513,43 @@ def build_prompt_payload(job_input, upscale_method="none"):
         workflow["105:91"]["inputs"]["images"] = ["_nvidia_vsr", 0]
 
     return workflow
+
+
+def apply_attention_mode(workflow, mode):
+    """Rewires the model path for the attention A/B (see ATTENTION_MODES).
+    Runs after the LoRA splice, so it picks up whichever model (base or
+    LoRA'd) currently feeds the Sage node."""
+    if mode == "sage":
+        return
+    sage_id = NODE_IDS["sage_attention"]
+    model_src = workflow[sage_id]["inputs"]["model"]
+    del workflow[sage_id]
+    workflow[NODE_IDS["scheduler"]]["inputs"]["model"] = model_src
+    if mode == "off":
+        workflow[NODE_IDS["guider"]]["inputs"]["model"] = model_src
+    elif mode == "sparse":
+        # Only the guider needs the patch; the scheduler just builds sigmas.
+        # DynamicCombo "selection" in ComfyUI's flat API format (same
+        # convention as RTX VSR's resize_type). verbose=True logs, per
+        # attention shape, whether it actually ran sparse or why it stayed
+        # dense - the docs warn it silently falls back to dense without the
+        # comfy-kitchen sol_attn kernel.
+        workflow["_sparse_attention"] = {
+            "inputs": {
+                "model": model_src,
+                "selection": "sol-attn",
+                "selection.tau": 1.3,
+                "start_percent": 0.2,
+                "end_percent": 1.0,
+                "dense_blocks": "",
+                "min_tokens": 12288,
+                "extra_tokens": 256,
+                "sink_conditioning": "exact_kv_and_rows",
+                "verbose": True,
+            },
+            "class_type": "BlockSparseAttention",
+        }
+        workflow[NODE_IDS["guider"]]["inputs"]["model"] = ["_sparse_attention", 0]
 
 
 def submit_and_wait(workflow, timeout_seconds=1200, should_cancel=None, should_force_kill=None):
@@ -657,6 +710,9 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
             f"Unsupported upscale_scale {job_input.get('upscale_scale')!r} - this worker supports {sorted(UPSCALE_SCALES)}"
         )
     job_input["upscale_scale"] = upscale_scale
+    attention = job_input.get("attention", "sage")
+    if attention not in ATTENTION_MODES:
+        raise ValueError(f"Unknown attention {attention!r} - this worker supports {sorted(ATTENTION_MODES)}")
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
     if result.get("force_killed"):
@@ -679,7 +735,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
-    return {"videoKey": video_key, "seed": job_input["seed"]}
+    return {"videoKey": video_key, "seed": job_input["seed"], "attention": attention}
 
 
 # --- Session mode (held-open worker) -------------------------------------
