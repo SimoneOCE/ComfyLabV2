@@ -446,6 +446,30 @@ def ensure_model_file(spec, subdir):
     print(f"Downloaded {spec['filename']} in {round(time.time() - start)}s.")
 
 
+# Downloaded at session start, before the session reports ready, so the
+# first job on each bake-off model isn't also a ~21GB download. Comma list
+# of MODEL_CHOICES keys and/or "realism_lora"; overridable per endpoint via
+# PRELOAD_MODELS ("" = none). Each file is fetched once per volume - later
+# sessions find it already there and skip straight past.
+PRELOAD_MODELS = os.environ.get("PRELOAD_MODELS", "dasiwa_v3,singularity,realism_lora")
+
+
+def preload_models():
+    """Best-effort: a failure (e.g. DaSiWa without HF_TOKEN) is logged and
+    skipped rather than failing the session - that model's own job will
+    retry the download and fail with the clear gated-repo error instead."""
+    for key in (k.strip() for k in PRELOAD_MODELS.split(",") if k.strip()):
+        try:
+            if key == "realism_lora":
+                ensure_model_file(REALISM_LORA, "loras")
+            elif key in MODEL_CHOICES:
+                ensure_model_file(MODEL_CHOICES[key], "diffusion_models")
+            else:
+                print(f"PRELOAD_MODELS: unknown entry {key!r}, skipping.")
+        except Exception as e:
+            print(f"Preload of {key} failed, continuing without it: {e}")
+
+
 def build_prompt_payload(job_input, upscale_method="none"):
     """Builds the full workflow graph for one generation. upscale_method
     "nvidia_vsr" / "nvidia_vsr_hb" splices RTX VSR into the SAME submission
@@ -1034,6 +1058,7 @@ def run_session(session_id):
     try:
         ensure_comfyui_engine()
         symlink_models_to_volume()
+        preload_models()
         start_comfyui_if_needed()
     except Exception as e:
         print(f"Session {session_id}: ComfyUI failed to start ({e}) - ending session.")
