@@ -84,7 +84,32 @@ foregrounded faces, was fine.
   similar height, for example a child held in an arm or people leaning in,
   and frame waist-up.
 - Larger groups (crowds, teams, audiences) should be shown from behind, out
-  of focus, or in separate shots.
+  of focus, or in separate shots. See rule 5a.
+
+### 5a. Crowds and large groups
+
+**[hypothesis]** None of this is tested yet. Every crowd face can't be
+refined: the refine pass is capped at 4 people and is meant for the main
+faces. So a crowd shot has to be written so that background faces are never
+read as faces.
+
+- **Foreground/background split.** Put 1–3 people in focus in the
+  foreground, framed chest-up, with the crowd behind them softly out of
+  focus: "the crowd behind them is out of focus, faces indistinct".
+- **Turned away.** Show the crowd seen from behind: marching away from
+  camera, facing a stage, looking toward a building.
+- **Hands and objects instead of faces.** Close-ups of signs, raised fists,
+  flags, banners, feet marching, hands clapping.
+- **Separate shots.** A wide establishing shot with no readable faces
+  (from behind, from high above, or in silhouette), then cuts to tight
+  single-person shots.
+- **Light that hides faces.** Silhouettes against a bright sky, backlight
+  at dusk, or smoke and haze, so faces are naturally unreadable.
+- **Avoid:** "a crowd of people looking at the camera", "faces in the
+  crowd", or a sharp, front-facing wide crowd shot. That's guaranteed to
+  melt every face.
+- If a crowd shot still has a few sharp mid-ground faces, refine only the
+  2–4 the viewer will look at.
 
 ### 6. Put faces in focus and in good light
 
@@ -112,12 +137,17 @@ The enhancer should:
 3. Rewrite pull-outs on people to end on a medium shot, or change them to
    push-ins or static shots (rule 4).
 4. Cap visible groups at 3, pulled in tight (rule 5).
-5. Add focus and lighting cues for the main faces (rule 6).
+5. Rewrite crowd shots (rule 5a): sharp foreground people with an
+   out-of-focus crowd, or a crowd turned away, in silhouette, or shown
+   through signs and hands.
+6. Add focus and lighting cues for the main faces (rule 6).
 
 As a safety net, add a simple server-side check that flags a shot whose
 text contains both a person word ("man", "woman", "family", "builder",
 "people" …) and a wide word (rule 2's list). Use it to warn the user or to
-re-run the enhancer.
+re-run the enhancer. Also flag a shot with a crowd word ("crowd",
+"protesters", "audience", "team", "fans", "people gathered" …) that doesn't
+say the crowd is out of focus, turned away or in silhouette.
 
 ## Test log
 
@@ -132,6 +162,7 @@ re-run the enhancer.
 | | | 3 | Medium shot of a family of 3 stepping out, small pull-out to a static wide | Faces melted |
 | pending | Alpha Timber 15s (reframed) | 3 | Builder chest-up, truck out of focus behind | ? |
 | | | 4 | Family of 3 waist-up, child in dad's arms, small pull-back ending on a medium shot | ? |
+| to test | Crowd/protest shot | - | Sharp foreground speaker chest-up, out-of-focus crowd behind (rule 5a) | ? |
 
 Update this table after every framing test, and promote rules from
 [hypothesis] to [tested] (or drop them) based on what we see.
