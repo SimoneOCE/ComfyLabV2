@@ -246,6 +246,12 @@ COMFYLAB_NODES_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/c
 rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
 cp -r "$COMFYLAB_NODES_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
 echo "[comfylab-engine] Installed comfylab_rtx_vsr custom node."
+
+# Our audio-lock node for the face refine pass (see its docstring).
+COMFYLAB_AUDIO_LOCK_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/comfylab_h3_audio_lock"
+rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_h3_audio_lock"
+cp -r "$COMFYLAB_AUDIO_LOCK_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_h3_audio_lock"
+echo "[comfylab-engine] Installed comfylab_h3_audio_lock custom node."
 echo "[comfylab-engine] nvidia-vfx installed: $(pip show nvidia-vfx 2>/dev/null | grep '^Version:' || echo 'NOT INSTALLED')"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
 

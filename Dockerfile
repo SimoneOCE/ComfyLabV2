@@ -119,19 +119,14 @@ RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git ComfyUI/custom_nodes/
 # run_face_refine). Carasibana/ComfyUI-H3-FaceRefine (MIT) is pure Python;
 # its detector/scene-cut deps are wheels. insightface is deliberately NOT
 # installed (needs a C++ build): the refine graph runs with identity
-# matching off, which never imports it. MiniMaxH3NativeAudioLock (keeps the
-# clip's real audio fixed so lipsync survives the refine) ships inside the
-# Shrek3OnVH5 workflow repo; only that one folder is copied in.
+# matching off, which never imports it. The audio-lock step is our own node
+# (comfyui_engine/custom_nodes/comfylab_h3_audio_lock), installed at boot by
+# ensure_comfyui_engine.sh.
 ARG FACEREFINE_COMMIT=d8521d14fe0d721d80cd9417fff5a559cbc21aba
-ARG NATIVEAUDIOLOCK_COMMIT=11a95f623b98496923714db99da0aecec672cbd4
 RUN git clone https://github.com/Carasibana/ComfyUI-H3-FaceRefine.git ComfyUI/custom_nodes/ComfyUI-H3-FaceRefine \
     && cd ComfyUI/custom_nodes/ComfyUI-H3-FaceRefine \
     && git checkout "$FACEREFINE_COMMIT" \
     && pip install --no-cache-dir "ultralytics==8.4.171" scipy "scenedetect==0.7.1"
-RUN git clone https://github.com/Shrek3OnVH5/MiniMax-H3-NativeAudio-MusicVideo-Workflow.git /tmp/h3-nal \
-    && git -C /tmp/h3-nal checkout "$NATIVEAUDIOLOCK_COMMIT" \
-    && cp -r /tmp/h3-nal/custom_nodes/ComfyUI-H3-NativeAudioLock ComfyUI/custom_nodes/ComfyUI-H3-NativeAudioLock \
-    && rm -rf /tmp/h3-nal
 
 COPY comfyui_engine ./comfyui_engine
 COPY handler.py .
