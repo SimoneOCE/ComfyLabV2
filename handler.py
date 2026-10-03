@@ -1099,21 +1099,29 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
         wf[p + "r2v"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
             "clip": ["r_clip", 0], "vae": ["r_vae", 0], "audio_vae": ["r_avae", 0],
             "prompt": prompt, "width": [p + "track", 4], "height": [p + "track", 5],
-            "length": [p + "track", 6], "ref_image_size": "match",
-            # Autogrow API key = "<input id>.<template name>" (comfy_api
-            # _io.py finalize_prefix at the pinned commit).
-            "ref_audios.ref_audio_0": audio}}
-        wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
-            "av_latent": dbg_latent(p + "dbg_r2v", [p + "r2v", 1], f"pass {i} r2v latent"),
-            "images": dbg_image(p + "dbg_crops", [p + "track", 0], f"pass {i} crops"),
-            "vae": ["r_vae", 0]}}
+            "length": [p + "track", 6], "ref_image_size": "match"}}
+            # No reference audio here (the pack's example passes the clip's
+            # audio as ref_audios.ref_audio_0). With it, the text conditioning
+            # came out entirely NaN on our setup (debug run 4504b86a), while
+            # plain text conditioning - what every normal generation uses -
+            # is clean. Lip sync is anchored by the audio lock below instead.
+        # Audio lock runs BEFORE the video inject (the pack's example does it
+        # after). Debug run 4504b86a: core's own encode of this soundtrack
+        # (reference audio, early in the graph) was clean, but the lock's
+        # identical encode after the big video-VAE inject came out NaN.
+        # H3InjectVideoLatent copies the latent dict and only swaps the video
+        # stream, so the locked audio and its noise mask pass through intact.
         wf[p + "lock"] = {"class_type": "MiniMaxH3NativeAudioLock", "inputs": {
             "model": ["r_sage", 0],
-            "av_latent": dbg_latent(p + "dbg_inject", [p + "inject", 0], f"pass {i} after inject"),
+            "av_latent": dbg_latent(p + "dbg_r2v", [p + "r2v", 1], f"pass {i} r2v latent"),
             "audio_vae": ["r_avae", 0], "audio": audio}}
+        wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
+            "av_latent": dbg_latent(p + "dbg_lock", [p + "lock", 1], f"pass {i} after audio lock"),
+            "images": dbg_image(p + "dbg_crops", [p + "track", 0], f"pass {i} crops"),
+            "vae": ["r_vae", 0]}}
         wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
             "model": [p + "lock", 0],
-            "av_latent": dbg_latent(p + "dbg_lock", [p + "lock", 1], f"pass {i} after audio lock"),
+            "av_latent": dbg_latent(p + "dbg_inject", [p + "inject", 0], f"pass {i} after inject"),
             "transform": [p + "track", 1],
             "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.35,
             "scale_mode": "absolute_px", "face_px_small": 30.0, "face_px_large": 120.0,
