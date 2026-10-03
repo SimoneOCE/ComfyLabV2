@@ -167,10 +167,38 @@ class ComfyLabDebugConditioning:
         return (conditioning,)
 
 
+class ComfyLabDebugSigmas:
+    """Logs the sigma schedule the sampler will use, and the model_sampling
+    table it was built from (BasicScheduler reads model_sampling.sigmas)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"sigmas": ("SIGMAS",), "model": ("MODEL",),
+                             "label": ("STRING", {"default": "sigmas"})}}
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "run"
+    CATEGORY = "ComfyLab/debug"
+
+    def run(self, sigmas, model, label):
+        _log(f"{label}: schedule {_stats(sigmas)} values={[round(float(v), 6) for v in sigmas.flatten()[:12]]}")
+        try:
+            ms = model.get_model_object("model_sampling")
+            table = getattr(ms, "sigmas", None)
+            _log(f"{label}: model_sampling {type(ms).__name__} shift={getattr(ms, 'shift', None)}"
+                 f" audio_shift={getattr(ms, 'audio_shift', None)} table {_stats(table)}"
+                 f" device={getattr(table, 'device', None)}"
+                 f" first/last={[float(table[0]), float(table[-1])] if torch.is_tensor(table) and table.numel() else None}")
+        except Exception as e:
+            _log(f"{label}: could not read model_sampling: {e!r}")
+        return (sigmas,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ComfyLabDebugImage": ComfyLabDebugImage,
     "ComfyLabDebugLatent": ComfyLabDebugLatent,
     "ComfyLabDebugModel": ComfyLabDebugModel,
     "ComfyLabDebugAudio": ComfyLabDebugAudio,
     "ComfyLabDebugConditioning": ComfyLabDebugConditioning,
+    "ComfyLabDebugSigmas": ComfyLabDebugSigmas,
 }

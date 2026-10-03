@@ -1134,9 +1134,11 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
             "model": [p + "dbg_model", 0], "conditioning": [p + "dbg_cond", 0]}}
         wf[p + "sched"] = {"class_type": "BasicScheduler", "inputs": {
             "scheduler": "simple", "steps": REFINE_STEPS, "denoise": denoise, "model": [p + "pfd", 2]}}
+        wf[p + "dbg_sigmas"] = {"class_type": "ComfyLabDebugSigmas", "inputs": {
+            "sigmas": [p + "sched", 0], "model": [p + "pfd", 2], "label": f"pass {i} sigmas"}}
         wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
             "noise": ["r_noise", 0], "guider": [p + "guider", 0], "sampler": ["r_sampler", 0],
-            "sigmas": [p + "sched", 0],
+            "sigmas": [p + "dbg_sigmas", 0],
             "latent_image": dbg_latent(p + "dbg_pfd", [p + "pfd", 0], f"pass {i} after per-frame denoise")}}
         wf[p + "decode"] = {"class_type": "VAEDecode", "inputs": {"samples": [p + "sample", 0], "vae": ["r_vae", 0]}}
         wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
