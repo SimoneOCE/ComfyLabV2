@@ -70,6 +70,12 @@ agrees it's a property of head-size-in-frame, not output resolution
     video, count people per shot, build one pass per person who ever has a
     small (<120px) face, cap 4. Removes the "People" dropdown (asking for
     more people than the video has errors with "No face detected").
+    Per shot: passes = the most small-faced people in any one shot. In a
+    shot with fewer people than a pass's index, the tracker falls back to
+    the last face it has (the pack's `ranked[min(select_index, n-1)]`), so
+    that person is redrawn by several passes (last one wins - costs time,
+    no harm). The auto version should zero that pass's strength in those
+    shots instead.
   - Drop the prompt override for Wan: always use the node's generic face
     prompt (one override applies to every person, and the source prompt is
     a whole-scene H3-format prompt that never goes to Wan).
