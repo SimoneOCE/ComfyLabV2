@@ -70,6 +70,10 @@ agrees it's a property of head-size-in-frame, not output resolution
   canvas, redrawn at up to 512px), people counted automatically (up to 4
   per shot). All are the worker's defaults, so the site only needs to send
   `mode` and `source_video_key`.
+  Test finding (2026-10-03, job d6128f80 vs earlier 4-step runs on the same
+  clip): 3 steps looked as good as or better than 4, so 3 is a quality
+  choice, not just a speed one. Untested guess at why: fewer steps on an
+  already-detailed crop means less over-smoothing ("waxy" look).
 - **Refine speed ideas, not built yet (decide once the per-step timings are
   in - the job output now has `timings`):**
   - Cache the native-size (pre-upscale) copy of every generation on the
