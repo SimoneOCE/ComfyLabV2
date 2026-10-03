@@ -1081,7 +1081,7 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
             "ref_audios.ref_audio_0": audio}}
         wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
             "av_latent": [p + "r2v", 1], "images": [p + "track", 0], "vae": ["r_vae", 0]}}
-        wf[p + "lock"] = {"class_type": "ComfyLabH3AudioLock", "inputs": {
+        wf[p + "lock"] = {"class_type": "MiniMaxH3NativeAudioLock", "inputs": {
             "model": ["r_sage", 0], "av_latent": [p + "inject", 0], "audio_vae": ["r_avae", 0], "audio": audio}}
         wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
             "model": [p + "lock", 0], "av_latent": [p + "lock", 1], "transform": [p + "track", 1],
