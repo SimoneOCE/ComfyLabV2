@@ -1013,7 +1013,9 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
     for i in range(subjects):
         p = f"r{i}_"
         wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
-            "base_images": images, "refined_crops": ["r_wan", i], "transform": [p + "track", 1],
+            # The redraw node's transform: its per-frame weights are zero on
+            # frames it didn't redraw, so those keep the video's own pixels.
+            "base_images": images, "refined_crops": ["r_wan", i], "transform": ["r_wan", 5 + i],
             "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
             "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
         images = [p + "stitch", 0]
