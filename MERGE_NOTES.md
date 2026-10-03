@@ -79,6 +79,14 @@ agrees it's a property of head-size-in-frame, not output resolution
     `build_refine_payload`;
   - `build_refine_payload`, `REFINE_DEFAULT_DENOISE`/`REFINE_STEPS`, the H3
     option on the test page.
+- **Wan refine to-dos (noted, not built - after the current test):**
+  - Auto people count: before building the graph, run face_yolov8m on the
+    video, count people per shot, build one pass per person who ever has a
+    small (<120px) face, cap 4. Removes the "People" dropdown (asking for
+    more people than the video has errors with "No face detected").
+  - Drop the prompt override for Wan: always use the node's generic face
+    prompt (one override applies to every person, and the source prompt is
+    a whole-scene H3-format prompt that never goes to Wan).
   Keep for Wan: the ComfyUI-H3-FaceRefine pack (its tracker and stitch are
   used; its nodes import lazily, ultralytics only when a refine runs),
   ultralytics/scipy/scenedetect, face_yolov8m.pt.
