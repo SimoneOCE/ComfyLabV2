@@ -66,6 +66,22 @@ agrees it's a property of head-size-in-frame, not output resolution
     download on the first Wan refine, not at session start; Wan loads once
     per refine and is unloaded from VRAM and RAM before the job ends. Not
     audio-aware - lip sync to be judged on the first results.
+- **At merge, if Wan is the engine we keep: remove the H3-only refine
+  pieces.** Startup cost today is small (no model loads, no downloads at
+  session start), but these exist only for the H3 engine:
+  - `MiniMaxH3NativeAudioLock` (Dockerfile copy from the Shrek3OnVH5 repo) -
+    the one H3-refine piece imported at every ComfyUI start, and it pulls in
+    torchaudio;
+  - the torchaudio pin and the libgl1/libglib2.0-0 note tied to it (keep
+    torchvision's pin; check nothing else imports torchaudio first - core
+    ComfyUI dropped it);
+  - `comfylab_debug` nodes (copied every boot) and the debug wiring in
+    `build_refine_payload`;
+  - `build_refine_payload`, `REFINE_DEFAULT_DENOISE`/`REFINE_STEPS`, the H3
+    option on the test page.
+  Keep for Wan: the ComfyUI-H3-FaceRefine pack (its tracker and stitch are
+  used; its nodes import lazily, ultralytics only when a refine runs),
+  ultralytics/scipy/scenedetect, face_yolov8m.pt.
 
 ## Other to-dos (not merge-blocking)
 
