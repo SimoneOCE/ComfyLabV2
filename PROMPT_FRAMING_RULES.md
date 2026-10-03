@@ -16,7 +16,9 @@ Base H3 draws faces badly once a head is a small part of the frame. This
 depends on how tall the head is in pixels, not on output resolution, so
 upscaling doesn't fix it. **[tested]** It's not Sage attention, not clip
 length, and not the fine-tune: base, base with the Realism LoRA, DaSiWa V3,
-7s and 15s clips, and Sage on/off all produced the same melted faces.
+7s and 15s clips, and Sage on/off all produced the same melted faces. It's
+not our ComfyUI stack either: production koboldcpp (different weights,
+engine and attention code) melted the same framings.
 
 H3's native output is 768px tall. ComfyUI-H3-FaceRefine's defaults put
 "broken" at 30px of face height or less and "fine" at 120px or more.
@@ -126,6 +128,8 @@ re-run the enhancer.
 | | | 3 | Medium-wide, builder with thumbs-up, truck behind | Face melted |
 | | | 4 | Medium shot of a family of 3 stepping out, pulling out to a static wide | All 3 faces melted |
 | 2026-10-02 | Family 7s (Shot 4 on its own) | 1 | Same family shot over 7s | Faces bad from the first frame (rules out clip length) |
+| 2026-10-03 | Alpha Timber 7s, 3 shots, **koboldcpp live site** (DaSiWa V1 Q5 GGUF, 1280x736, 20 steps, Euler, hi-res on; `ad4ddca3`) | 2 | Medium-wide, builder with thumbs-up | Face melted |
+| | | 3 | Medium shot of a family of 3 stepping out, small pull-out to a static wide | Faces melted |
 | pending | Alpha Timber 15s (reframed) | 3 | Builder chest-up, truck out of focus behind | ? |
 | | | 4 | Family of 3 waist-up, child in dad's arms, small pull-back ending on a medium shot | ? |
 
