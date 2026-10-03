@@ -962,7 +962,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 # looked up by videoKey, since H3 regenerates the crop against it.
 REFINE_MODE = "face_refine"
 REFINE_MAX_SUBJECTS = 4
-REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base; H3PerFrameDenoise scales it down per frame for big faces
+REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base; see build_refine_payload for why it still holds with H3PerFrameDenoise bypassed
 REFINE_STEPS = 8               # matches the 8-step turbo LoRA (LORA_CHOICES["turbo"])
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
 
@@ -1119,27 +1119,30 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
             "av_latent": dbg_latent(p + "dbg_lock", [p + "lock", 1], f"pass {i} after audio lock"),
             "images": dbg_image(p + "dbg_crops", [p + "track", 0], f"pass {i} crops"),
             "vae": ["r_vae", 0]}}
-        wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
-            "model": [p + "lock", 0],
-            "av_latent": dbg_latent(p + "dbg_inject", [p + "inject", 0], f"pass {i} after inject"),
-            "transform": [p + "track", 1],
-            "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.35,
-            "scale_mode": "absolute_px", "face_px_small": 30.0, "face_px_large": 120.0,
-            "gamma": 1.0, "smooth_frames": 9}}
+        # H3PerFrameDenoise is bypassed, per the pack's own issue #19 ("H3PerFrameDenoise
+        # swallows the denoise", same model/LoRA/er_sde/Sage setup as ours): its model
+        # patches neutralised sampling there, and here the timestep reaching H3 came out
+        # as garbage (NaN / -129) with it in the path. The reporter's workaround - wire
+        # the injected latent straight into the sampler - is what this does; the README
+        # says to drop the base denoise to 0.15-0.25 when the per-frame node is bypassed,
+        # but only so LARGE faces aren't rewritten: the node scales the 0.4 base by 1.0 at
+        # <=30px faces and 0.35 at >=120px. Refine targets small faces (ours measured
+        # 15-38px), where the node would have applied ~0.4 anyway, so a flat 0.4 matches
+        # the pack's intent here. The lock's model output feeds guider and scheduler.
         wf[p + "dbg_model"] = {"class_type": "ComfyLabDebugModel", "inputs": {
-            "model": [p + "pfd", 2], "label": f"pass {i} H3 forward", "calls": 2}}
+            "model": [p + "lock", 0], "label": f"pass {i} H3 forward", "calls": 2}}
         wf[p + "dbg_cond"] = {"class_type": "ComfyLabDebugConditioning", "inputs": {
             "conditioning": [p + "r2v", 0], "label": f"pass {i} r2v conditioning"}}
         wf[p + "guider"] = {"class_type": "BasicGuider", "inputs": {
             "model": [p + "dbg_model", 0], "conditioning": [p + "dbg_cond", 0]}}
         wf[p + "sched"] = {"class_type": "BasicScheduler", "inputs": {
-            "scheduler": "simple", "steps": REFINE_STEPS, "denoise": denoise, "model": [p + "pfd", 2]}}
+            "scheduler": "simple", "steps": REFINE_STEPS, "denoise": denoise, "model": [p + "lock", 0]}}
         wf[p + "dbg_sigmas"] = {"class_type": "ComfyLabDebugSigmas", "inputs": {
-            "sigmas": [p + "sched", 0], "model": [p + "pfd", 2], "label": f"pass {i} sigmas"}}
+            "sigmas": [p + "sched", 0], "model": [p + "lock", 0], "label": f"pass {i} sigmas"}}
         wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
             "noise": ["r_noise", 0], "guider": [p + "guider", 0], "sampler": ["r_sampler", 0],
             "sigmas": [p + "dbg_sigmas", 0],
-            "latent_image": dbg_latent(p + "dbg_pfd", [p + "pfd", 0], f"pass {i} after per-frame denoise")}}
+            "latent_image": dbg_latent(p + "dbg_inject", [p + "inject", 0], f"pass {i} after inject")}}
         wf[p + "decode"] = {"class_type": "VAEDecode", "inputs": {"samples": [p + "sample", 0], "vae": ["r_vae", 0]}}
         wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
             "base_images": images, "refined_crops": [p + "decode", 0], "transform": [p + "track", 1],
