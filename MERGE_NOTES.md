@@ -75,8 +75,10 @@ agrees it's a property of head-size-in-frame, not output resolution
   - Cache the native-size (pre-upscale) copy of every generation on the
     volume when it's made, so a refine skips downloading, decoding and
     shrinking the upscaled video (~10-20s, needs a small generation change).
-  - Hardware encoding: ComfyUI's SaveVideo encodes H.264 on the CPU
-    (libx264, crf 18); the 5090's NVENC would be far faster at 2x size.
+  - Done for the refine: GPU H.264 (ComfyLabSaveVideoNVENC, h264_nvenc
+    cq 19, falls back to core's libx264 crf 18). Needs the image's
+    NVIDIA_DRIVER_CAPABILITIES to include "video". Generation still uses
+    core SaveVideo (CPU) - switch it too once the refine confirms NVENC works.
   - One stitch for everyone (one pass over the frames instead of one per
     person, touching only the face areas).
   - Don't re-upscale the whole video: paste the refined faces into the

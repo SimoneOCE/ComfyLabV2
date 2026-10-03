@@ -454,7 +454,11 @@ except Exception as _e:  # logging-only helper; never block the nodes
     logging.warning(f"[ComfyLabTiming] not installed: {_e}")
 
 
+from .save_nvenc import ComfyLabSaveVideoNVENC  # noqa: E402
+
+
 NODE_CLASS_MAPPINGS = {
+    "ComfyLabSaveVideoNVENC": ComfyLabSaveVideoNVENC,
     "ComfyLabWanFaceRedraw": ComfyLabWanFaceRedraw,
     "ComfyLabFacePickIndex": ComfyLabFacePickIndex,
     "ComfyLabSmallFaceCount": ComfyLabSmallFaceCount,
@@ -463,4 +467,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ComfyLabWanFaceRedraw": "ComfyLab Wan Face Redraw",
     "ComfyLabFacePickIndex": "ComfyLab Face Pick (person N)",
     "ComfyLabSmallFaceCount": "ComfyLab Small Face Count",
+    "ComfyLabSaveVideoNVENC": "ComfyLab Save Video (NVENC)",
 }

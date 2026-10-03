@@ -1077,9 +1077,11 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         images = ["r_vsr", 0]
     wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
         "fps": ["r_select", 6], "bit_depth": 8, "images": images, "audio": audio}}
-    wf[NODE_IDS["output"]] = {"class_type": "SaveVideo", "inputs": {
+    # GPU (NVENC) H.264 instead of core SaveVideo's CPU libx264 - same
+    # history output shape, falls back to libx264 if NVENC isn't usable.
+    wf[NODE_IDS["output"]] = {"class_type": "ComfyLabSaveVideoNVENC", "inputs": {
         "filename_prefix": f"video/FaceRefineWan_{uuid.uuid4().hex[:12]}",
-        "format": "auto", "codec": "auto", "video": ["r_create", 0]}}
+        "video": ["r_create", 0]}}
     return wf
 
 
@@ -1212,7 +1214,9 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
     stages["fetch_and_upload"] = time.time() - t
+    encoder = (result.get("outputs", {}).get(NODE_IDS["output"], {}).get("encoder") or [None])[0]
     timings = summarize_timings(stages, node_rows)
+    timings["encoder"] = encoder
     print(f"Face refine timings: {json.dumps(timings)}")
     return {
         "videoKey": video_key,

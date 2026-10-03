@@ -91,6 +91,10 @@ RUN curl -fsSL -o /tmp/cuda-keyring.deb \
     && apt-get install -y --no-install-recommends cuda-nvcc-13-0 \
     && rm -rf /var/lib/apt/lists/*
 ENV CUDA_HOME=/usr/local/cuda-13.0
+# "video" makes the NVIDIA container runtime mount the driver's NVENC/NVDEC
+# libraries (libnvidia-encode), which the refine's GPU H.264 encoding needs
+# (ComfyLabSaveVideoNVENC; it falls back to CPU libx264 without them).
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 
 # ComfyUI itself
