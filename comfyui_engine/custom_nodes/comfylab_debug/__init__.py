@@ -119,8 +119,58 @@ class ComfyLabDebugModel:
         return (m,)
 
 
+class ComfyLabDebugAudio:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"audio": ("AUDIO",), "label": ("STRING", {"default": "audio"})}}
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "run"
+    CATEGORY = "ComfyLab/debug"
+
+    def run(self, audio, label):
+        if not isinstance(audio, dict):
+            _log(f"{label}: not a dict: {type(audio)}")
+            return (audio,)
+        wf = audio.get("waveform")
+        _log(f"{label}: sample_rate={audio.get('sample_rate')} waveform {_stats(wf)}")
+        if torch.is_tensor(wf) and wf.numel():
+            f = wf.detach().float()
+            _log(f"{label}: abs-max={f.abs().max().item():.6g} rms={f.pow(2).mean().sqrt().item():.6g}"
+                 f" silent={bool(f.abs().max().item() == 0)} seconds={wf.shape[-1] / float(audio.get('sample_rate') or 1):.3f}")
+        return (audio,)
+
+
+class ComfyLabDebugConditioning:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"conditioning": ("CONDITIONING",), "label": ("STRING", {"default": "conditioning"})}}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "run"
+    CATEGORY = "ComfyLab/debug"
+
+    def run(self, conditioning, label):
+        for i, (tensor, extras) in enumerate(conditioning):
+            _log(f"{label}[{i}] tensor {_stats(tensor)}")
+            for key, value in (extras or {}).items():
+                if torch.is_tensor(value) or getattr(value, "is_nested", False):
+                    _log(f"{label}[{i}] {key} {_stats(value)}")
+                elif key == "minimax_refs" and isinstance(value, list):
+                    for j, ref in enumerate(value):
+                        if isinstance(ref, dict):
+                            parts = ", ".join(f"{k}: {_stats(v)}" for k, v in ref.items()
+                                              if torch.is_tensor(v) or getattr(v, "is_nested", False))
+                            _log(f"{label}[{i}] minimax_refs[{j}] kind={ref.get('kind')} {parts}")
+                else:
+                    _log(f"{label}[{i}] {key} = {repr(value)[:200]}")
+        return (conditioning,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ComfyLabDebugImage": ComfyLabDebugImage,
     "ComfyLabDebugLatent": ComfyLabDebugLatent,
     "ComfyLabDebugModel": ComfyLabDebugModel,
+    "ComfyLabDebugAudio": ComfyLabDebugAudio,
+    "ComfyLabDebugConditioning": ComfyLabDebugConditioning,
 }

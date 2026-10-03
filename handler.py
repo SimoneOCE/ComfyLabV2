@@ -1077,7 +1077,8 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
         return [node_id, 0]
 
     images = dbg_image("r_dbg_frames", ["r_comp", 0], "source frames")
-    audio = ["r_comp", 1]
+    wf["r_dbg_audio"] = {"class_type": "ComfyLabDebugAudio", "inputs": {"audio": ["r_comp", 1], "label": "source audio"}}
+    audio = ["r_dbg_audio", 0]
     for i in range(subjects):
         p = f"r{i}_"
         wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
@@ -1119,8 +1120,10 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
             "gamma": 1.0, "smooth_frames": 9}}
         wf[p + "dbg_model"] = {"class_type": "ComfyLabDebugModel", "inputs": {
             "model": [p + "pfd", 2], "label": f"pass {i} H3 forward", "calls": 2}}
+        wf[p + "dbg_cond"] = {"class_type": "ComfyLabDebugConditioning", "inputs": {
+            "conditioning": [p + "r2v", 0], "label": f"pass {i} r2v conditioning"}}
         wf[p + "guider"] = {"class_type": "BasicGuider", "inputs": {
-            "model": [p + "dbg_model", 0], "conditioning": [p + "r2v", 0]}}
+            "model": [p + "dbg_model", 0], "conditioning": [p + "dbg_cond", 0]}}
         wf[p + "sched"] = {"class_type": "BasicScheduler", "inputs": {
             "scheduler": "simple", "steps": REFINE_STEPS, "denoise": denoise, "model": [p + "pfd", 2]}}
         wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
