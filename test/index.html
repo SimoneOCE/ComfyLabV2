@@ -177,11 +177,11 @@
       <option value="4">4</option>
     </select>
   </label>
-  <label>Strength (base denoise; scaled down automatically for faces that are already large)
+  <label>Strength (denoise - the pack's README range is 0.15-0.25 with its per-frame node bypassed, as here)
     <select id="refineDenoise">
-      <option value="0.3">0.3 - gentle</option>
-      <option value="0.4" selected>0.4 - default (the pack's own setting)</option>
-      <option value="0.5">0.5 - strong (risk: head drifts from body)</option>
+      <option value="0.15">0.15 - gentle</option>
+      <option value="0.2" selected>0.2 - default</option>
+      <option value="0.25">0.25 - strong (risk: head drifts from body)</option>
     </select>
   </label>
   <label>Prompt override (optional - blank uses the original generation's prompt)
