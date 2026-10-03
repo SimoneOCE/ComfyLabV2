@@ -161,10 +161,10 @@
       <option value="0.6">0.6 - strongest</option>
     </select>
   </label>
-  <label>Face canvas (size each face crop is redrawn at)
+  <label>Face crop size (resolution each face is redrawn at - not the number of people)
     <select id="refineCanvas">
-      <option value="auto" selected>Auto (tracker picks, up to 768 - 512 on recent tests)</option>
-      <option value="384">384 - ~2x faster redraw, less detail per face (testing)</option>
+      <option value="auto" selected>Standard - sized per person by the tracker, up to 768px (512 on recent tests)</option>
+      <option value="384">Fast - fixed 384px, ~2x faster redraw, less detail per face (testing)</option>
     </select>
   </label>
   <label>Face prompt override (optional - blank uses a generic face prompt; applies to every person)
