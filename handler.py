@@ -6,6 +6,7 @@ import time
 import requests
 import os
 import json
+import re
 import shutil
 import urllib.parse
 import uuid
@@ -847,12 +848,14 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 #
 # Job shape (comfylab_gpu_session_jobs.input):
 #   {"mode": "face_refine", "source_video_key": "<key>.mp4",
-#    "subjects": 1-4, "denoise": 0.05-1.0 (default 0.6), "seed": ...,
+#    "subjects": optional 1-4 (default: counted - the most small faces in
+#                any one shot, capped at 4), "denoise": 0.05-1.0 (default 0.6), "seed": ...,
 #    "prompt": optional face prompt (blank = the node's generic one),
 #    "canvas": "auto" (default) | 384 | 512 | 640 | 768,
 #    "steps": 2-8 (default 3)}
 REFINE_MODE = "face_refine"
-REFINE_MAX_SUBJECTS = 4
+REFINE_MAX_SUBJECTS = 4            # most people refined per shot (the largest small faces win)
+REFINE_FACE_PX_LARGE = 120.0       # faces this tall or more are left as they are
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
 WAN_REFINE_DEFAULT_DENOISE = 0.6   # the "Fix faces" setting (chosen on test 96cb3da1); starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
 WAN_REFINE_STEPS = 3               # the "Fix faces" setting (chosen on test 96cb3da1); the lightx2v LoRA is distilled for 4
@@ -951,6 +954,32 @@ def prepare_refine_source(video_key):
     return filename, factor
 
 
+def refine_select_node(source_filename):
+    """The pack's H3 Load Video + Face Select: loads the video and finds every
+    face and cut in one pass. Built identically for the people-count prompt
+    and the refine prompt, so ComfyUI's cache reuses the first one's result
+    instead of detecting again."""
+    return {"class_type": "H3FaceSelect", "inputs": {
+        "video": source_filename, "detector": FACE_DETECTOR, "confidence": 0.35,
+        "select": "largest_face", "select_index": 0, "confirmed_pick": "",
+        "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
+        "skip_first_frames": 0, "frame_load_cap": 0, "select_every_nth": 1,
+        "identity_model": "insightface", "identity_threshold": 0.28,
+        "X": 0, "Y": 0, "frame_index": 0}}
+
+
+def build_people_count_payload(source_filename):
+    """Short first prompt: face finding + ComfyLabSmallFaceCount. Its report's
+    first line is "small_face_people=N found=M"."""
+    return {
+        "r_select": refine_select_node(source_filename),
+        "r_count": {"class_type": "ComfyLabSmallFaceCount", "inputs": {
+            "face_pick": ["r_select", 2], "face_px_large": REFINE_FACE_PX_LARGE,
+            "max_people": REFINE_MAX_SUBJECTS}},
+        "r_count_report": {"class_type": "PreviewAny", "inputs": {"source": ["r_count", 1]}},
+    }
+
+
 def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt, canvas=None,
                          steps=WAN_REFINE_STEPS):
     """The pack's H3FaceSelect loads the video and detects every face and cut
@@ -960,15 +989,7 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
     is unloaded inside the node when it finishes), then stitched back one
     subject after another. canvas: None = the tracker's auto size (capped at
     768), or a fixed square size (e.g. 384) for every crop."""
-    wf = {
-        "r_select": {"class_type": "H3FaceSelect", "inputs": {
-            "video": source_filename, "detector": FACE_DETECTOR, "confidence": 0.35,
-            "select": "largest_face", "select_index": 0, "confirmed_pick": "",
-            "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
-            "skip_first_frames": 0, "frame_load_cap": 0, "select_every_nth": 1,
-            "identity_model": "insightface", "identity_threshold": 0.28,
-            "X": 0, "Y": 0, "frame_index": 0}},
-    }
+    wf = {"r_select": refine_select_node(source_filename)}
     source = ["r_select", 0]
     audio = ["r_select", 1]
     redraw_inputs = {
@@ -980,13 +1001,16 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         "shift": WAN_REFINE_SHIFT, "seed": seed,
         # The pack's H3PerFrameDenoise ramp, ending at zero: faces at or
         # above 120px are left exactly as they are.
-        "face_px_small": 30.0, "face_px_large": 120.0, "smooth_frames": 9,
+        "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE, "smooth_frames": 9,
         "sage_attention": True,
     }
     for i in range(subjects):
         p = f"r{i}_"
+        # Person i = the i-th largest SMALL face in each shot: faces already
+        # big enough are skipped, since the refine leaves them alone anyway.
         wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
-            "face_pick": ["r_select", 2], "index": i}}
+            "face_pick": ["r_select", 2], "index": i,
+            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE}}
         wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
             "images": source, "face_pick": [p + "pick", 0],
             # detector/confidence/cut settings are inert with a face_pick wired
@@ -1037,12 +1061,17 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     source_key = (job_input.get("source_video_key") or "").strip()
     if not source_key:
         raise ValueError("face_refine needs source_video_key")
-    try:
-        subjects = int(job_input.get("subjects", 1))
-    except (TypeError, ValueError):
-        raise ValueError(f"subjects must be a whole number, got {job_input.get('subjects')!r}")
-    if not 1 <= subjects <= REFINE_MAX_SUBJECTS:
-        raise ValueError(f"subjects must be 1-{REFINE_MAX_SUBJECTS}, got {subjects}")
+    # People to refine: counted automatically unless the job names a number.
+    subjects = job_input.get("subjects")
+    if subjects not in (None, "", "auto"):
+        try:
+            subjects = int(subjects)
+        except (TypeError, ValueError):
+            raise ValueError(f"subjects must be a whole number or 'auto', got {job_input.get('subjects')!r}")
+        if not 1 <= subjects <= REFINE_MAX_SUBJECTS:
+            raise ValueError(f"subjects must be 1-{REFINE_MAX_SUBJECTS}, got {subjects}")
+    else:
+        subjects = None
     try:
         denoise = float(job_input.get("denoise", WAN_REFINE_DEFAULT_DENOISE))
     except (TypeError, ValueError):
@@ -1077,10 +1106,40 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     upscale_scale = None
     if job_input.get("upscale_back", True):
         upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
-    workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt, canvas, steps)
-
     comfy_start = time.time()
+    count_report = None
     try:
+        if subjects is None:
+            if report_stage:
+                report_stage("Finding faces")
+            counted = submit_and_wait(build_people_count_payload(source_filename),
+                                      should_cancel=should_cancel, should_force_kill=should_force_kill)
+            if counted.get("force_killed"):
+                return {"cancelled": True, "force_killed": True}
+            if counted.get("cancelled"):
+                return {"cancelled": True}
+            text = counted.get("outputs", {}).get("r_count_report", {}).get("text")
+            count_report = (text[0] if isinstance(text, list) else text) or ""
+            match = re.search(r"small_face_people=(\d+)", count_report)
+            if not match:
+                raise RuntimeError(f"Could not read the people count: {count_report[:300]!r}")
+            subjects = int(match.group(1))
+            if subjects == 0:
+                # Nothing to fix: hand back the original video, no Wan, no upload.
+                return {
+                    "videoKey": source_key,
+                    "mode": REFINE_MODE,
+                    "no_small_faces": True,
+                    "message": "No small faces found - the video was left as it is.",
+                    "source_video_key": source_key,
+                    "subjects": 0,
+                    "comfy_seconds": round(time.time() - comfy_start, 1),
+                    "tracker_reports": [count_report],
+                }
+            if report_stage:
+                report_stage(f"Refining faces ({subjects} {'person' if subjects == 1 else 'people'})")
+        workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
+                                        canvas, steps)
         result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
     finally:
         try:
@@ -1095,7 +1154,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
 
     # Tracker reports (one per subject) - what it found, lost frames, the
     # canvas it chose. Surfaced so a bad refine can be diagnosed.
-    reports = []
+    reports = [count_report] if count_report else []
     for i in range(subjects):
         text = result.get("outputs", {}).get(f"r{i}_report", {}).get("text")
         if text:
@@ -1119,6 +1178,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         "steps": steps,
         "source_video_key": source_key,
         "subjects": subjects,
+        "subjects_counted": count_report is not None,
         "denoise": denoise,
         "seed": seed,
         "upscaled_back": upscale_scale,

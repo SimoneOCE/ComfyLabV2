@@ -145,11 +145,12 @@
   <label>Video key to refine (fills in with your latest result)
     <input id="refineVideoKey" type="text" placeholder="938602e6-1f35-45bb-afb2-578061b00562.mp4" />
   </label>
-  <label>People to refine (largest face first)
+  <label>People to refine
     <select id="refineSubjects">
+      <option value="auto" selected>Auto - site default (counts the small faces, up to 4 per shot)</option>
       <option value="1">1</option>
       <option value="2">2</option>
-      <option value="3" selected>3</option>
+      <option value="3">3</option>
       <option value="4">4</option>
     </select>
   </label>
@@ -677,7 +678,8 @@ async function runRefine() {
   const refineInput = {
     mode: 'face_refine',
     source_video_key: sourceKey,
-    subjects: Number(document.getElementById('refineSubjects').value),
+    subjects: document.getElementById('refineSubjects').value === 'auto'
+      ? 'auto' : Number(document.getElementById('refineSubjects').value),
     denoise: Number(document.getElementById('refineDenoise').value),
     canvas: document.getElementById('refineCanvas').value,
     steps: Number(document.getElementById('refineSteps').value),

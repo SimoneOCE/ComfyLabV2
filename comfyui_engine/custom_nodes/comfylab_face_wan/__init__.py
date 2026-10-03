@@ -326,6 +326,68 @@ class ComfyLabWanFaceRedraw:
         return crops + ("\n".join(report),) + xforms
 
 
+def _pack_module():
+    select_cls = nodes.NODE_CLASS_MAPPINGS.get("H3FaceSelect")
+    if select_cls is None:
+        raise RuntimeError("ComfyUI-H3-FaceRefine's H3FaceSelect is not loaded")
+    return sys.modules[select_cls.__module__]
+
+
+def shot_face_counts(face_pick, face_px_large):
+    """Per shot: (small, large) - how many faces under / at-or-over
+    face_px_large tall are on screen together. Robust to stray detections:
+    a count only counts if at least max(3, 5% of the shot's) frames reach it."""
+    boxes = face_pick["boxes"]
+    out = []
+    for a, b in face_pick["segments"]:
+        a, b = int(a), int(b)
+        small, large = [], []
+        for f in range(a, min(b, len(boxes))):
+            heights = [float(q[3]) - float(q[1]) for q in boxes[f]]
+            small.append(sum(h < face_px_large for h in heights))
+            large.append(sum(h >= face_px_large for h in heights))
+        need = max(3, int(np.ceil(0.05 * max(1, len(small)))))
+
+        def robust(counts):
+            if len(counts) < need:
+                return max(counts, default=0)
+            return int(sorted(counts, reverse=True)[need - 1])
+        out.append((robust(small), robust(large)))
+    return out
+
+
+class ComfyLabSmallFaceCount:
+    """How many people the refine should redraw: the most faces under
+    face_px_large tall on screen together in any one shot, capped at
+    max_people (the largest small faces win when there are more). Reads the
+    face_pick from H3 Load Video + Face Select, so nothing is detected again.
+    The report's first line is machine-read by the worker."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"face_pick": ("H3FACEPICK",),
+                             "face_px_large": ("FLOAT", {"default": 120.0, "min": 2.0, "max": 2000.0}),
+                             "max_people": ("INT", {"default": 4, "min": 1, "max": 4})}}
+
+    RETURN_TYPES = ("INT", "STRING")
+    RETURN_NAMES = ("people", "report")
+    FUNCTION = "run"
+    CATEGORY = "ComfyLab"
+
+    def run(self, face_pick, face_px_large, max_people):
+        counts = shot_face_counts(face_pick, face_px_large)
+        found = max((sm for sm, _ in counts), default=0)
+        people = min(found, int(max_people))
+        lines = [f"small_face_people={people} found={found}"]
+        for k, (sm, lg) in enumerate(counts):
+            lines.append(f"shot {k + 1}: {sm} small face(s), {lg} large")
+        if found > people:
+            lines.append(f"{found} small faces in one shot - the {people} largest of them are refined")
+        report = "\n".join(lines)
+        _log(report.replace("\n", " | "))
+        return (people, report)
+
+
 class ComfyLabFacePickIndex:
     """One detection pass, many people: takes the face_pick from the pack's
     H3 Load Video + Face Select (which detects every face and cut once) and
@@ -340,24 +402,37 @@ class ComfyLabFacePickIndex:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"face_pick": ("H3FACEPICK",),
-                             "index": ("INT", {"default": 0, "min": 0, "max": 63})}}
+                             "index": ("INT", {"default": 0, "min": 0, "max": 63})},
+                "optional": {
+                    # On: `index` counts SMALL faces only - person 0 is the largest
+                    # face under face_px_large in each shot, skipping the faces
+                    # that are already big (the refine leaves those alone anyway).
+                    "skip_large": ("BOOLEAN", {"default": False}),
+                    "face_px_large": ("FLOAT", {"default": 120.0, "min": 2.0, "max": 2000.0})}}
 
     RETURN_TYPES = ("H3FACEPICK", "STRING")
     RETURN_NAMES = ("face_pick", "report")
     FUNCTION = "run"
     CATEGORY = "ComfyLab"
 
-    def run(self, face_pick, index):
-        select_cls = nodes.NODE_CLASS_MAPPINGS.get("H3FaceSelect")
-        if select_cls is None:
-            raise RuntimeError("ComfyUI-H3-FaceRefine's H3FaceSelect is not loaded")
-        pack = sys.modules[select_cls.__module__]
+    def run(self, face_pick, index, skip_large=False, face_px_large=120.0):
+        pack = _pack_module()
         boxes, confs = face_pick["boxes"], face_pick["confs"]
         segs = [(int(a), int(b)) for a, b in face_pick["segments"]]
         width, height = face_pick["src_size"]
-        picks = pack._auto_pick(boxes, confs, segs, width, height,
-                                pack._review_select("largest_face"), int(index))
-        present = [max((len(boxes[f]) for f in range(a, b)), default=0) > index for a, b in segs]
+        rank = pack._review_select("largest_face")
+        if skip_large:
+            # Per shot, rank among ALL faces = the shot's large faces + index.
+            counts = shot_face_counts(face_pick, face_px_large)
+            picks, present = [], []
+            for k, (a, b) in enumerate(segs):
+                small, large = counts[k]
+                picks.append(pack._auto_pick(boxes, confs, [(a, b)], width, height, rank,
+                                             large + int(index))[0])
+                present.append(index < small)
+        else:
+            picks = pack._auto_pick(boxes, confs, segs, width, height, rank, int(index))
+            present = [max((len(boxes[f]) for f in range(a, b)), default=0) > index for a, b in segs]
         if any(present):
             for k, (a, b) in enumerate(segs):
                 if not present[k]:
@@ -375,8 +450,10 @@ class ComfyLabFacePickIndex:
 NODE_CLASS_MAPPINGS = {
     "ComfyLabWanFaceRedraw": ComfyLabWanFaceRedraw,
     "ComfyLabFacePickIndex": ComfyLabFacePickIndex,
+    "ComfyLabSmallFaceCount": ComfyLabSmallFaceCount,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ComfyLabWanFaceRedraw": "ComfyLab Wan Face Redraw",
     "ComfyLabFacePickIndex": "ComfyLab Face Pick (person N)",
+    "ComfyLabSmallFaceCount": "ComfyLab Small Face Count",
 }

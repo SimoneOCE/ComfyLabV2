@@ -67,17 +67,17 @@ agrees it's a property of head-size-in-frame, not output resolution
   0.36/0.38), along with its audio-lock node, torchaudio and the debug nodes.
 - **"Fix faces" button settings (chosen 2026-10-03, test job 96cb3da1 on
   cba2f8ef):** strength (denoise) 0.6, 3 steps, Standard crop size (tracker
-  canvas, redrawn at up to 512px), people = up to 3 (to become the auto
-  count below). These are now the worker's defaults (`WAN_REFINE_*`), so the
-  site only needs to send `mode`, `source_video_key` and `subjects`.
+  canvas, redrawn at up to 512px), people counted automatically (up to 4
+  per shot). All are the worker's defaults, so the site only needs to send
+  `mode` and `source_video_key`.
 - **Wan refine to-dos (noted, not built - after the current test):**
-  - Auto people count: before building the graph, run face_yolov8m on the
-    video, count people per shot, build one pass per person who ever has a
-    small (<120px) face, cap 4. Removes the "People" dropdown (asking for
-    more people than the video has errors with "No face detected").
-    Per shot: passes = the most small-faced people in any one shot. Shots
-    with fewer people already skip that pass (ComfyLabFacePickIndex marks
-    them absent), so the auto count only has to pick the number.
+  - Done: auto people count. A short first ComfyUI prompt runs face
+    finding + ComfyLabSmallFaceCount (the most faces under 120px on screen
+    together in any shot, capped at 4 - the largest small faces win), then
+    the refine is built with exactly that many; the face finding is reused
+    from ComfyUI's cache. 0 = "no small faces", original video returned.
+    Person i = the i-th largest SMALL face per shot (already-big faces are
+    skipped). Job input subjects is optional (1-4 still accepted).
   - Drop the prompt override for Wan: always use the node's generic face
     prompt (one override applies to every person, and the source prompt is
     a whole-scene H3-format prompt that never goes to Wan).
