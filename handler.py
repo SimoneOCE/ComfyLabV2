@@ -170,17 +170,6 @@ UPSCALE_SCALES = {2.0, 4.0}
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
 
-# ComfyUI's model compiler (comfy-aimdo malloc graphs, on by default) records
-# H3's per-step memory on the first call and replays it. The face refine's
-# extra per-step work inside H3's forward (H3PerFrameDenoise mask patches,
-# the audio lock) allocates outside that recording - the log shows
-# "rogues: 5" vs 0 for plain generations - and the first model call then
-# read a NaN timestep (KeyError: nan in rows_to_mod_index). MMH3Tools'
-# README documents the same compiler breaking H3 patch graphs, fixed with
-# --disable-comfy-compiler. Off by default here while that's being tested;
-# set COMFYUI_COMPILER=on on the endpoint to restore ComfyUI's default.
-COMFYUI_COMPILER_ARGS = [] if os.environ.get("COMFYUI_COMPILER", "off").lower() == "on" else ["--disable-comfy-compiler"]
-
 
 def force_kill_comfyui():
     """Force Cancellation: kills ComfyUI outright rather than waiting for
@@ -358,7 +347,7 @@ def start_comfyui_if_needed():
                     # uploaded to Wasabi, so even the volume doesn't
                     # grow unbounded.
                     "--output-directory", COMFYUI_OUTPUT_DIR,
-                ] + COMFYUI_COMPILER_ARGS,
+                ],
                 cwd=COMFYUI_DIR,
             )
 
