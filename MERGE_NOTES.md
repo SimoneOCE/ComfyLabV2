@@ -80,6 +80,26 @@ agrees it's a property of head-size-in-frame, not output resolution
   each URL to its HuggingFace commit (`resolve/<sha>/...` instead of
   `resolve/main/...`) would make results reproducible. Matters most once a
   model is chosen for production. Not done yet.
+- **Parked: unsaved koboldcpp video (owner's account).** Job `4ba19710` on
+  the live site (2026-10-03 07:10 UTC; Alpha Timber prompt, 1280x736, 175
+  frames, 20 steps, hi-res on, 1124s) produced
+  `ad4ddca3-f097-41aa-ba2b-da1ffbb69d5c.mp4`, but it never reached the
+  Library: account `c8929f68...` has no `user_subscriptions` row, so its
+  library cap is 0 and the save was blocked. The file is still in storage;
+  without a `generations` row, `GET /api/video/:key` 403s. Owner said leave
+  it for now. To restore, insert a `generations` row for that user with
+  `video_url = .../api/video/ad4ddca3-f097-41aa-ba2b-da1ffbb69d5c.mp4`.
+  **Deadline: `cleanup.js` deletes `gpu_session_jobs` rows after 7 days
+  (~2026-10-10).** After that the job row (and its full prompt) is gone, so
+  any insert has to use literal values instead of selecting from the job.
+  The video file itself isn't touched by cleanup, since it only deletes
+  storage for `generations` rows.
+- **Unsubscribed accounts silently lose generations.** While billing isn't
+  launched, every account without a subscription row has a library cap of 0,
+  so every result is generated and then can't be saved, including test
+  accounts. Fix as part of the library-cap decision below: give test
+  accounts a cap or a test subscription row, and/or warn before generating
+  that the result can't be saved.
 - **Undecided: library caps.** `cleanup.js` (Railway "cleanup crew", hourly)
   rolls every account's library over at a flat 30 videos and deletes anything
   older than 15 days. That's intentional per the owner. But `server.js`'s
