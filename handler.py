@@ -955,7 +955,8 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 #
 # Job shape (comfylab_gpu_session_jobs.input):
 #   {"mode": "face_refine", "source_video_key": "<key>.mp4",
-#    "subjects": 1-4, "denoise": 0.2-0.6, "seed": ..., "prompt": optional}
+#    "subjects": 1-4, "denoise": 0.2-0.6, "seed": ..., "prompt": optional,
+#    "engine": "h3" (default) | "wan"}
 # One subject = one tracked person per pass; passes are chained, each
 # stitching onto the previous pass's output (the pack's documented way to
 # do several people). The prompt defaults to the source job's own prompt,
@@ -965,6 +966,49 @@ REFINE_MAX_SUBJECTS = 4
 REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base; H3PerFrameDenoise scales it down per frame for big faces
 REFINE_STEPS = 8               # matches the 8-step turbo LoRA (LORA_CHOICES["turbo"])
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
+
+# "Refine faces (Wan)" engine: same tracker and stitch-back as above, but the
+# crops are redrawn by Wan 2.2's low-noise 14B model (comfylab_face_wan node)
+# instead of H3. Its files are NOT part of preload or the engine script, so
+# session start and H3 generation are unchanged; the first Wan refine on a
+# volume downloads them (~22.5GB, once per volume).
+REFINE_ENGINE_H3 = "h3"
+REFINE_ENGINE_WAN = "wan"
+WAN_REFINE_DEFAULT_DENOISE = 0.5   # starting sigma ~0.83 at shift 5, under the low-noise expert's 0.875 boundary
+WAN_REFINE_STEPS = 4               # the 4-step lightx2v LoRA
+WAN_REFINE_SHIFT = 5.0
+WAN_REFINE_FILES = {
+    "unet": ({"filename": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+              "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+              "repo_path": "split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors"},
+             "diffusion_models"),
+    "lora": ({"filename": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors",
+              "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+              "repo_path": "split_files/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors"},
+             "loras"),
+    "clip": ({"filename": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+              "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+              "repo_path": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"},
+             "text_encoders"),
+    "vae": ({"filename": "wan_2.1_vae.safetensors",
+             "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+             "repo_path": "split_files/vae/wan_2.1_vae.safetensors"},
+            "vae"),
+}
+
+
+def ensure_wan_refine_files(report_stage=None):
+    """Downloads the Wan refine models on first use (skips files already on
+    the volume). Returns True if anything had to be downloaded."""
+    missing = [(spec, sub) for spec, sub in WAN_REFINE_FILES.values()
+               if not os.path.exists(os.path.join(VOLUME_MODELS_DIR, sub, spec["filename"]))]
+    if not missing:
+        return False
+    if report_stage:
+        report_stage("First-time setup: downloading the Wan face-refine models (~22.5GB, once per volume)")
+    for spec, sub in missing:
+        ensure_model_file(spec, sub)
+    return True
 
 
 def find_source_prompt(video_key, hops=3):
@@ -1164,7 +1208,69 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
     return wf
 
 
-def run_face_refine(job_input, should_cancel=None, should_force_kill=None):
+def build_refine_payload_wan(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt):
+    """Wan engine: every subject is tracked on the source frames, all crops
+    are redrawn in one ComfyLabWanFaceRedraw node (Wan loads once, and is
+    unloaded inside the node when it finishes), then stitched back one
+    subject after another. Tracker and stitch settings are the H3 graph's."""
+    wf = {
+        "r_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
+        "r_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["r_load", 0]}},
+    }
+    source = ["r_comp", 0]
+    audio = ["r_comp", 1]
+    redraw_inputs = {
+        "unet_name": WAN_REFINE_FILES["unet"][0]["filename"],
+        "lora_name": WAN_REFINE_FILES["lora"][0]["filename"],
+        "clip_name": WAN_REFINE_FILES["clip"][0]["filename"],
+        "vae_name": WAN_REFINE_FILES["vae"][0]["filename"],
+        "prompt": wan_prompt or "", "denoise": denoise, "steps": WAN_REFINE_STEPS,
+        "shift": WAN_REFINE_SHIFT, "seed": seed,
+        # Same ramp as H3PerFrameDenoise's defaults, ending at zero: faces at
+        # or above 120px are left exactly as they are.
+        "face_px_small": 30.0, "face_px_large": 120.0, "smooth_frames": 9,
+        "sage_attention": True,
+    }
+    for i in range(subjects):
+        p = f"r{i}_"
+        wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
+            "images": source, "detector": FACE_DETECTOR, "confidence": 0.35,
+            "crop_factor": 3.0, "canvas_width": 768, "canvas_height": 768,
+            "canvas_mode": "auto_capped_768", "smooth_window": 21, "size_smooth_window": 51,
+            "smooth_method": "gaussian", "size_mode": "per_frame",
+            "identity_track": False, "identity_threshold": 0.28,
+            "select": "largest_face", "select_index": i, "fallback_detector": "none",
+            "fallback_head_frac": 0.5, "identity_model": "insightface",
+            "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
+            "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
+        wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
+        redraw_inputs[f"crops_{i}"] = [p + "track", 0]
+        redraw_inputs[f"transform_{i}"] = [p + "track", 1]
+    wf["r_wan"] = {"class_type": "ComfyLabWanFaceRedraw", "inputs": redraw_inputs}
+    wf["r_wan_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_wan", 4]}}
+    images = source
+    for i in range(subjects):
+        p = f"r{i}_"
+        wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
+            "base_images": images, "refined_crops": ["r_wan", i], "transform": [p + "track", 1],
+            "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
+            "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
+        images = [p + "stitch", 0]
+
+    if upscale_scale:
+        wf["r_vsr"] = {"class_type": "RTXVideoSuperResolution", "inputs": {
+            "images": images, "resize_type": "scale by multiplier",
+            "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
+        images = ["r_vsr", 0]
+    wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
+        "fps": 24, "bit_depth": 8, "images": images, "audio": audio}}
+    wf[NODE_IDS["output"]] = {"class_type": "SaveVideo", "inputs": {
+        "filename_prefix": f"video/FaceRefineWan_{uuid.uuid4().hex[:12]}",
+        "format": "auto", "codec": "auto", "video": ["r_create", 0]}}
+    return wf
+
+
+def run_face_refine(job_input, should_cancel=None, should_force_kill=None, report_stage=None):
     source_key = (job_input.get("source_video_key") or "").strip()
     if not source_key:
         raise ValueError("face_refine needs source_video_key")
@@ -1174,22 +1280,38 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None):
         raise ValueError(f"subjects must be a whole number, got {job_input.get('subjects')!r}")
     if not 1 <= subjects <= REFINE_MAX_SUBJECTS:
         raise ValueError(f"subjects must be 1-{REFINE_MAX_SUBJECTS}, got {subjects}")
+    engine = (job_input.get("engine") or REFINE_ENGINE_H3).strip().lower()
+    if engine not in (REFINE_ENGINE_H3, REFINE_ENGINE_WAN):
+        raise ValueError(f"engine must be '{REFINE_ENGINE_H3}' or '{REFINE_ENGINE_WAN}', got {engine!r}")
+    default_denoise = WAN_REFINE_DEFAULT_DENOISE if engine == REFINE_ENGINE_WAN else REFINE_DEFAULT_DENOISE
     try:
-        denoise = float(job_input.get("denoise", REFINE_DEFAULT_DENOISE))
+        denoise = float(job_input.get("denoise", default_denoise))
     except (TypeError, ValueError):
         raise ValueError(f"denoise must be a number, got {job_input.get('denoise')!r}")
     if not 0.05 <= denoise <= 1.0:
         raise ValueError(f"denoise must be between 0.05 and 1.0, got {denoise}")
     seed = resolve_seed(job_input.get("seed"))
-    prompt = (job_input.get("prompt") or "").strip() or find_source_prompt(source_key)
-    if not prompt:
-        raise ValueError(f"No prompt given and none found for {source_key} - pass one in the job")
+    if engine == REFINE_ENGINE_WAN:
+        # Wan redraws face crops, not the scene, so it gets a face prompt
+        # (the node's default) rather than the source's whole-scene prompt.
+        prompt = (job_input.get("prompt") or "").strip()
+        downloaded = ensure_wan_refine_files(report_stage)
+        if report_stage:
+            report_stage("Refining faces (Wan)")
+    else:
+        downloaded = False
+        prompt = (job_input.get("prompt") or "").strip() or find_source_prompt(source_key)
+        if not prompt:
+            raise ValueError(f"No prompt given and none found for {source_key} - pass one in the job")
 
     source_filename, factor = prepare_refine_source(source_key)
     upscale_scale = None
     if job_input.get("upscale_back", True):
         upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
-    workflow = build_refine_payload(source_filename, prompt, subjects, denoise, seed, upscale_scale)
+    if engine == REFINE_ENGINE_WAN:
+        workflow = build_refine_payload_wan(source_filename, subjects, denoise, seed, upscale_scale, prompt)
+    else:
+        workflow = build_refine_payload(source_filename, prompt, subjects, denoise, seed, upscale_scale)
 
     comfy_start = time.time()
     try:
@@ -1213,11 +1335,17 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None):
         if text:
             reports.append(text[0] if isinstance(text, list) else text)
 
+    wan_report = result.get("outputs", {}).get("r_wan_report", {}).get("text")
+    if wan_report:
+        reports.append(wan_report[0] if isinstance(wan_report, list) else wan_report)
+
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
     return {
         "videoKey": video_key,
         "mode": REFINE_MODE,
+        "engine": engine,
+        "first_time_download": downloaded,
         "source_video_key": source_key,
         "subjects": subjects,
         "denoise": denoise,
@@ -1353,6 +1481,15 @@ def is_job_force_cancel_requested(job_row_id):
     except Exception as e:
         print(f"Could not check force cancel flag for job {job_row_id}: {e}")
         return False
+
+
+def set_job_stage(job_row_id, text):
+    """Progress note on a still-processing job (output.stage), e.g. the Wan
+    refine's first-time model download. finish_job() overwrites output."""
+    try:
+        sb_patch("comfylab_gpu_session_jobs", {"id": f"eq.{job_row_id}"}, {"output": {"stage": text}})
+    except Exception as e:
+        print(f"Could not write stage for job {job_row_id}: {e}")
 
 
 def finish_job(job_row_id, output):
@@ -1492,11 +1629,12 @@ def run_session(session_id):
                 # graceful /interrupt: the session is over either way, and an
                 # interrupt only lands at a step boundary, which can be
                 # minutes away at high resolution.
-                job_runner = (
-                    run_face_refine
-                    if (job_row["input"] or {}).get("mode") == REFINE_MODE
-                    else run_generation
-                )
+                runner_kwargs = {}
+                if (job_row["input"] or {}).get("mode") == REFINE_MODE:
+                    job_runner = run_face_refine
+                    runner_kwargs["report_stage"] = lambda text: set_job_stage(job_row["id"], text)
+                else:
+                    job_runner = run_generation
                 result = job_runner(
                     job_row["input"],
                     should_cancel=lambda: is_job_cancel_requested(job_row["id"]),
@@ -1504,6 +1642,7 @@ def run_session(session_id):
                         is_job_force_cancel_requested(job_row["id"])
                         or not is_session_active(session_id)
                     ),
+                    **runner_kwargs,
                 )
             except Exception as e:
                 result = {"error": str(e)}

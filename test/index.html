@@ -169,6 +169,12 @@
   <label>Video key to refine (fills in with your latest result)
     <input id="refineVideoKey" type="text" placeholder="938602e6-1f35-45bb-afb2-578061b00562.mp4" />
   </label>
+  <label>Engine
+    <select id="refineEngine" onchange="updateRefineEngine()">
+      <option value="h3" selected>H3 (ComfyUI-H3-FaceRefine)</option>
+      <option value="wan">Wan 2.2 low-noise (first run downloads ~22.5GB, once per volume)</option>
+    </select>
+  </label>
   <label>People to refine (one pass each, largest face first)
     <select id="refineSubjects">
       <option value="1">1</option>
@@ -177,14 +183,22 @@
       <option value="4">4</option>
     </select>
   </label>
-  <label>Strength (base denoise; scaled down automatically for faces that are already large)
+  <label id="refineDenoiseWanLabel" style="display:none">Strength (Wan; faces 120px+ are left untouched, full strength at 30px and below)
+    <select id="refineDenoiseWan">
+      <option value="0.3">0.3 - gentle</option>
+      <option value="0.4">0.4</option>
+      <option value="0.5" selected>0.5 - default</option>
+      <option value="0.6">0.6 - strongest</option>
+    </select>
+  </label>
+  <label id="refineDenoiseLabel">Strength (base denoise; scaled down automatically for faces that are already large)
     <select id="refineDenoise">
       <option value="0.3">0.3 - gentle</option>
       <option value="0.4" selected>0.4 - default (the pack's own setting)</option>
       <option value="0.5">0.5 - strong (risk: head drifts from body)</option>
     </select>
   </label>
-  <label>Prompt override (optional - blank uses the original generation's prompt)
+  <label>Prompt override (optional - blank uses the original generation's prompt for H3, a generic face prompt for Wan)
     <textarea id="refinePrompt" placeholder="(original prompt)"></textarea>
   </label>
   <button id="refineBtn" onclick="runRefine()">Refine faces</button>
@@ -213,7 +227,7 @@ const PERSISTED_FIELDS = [
   'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'model', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
-  'refineVideoKey', 'refineSubjects', 'refineDenoise',
+  'refineVideoKey', 'refineSubjects', 'refineDenoise', 'refineEngine', 'refineDenoiseWan',
 ];
 
 // Show/hide toggle for the key fields. Defaults to shown; the choice is
@@ -590,6 +604,9 @@ async function runSessionJob(payload, statusEl) {
     const row = rows[0];
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     statusEl.textContent = `Session job ${jobRow.id} - status: ${row.status} (${elapsed}s elapsed)`;
+    if (row.status === 'processing' && row.output && row.output.stage) {
+      statusEl.textContent += `\n${row.output.stage}`;
+    }
 
     if (row.status === 'completed') {
       statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(row.output, null, 2)}`;
@@ -719,6 +736,13 @@ async function runJob() {
   statusEl.textContent = 'No active GPU session - click "Run GPU" first. This endpoint no longer accepts jobs without one.';
 }
 
+function updateRefineEngine() {
+  const wan = document.getElementById('refineEngine').value === 'wan';
+  document.getElementById('refineDenoiseLabel').style.display = wan ? 'none' : '';
+  document.getElementById('refineDenoiseWanLabel').style.display = wan ? '' : 'none';
+}
+document.addEventListener('DOMContentLoaded', () => setTimeout(updateRefineEngine, 0));
+
 async function runRefine() {
   const btn = document.getElementById('refineBtn');
   const statusEl = document.getElementById('status');
@@ -741,8 +765,10 @@ async function runRefine() {
     mode: 'face_refine',
     source_video_key: sourceKey,
     subjects: Number(document.getElementById('refineSubjects').value),
-    denoise: Number(document.getElementById('refineDenoise').value),
+    engine: document.getElementById('refineEngine').value,
   };
+  refineInput.denoise = Number(document.getElementById(
+    refineInput.engine === 'wan' ? 'refineDenoiseWan' : 'refineDenoise').value);
   const seedRaw = document.getElementById('seed').value.trim();
   if (seedRaw !== '') {
     if (!/^\d+$/.test(seedRaw) || !Number.isSafeInteger(Number(seedRaw))) {

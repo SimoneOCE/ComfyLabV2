@@ -253,6 +253,13 @@ rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_debug"
 cp -r "$COMFYLAB_DEBUG_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_debug"
 echo "[comfylab-engine] Installed comfylab_debug custom node."
 
+# "Refine faces (Wan)" redraw node (see its docstring). Code only - the Wan
+# model files are downloaded by the handler on the first Wan refine.
+COMFYLAB_FACE_WAN_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/comfylab_face_wan"
+rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_face_wan"
+cp -r "$COMFYLAB_FACE_WAN_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_face_wan"
+echo "[comfylab-engine] Installed comfylab_face_wan custom node."
+
 echo "[comfylab-engine] nvidia-vfx installed: $(pip show nvidia-vfx 2>/dev/null | grep '^Version:' || echo 'NOT INSTALLED')"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
 

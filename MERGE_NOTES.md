@@ -55,6 +55,17 @@ agrees it's a property of head-size-in-frame, not output resolution
   upscale, then re-upscales), keep both original and refined versions
   (decide how that counts toward library caps). Test-page version:
   handler.py run_face_refine / "Refine faces" panel.
+- Two refine engines on the test page (job input `engine`):
+  - `h3` - ComfyUI-H3-FaceRefine as shipped. Its H3PerFrameDenoise (what
+    keeps large faces from being redrawn) breaks sampling on our ComfyUI
+    (issue #19 on the pack; works on 0.34, broken on 0.36/0.38).
+  - `wan` - same tracker and stitch-back, crops redrawn by Wan 2.2 low-noise
+    14B + 4-step lightx2v LoRA (`comfylab_face_wan` node). Per-frame strength
+    through core's standard noise mask: full at <=30px faces, none at
+    >=120px (those frames keep their original pixels). Wan files (~22.5GB)
+    download on the first Wan refine, not at session start; Wan loads once
+    per refine and is unloaded from VRAM and RAM before the job ends. Not
+    audio-aware - lip sync to be judged on the first results.
 
 ## Other to-dos (not merge-blocking)
 
