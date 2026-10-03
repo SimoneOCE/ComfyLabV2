@@ -720,6 +720,17 @@ def submit_and_wait(workflow, timeout_seconds=None, should_cancel=None, should_f
         json={"prompt": workflow, "client_id": client_id},
         timeout=30,
     )
+    if resp.status_code == 400:
+        # ComfyUI rejected the graph before running it (unknown node class,
+        # bad input value, missing file...). Its body says exactly which node
+        # and why - raise_for_status() alone threw that away and left only
+        # "400 Client Error" (seen on the first face_refine run).
+        try:
+            detail = resp.json()
+        except ValueError:
+            detail = resp.text
+        print(f"ComfyUI rejected the prompt: {json.dumps(detail)[:4000]}")
+        raise RuntimeError(f"ComfyUI rejected the workflow: {json.dumps(detail)[:3000]}")
     resp.raise_for_status()
     prompt_id = resp.json()["prompt_id"]
 
