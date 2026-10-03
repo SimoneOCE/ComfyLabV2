@@ -1065,7 +1065,18 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
         "r_sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "er_sde"}},
         "r_noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
     }
-    images = ["r_comp", 0]
+    # Logging-only pass-through nodes (comfyui_engine/custom_nodes/comfylab_debug)
+    # while the refine's "KeyError: nan" is diagnosed. They print tensor stats
+    # to the worker log and change no values.
+    def dbg_image(node_id, src, label):
+        wf[node_id] = {"class_type": "ComfyLabDebugImage", "inputs": {"images": src, "label": label}}
+        return [node_id, 0]
+
+    def dbg_latent(node_id, src, label):
+        wf[node_id] = {"class_type": "ComfyLabDebugLatent", "inputs": {"latent": src, "label": label}}
+        return [node_id, 0]
+
+    images = dbg_image("r_dbg_frames", ["r_comp", 0], "source frames")
     audio = ["r_comp", 1]
     for i in range(subjects):
         p = f"r{i}_"
@@ -1092,21 +1103,30 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
             # _io.py finalize_prefix at the pinned commit).
             "ref_audios.ref_audio_0": audio}}
         wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
-            "av_latent": [p + "r2v", 1], "images": [p + "track", 0], "vae": ["r_vae", 0]}}
+            "av_latent": dbg_latent(p + "dbg_r2v", [p + "r2v", 1], f"pass {i} r2v latent"),
+            "images": dbg_image(p + "dbg_crops", [p + "track", 0], f"pass {i} crops"),
+            "vae": ["r_vae", 0]}}
         wf[p + "lock"] = {"class_type": "MiniMaxH3NativeAudioLock", "inputs": {
-            "model": ["r_sage", 0], "av_latent": [p + "inject", 0], "audio_vae": ["r_avae", 0], "audio": audio}}
+            "model": ["r_sage", 0],
+            "av_latent": dbg_latent(p + "dbg_inject", [p + "inject", 0], f"pass {i} after inject"),
+            "audio_vae": ["r_avae", 0], "audio": audio}}
         wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
-            "model": [p + "lock", 0], "av_latent": [p + "lock", 1], "transform": [p + "track", 1],
+            "model": [p + "lock", 0],
+            "av_latent": dbg_latent(p + "dbg_lock", [p + "lock", 1], f"pass {i} after audio lock"),
+            "transform": [p + "track", 1],
             "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.35,
             "scale_mode": "absolute_px", "face_px_small": 30.0, "face_px_large": 120.0,
             "gamma": 1.0, "smooth_frames": 9}}
+        wf[p + "dbg_model"] = {"class_type": "ComfyLabDebugModel", "inputs": {
+            "model": [p + "pfd", 2], "label": f"pass {i} H3 forward", "calls": 2}}
         wf[p + "guider"] = {"class_type": "BasicGuider", "inputs": {
-            "model": [p + "pfd", 2], "conditioning": [p + "r2v", 0]}}
+            "model": [p + "dbg_model", 0], "conditioning": [p + "r2v", 0]}}
         wf[p + "sched"] = {"class_type": "BasicScheduler", "inputs": {
             "scheduler": "simple", "steps": REFINE_STEPS, "denoise": denoise, "model": [p + "pfd", 2]}}
         wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
             "noise": ["r_noise", 0], "guider": [p + "guider", 0], "sampler": ["r_sampler", 0],
-            "sigmas": [p + "sched", 0], "latent_image": [p + "pfd", 0]}}
+            "sigmas": [p + "sched", 0],
+            "latent_image": dbg_latent(p + "dbg_pfd", [p + "pfd", 0], f"pass {i} after per-frame denoise")}}
         wf[p + "decode"] = {"class_type": "VAEDecode", "inputs": {"samples": [p + "sample", 0], "vae": ["r_vae", 0]}}
         wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
             "base_images": images, "refined_crops": [p + "decode", 0], "transform": [p + "track", 1],

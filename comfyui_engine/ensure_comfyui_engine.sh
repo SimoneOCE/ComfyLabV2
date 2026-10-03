@@ -247,6 +247,12 @@ rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
 cp -r "$COMFYLAB_NODES_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
 echo "[comfylab-engine] Installed comfylab_rtx_vsr custom node."
 
+# Logging-only debug nodes for the face refine graph (see their docstring).
+COMFYLAB_DEBUG_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/comfylab_debug"
+rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_debug"
+cp -r "$COMFYLAB_DEBUG_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_debug"
+echo "[comfylab-engine] Installed comfylab_debug custom node."
+
 echo "[comfylab-engine] nvidia-vfx installed: $(pip show nvidia-vfx 2>/dev/null | grep '^Version:' || echo 'NOT INSTALLED')"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
 
