@@ -968,6 +968,32 @@ def refine_select_node(source_filename):
         "X": 0, "Y": 0, "frame_index": 0}}
 
 
+def fetch_node_timings(history_entry):
+    """Per-node run times for a finished prompt, from the comfylab_face_wan
+    timing hook (GET /comfylab/timings/<prompt_id>). Logging only: returns []
+    if anything is missing rather than failing the job."""
+    try:
+        prompt_id = history_entry["prompt"][1]
+        r = requests.get(f"{COMFYUI_URL}/comfylab/timings/{prompt_id}", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"Could not read node timings: {e}")
+        return []
+
+
+def summarize_timings(stages, node_rows):
+    """{stage: seconds} plus ComfyUI node time summed per node type, biggest
+    first - what the refine's timing report shows."""
+    by_type = {}
+    for _node_id, class_name, seconds in node_rows:
+        by_type[class_name] = round(by_type.get(class_name, 0.0) + float(seconds), 1)
+    return {
+        "stages": {k: round(v, 1) for k, v in stages.items()},
+        "nodes_by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
+    }
+
+
 def build_people_count_payload(source_filename):
     """Short first prompt: face finding + ComfyLabSmallFaceCount. Its report's
     first line is "small_face_people=N found=M"."""
@@ -1098,11 +1124,18 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     # Wan redraws face crops, not the scene, so it gets a face prompt (the
     # node's generic one unless overridden) - never the source's H3 prompt.
     prompt = (job_input.get("prompt") or "").strip()
+    stages = {}
+    node_rows = []
+    t = time.time()
     downloaded = ensure_wan_refine_files(report_stage)
+    if downloaded:
+        stages["wan_first_download"] = time.time() - t
     if report_stage:
         report_stage("Refining faces")
 
+    t = time.time()
     source_filename, factor = prepare_refine_source(source_key)
+    stages["source_download_and_shrink"] = time.time() - t
     upscale_scale = None
     if job_input.get("upscale_back", True):
         upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
@@ -1112,12 +1145,15 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         if subjects is None:
             if report_stage:
                 report_stage("Finding faces")
+            t = time.time()
             counted = submit_and_wait(build_people_count_payload(source_filename),
                                       should_cancel=should_cancel, should_force_kill=should_force_kill)
+            stages["comfy_find_and_count_faces"] = time.time() - t
             if counted.get("force_killed"):
                 return {"cancelled": True, "force_killed": True}
             if counted.get("cancelled"):
                 return {"cancelled": True}
+            node_rows += fetch_node_timings(counted)
             text = counted.get("outputs", {}).get("r_count_report", {}).get("text")
             count_report = (text[0] if isinstance(text, list) else text) or ""
             match = re.search(r"small_face_people=(\d+)", count_report)
@@ -1140,7 +1176,9 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
                 report_stage(f"Refining faces ({subjects} {'person' if subjects == 1 else 'people'})")
         workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
                                         canvas, steps)
+        t = time.time()
         result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
+        stages["comfy_refine"] = time.time() - t
     finally:
         try:
             os.remove(os.path.join(COMFYUI_DIR, "input", source_filename))
@@ -1168,8 +1206,14 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     if wan_report:
         reports.append(wan_report[0] if isinstance(wan_report, list) else wan_report)
 
+    if not result.get("cancelled") and not result.get("force_killed"):
+        node_rows += fetch_node_timings(result)
+    t = time.time()
     raw_bytes, filename = fetch_output_video(result)
     video_key = upload_result_and_get_key(raw_bytes, filename)
+    stages["fetch_and_upload"] = time.time() - t
+    timings = summarize_timings(stages, node_rows)
+    print(f"Face refine timings: {json.dumps(timings)}")
     return {
         "videoKey": video_key,
         "mode": REFINE_MODE,
@@ -1182,6 +1226,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         "denoise": denoise,
         "seed": seed,
         "upscaled_back": upscale_scale,
+        "timings": timings,
         "comfy_seconds": comfy_seconds,
         "tracker_reports": reports,
     }

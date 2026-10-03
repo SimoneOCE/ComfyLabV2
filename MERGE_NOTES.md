@@ -70,6 +70,18 @@ agrees it's a property of head-size-in-frame, not output resolution
   canvas, redrawn at up to 512px), people counted automatically (up to 4
   per shot). All are the worker's defaults, so the site only needs to send
   `mode` and `source_video_key`.
+- **Refine speed ideas, not built yet (decide once the per-step timings are
+  in - the job output now has `timings`):**
+  - Cache the native-size (pre-upscale) copy of every generation on the
+    volume when it's made, so a refine skips downloading, decoding and
+    shrinking the upscaled video (~10-20s, needs a small generation change).
+  - Hardware encoding: ComfyUI's SaveVideo encodes H.264 on the CPU
+    (libx264, crf 18); the 5090's NVENC would be far faster at 2x size.
+  - One stitch for everyone (one pass over the frames instead of one per
+    person, touching only the face areas).
+  - Don't re-upscale the whole video: paste the refined faces into the
+    original upscaled video frame by frame outside ComfyUI (doing it inside
+    ComfyUI needs ~18GB RAM per copy at 2x for 15s).
 - **Wan refine to-dos (noted, not built - after the current test):**
   - Done: auto people count. A short first ComfyUI prompt runs face
     finding + ComfyLabSmallFaceCount (the most faces under 120px on screen

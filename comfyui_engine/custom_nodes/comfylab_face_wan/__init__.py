@@ -447,6 +447,13 @@ class ComfyLabFacePickIndex:
         return (out, report)
 
 
+try:
+    from . import timing as _timing
+    _timing.install()
+except Exception as _e:  # logging-only helper; never block the nodes
+    logging.warning(f"[ComfyLabTiming] not installed: {_e}")
+
+
 NODE_CLASS_MAPPINGS = {
     "ComfyLabWanFaceRedraw": ComfyLabWanFaceRedraw,
     "ComfyLabFacePickIndex": ComfyLabFacePickIndex,
