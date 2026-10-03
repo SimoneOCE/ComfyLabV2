@@ -171,8 +171,8 @@
   </label>
   <label>Engine
     <select id="refineEngine" onchange="updateRefineEngine()">
-      <option value="h3" selected>H3 (ComfyUI-H3-FaceRefine)</option>
-      <option value="wan">Wan 2.2 low-noise (first run downloads ~22.5GB, once per volume)</option>
+      <option value="wan" selected>Wan 2.2 low-noise - the one being tested (first run downloads ~22.5GB, once per volume)</option>
+      <option value="h3">H3 FaceRefine - currently broken on our ComfyUI, kept for reference</option>
     </select>
   </label>
   <label>People to refine (one pass each, largest face first)
@@ -183,7 +183,7 @@
       <option value="4">4</option>
     </select>
   </label>
-  <label id="refineDenoiseWanLabel" style="display:none">Strength (Wan; faces 120px+ are left untouched, full strength at 30px and below)
+  <label id="refineDenoiseWanLabel">Strength (Wan; faces 120px+ are left untouched, full strength at 30px and below)
     <select id="refineDenoiseWan">
       <option value="0.3">0.3 - gentle</option>
       <option value="0.4">0.4</option>
@@ -191,7 +191,7 @@
       <option value="0.6">0.6 - strongest</option>
     </select>
   </label>
-  <label id="refineDenoiseLabel">Strength (base denoise; scaled down automatically for faces that are already large)
+  <label id="refineDenoiseLabel" style="display:none">Strength (base denoise; scaled down automatically for faces that are already large)
     <select id="refineDenoise">
       <option value="0.3">0.3 - gentle</option>
       <option value="0.4" selected>0.4 - default (the pack's own setting)</option>
