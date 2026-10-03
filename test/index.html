@@ -157,20 +157,20 @@
     <select id="refineDenoise">
       <option value="0.3">0.3 - gentle</option>
       <option value="0.4">0.4</option>
-      <option value="0.5" selected>0.5 - default</option>
-      <option value="0.6">0.6 - strongest</option>
+      <option value="0.5">0.5</option>
+      <option value="0.6" selected>0.6 - site default (strongest)</option>
     </select>
   </label>
   <label>Face crop size (resolution each face is redrawn at - not the number of people)
     <select id="refineCanvas">
-      <option value="auto" selected>Standard - sized per person by the tracker, up to 768px (512 on recent tests)</option>
+      <option value="auto" selected>Standard - site default (redrawn at up to 512px)</option>
       <option value="384">Fast - fixed 384px, ~2x faster redraw, less detail per face (testing)</option>
     </select>
   </label>
   <label>Redraw steps
     <select id="refineSteps">
-      <option value="4" selected>4 - default (what the speed-up LoRA is built for)</option>
-      <option value="3">3 - ~25% faster redraw, slightly rougher detail (testing)</option>
+      <option value="3" selected>3 - site default</option>
+      <option value="4">4 - what the speed-up LoRA is built for (~25% slower redraw)</option>
     </select>
   </label>
   <label>Face prompt override (optional - blank uses a generic face prompt; applies to every person)

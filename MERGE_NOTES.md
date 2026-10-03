@@ -65,6 +65,11 @@ agrees it's a property of head-size-in-frame, not output resolution
   results. The pack's own H3 redraw was removed (its H3PerFrameDenoise breaks
   sampling on our ComfyUI - issue #19 on the pack; works on 0.34, broken on
   0.36/0.38), along with its audio-lock node, torchaudio and the debug nodes.
+- **"Fix faces" button settings (chosen 2026-10-03, test job 96cb3da1 on
+  cba2f8ef):** strength (denoise) 0.6, 3 steps, Standard crop size (tracker
+  canvas, redrawn at up to 512px), people = up to 3 (to become the auto
+  count below). These are now the worker's defaults (`WAN_REFINE_*`), so the
+  site only needs to send `mode`, `source_video_key` and `subjects`.
 - **Wan refine to-dos (noted, not built - after the current test):**
   - Auto people count: before building the graph, run face_yolov8m on the
     video, count people per shot, build one pass per person who ever has a

@@ -847,15 +847,15 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 #
 # Job shape (comfylab_gpu_session_jobs.input):
 #   {"mode": "face_refine", "source_video_key": "<key>.mp4",
-#    "subjects": 1-4, "denoise": 0.05-1.0 (default 0.5), "seed": ...,
+#    "subjects": 1-4, "denoise": 0.05-1.0 (default 0.6), "seed": ...,
 #    "prompt": optional face prompt (blank = the node's generic one),
 #    "canvas": "auto" (default) | 384 | 512 | 640 | 768,
-#    "steps": 2-8 (default 4, what the lightx2v LoRA is distilled for)}
+#    "steps": 2-8 (default 3)}
 REFINE_MODE = "face_refine"
 REFINE_MAX_SUBJECTS = 4
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
-WAN_REFINE_DEFAULT_DENOISE = 0.5   # starting sigma ~0.83 at shift 5, under the low-noise expert's 0.875 boundary
-WAN_REFINE_STEPS = 4               # the 4-step lightx2v LoRA
+WAN_REFINE_DEFAULT_DENOISE = 0.6   # the "Fix faces" setting (chosen on test 96cb3da1); starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
+WAN_REFINE_STEPS = 3               # the "Fix faces" setting (chosen on test 96cb3da1); the lightx2v LoRA is distilled for 4
 WAN_REFINE_SHIFT = 5.0
 REFINE_CANVAS_SIZES = {384, 512, 640, 768}  # job "canvas"; default "auto" (tracker picks, capped at 768)
 WAN_REFINE_FILES = {
