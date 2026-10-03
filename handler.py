@@ -848,13 +848,15 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 # Job shape (comfylab_gpu_session_jobs.input):
 #   {"mode": "face_refine", "source_video_key": "<key>.mp4",
 #    "subjects": 1-4, "denoise": 0.05-1.0 (default 0.5), "seed": ...,
-#    "prompt": optional face prompt (blank = the node's generic one)}
+#    "prompt": optional face prompt (blank = the node's generic one),
+#    "canvas": "auto" (default) | 384 | 512 | 640 | 768}
 REFINE_MODE = "face_refine"
 REFINE_MAX_SUBJECTS = 4
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
 WAN_REFINE_DEFAULT_DENOISE = 0.5   # starting sigma ~0.83 at shift 5, under the low-noise expert's 0.875 boundary
 WAN_REFINE_STEPS = 4               # the 4-step lightx2v LoRA
 WAN_REFINE_SHIFT = 5.0
+REFINE_CANVAS_SIZES = {384, 512, 640, 768}  # job "canvas"; default "auto" (tracker picks, capped at 768)
 WAN_REFINE_FILES = {
     "unet": ({"filename": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
               "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
@@ -948,16 +950,25 @@ def prepare_refine_source(video_key):
     return filename, factor
 
 
-def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt):
-    """Every subject is tracked on the source frames, all crops are redrawn
-    in one ComfyLabWanFaceRedraw node (Wan loads once, and is unloaded inside
-    the node when it finishes), then stitched back one subject after another."""
+def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt, canvas=None):
+    """The pack's H3FaceSelect loads the video and detects every face and cut
+    ONCE; ComfyLabFacePickIndex re-picks that for each person, so each
+    tracker reuses the boxes instead of detecting again. All crops are
+    redrawn in one ComfyLabWanFaceRedraw node (Wan loads once, batched, and
+    is unloaded inside the node when it finishes), then stitched back one
+    subject after another. canvas: None = the tracker's auto size (capped at
+    768), or a fixed square size (e.g. 384) for every crop."""
     wf = {
-        "r_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
-        "r_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["r_load", 0]}},
+        "r_select": {"class_type": "H3FaceSelect", "inputs": {
+            "video": source_filename, "detector": FACE_DETECTOR, "confidence": 0.35,
+            "select": "largest_face", "select_index": 0, "confirmed_pick": "",
+            "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
+            "skip_first_frames": 0, "frame_load_cap": 0, "select_every_nth": 1,
+            "identity_model": "insightface", "identity_threshold": 0.28,
+            "X": 0, "Y": 0, "frame_index": 0}},
     }
-    source = ["r_comp", 0]
-    audio = ["r_comp", 1]
+    source = ["r_select", 0]
+    audio = ["r_select", 1]
     redraw_inputs = {
         "unet_name": WAN_REFINE_FILES["unet"][0]["filename"],
         "lora_name": WAN_REFINE_FILES["lora"][0]["filename"],
@@ -972,10 +983,17 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
     }
     for i in range(subjects):
         p = f"r{i}_"
+        wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
+            "face_pick": ["r_select", 2], "index": i}}
         wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
-            "images": source, "detector": FACE_DETECTOR, "confidence": 0.35,
-            "crop_factor": 3.0, "canvas_width": 768, "canvas_height": 768,
-            "canvas_mode": "auto_capped_768", "smooth_window": 21, "size_smooth_window": 51,
+            "images": source, "face_pick": [p + "pick", 0],
+            # detector/confidence/cut settings are inert with a face_pick wired
+            # (H3FaceSelect above already did that pass); kept valid for the schema.
+            "detector": FACE_DETECTOR, "confidence": 0.35,
+            "crop_factor": 3.0,
+            "canvas_width": canvas or 768, "canvas_height": canvas or 768,
+            "canvas_mode": "manual" if canvas else "auto_capped_768",
+            "smooth_window": 21, "size_smooth_window": 51,
             "smooth_method": "gaussian", "size_mode": "per_frame",
             "identity_track": False, "identity_threshold": 0.28,
             "select": "largest_face", "select_index": i, "fallback_detector": "none",
@@ -983,8 +1001,10 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
             "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
             "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
         wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
+        wf[p + "pick_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pick", 1]}}
         redraw_inputs[f"crops_{i}"] = [p + "track", 0]
         redraw_inputs[f"transform_{i}"] = [p + "track", 1]
+    wf["r_select_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_select", 4]}}
     wf["r_wan"] = {"class_type": "ComfyLabWanFaceRedraw", "inputs": redraw_inputs}
     wf["r_wan_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_wan", 4]}}
     images = source
@@ -1002,7 +1022,7 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
             "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
         images = ["r_vsr", 0]
     wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
-        "fps": 24, "bit_depth": 8, "images": images, "audio": audio}}
+        "fps": ["r_select", 6], "bit_depth": 8, "images": images, "audio": audio}}
     wf[NODE_IDS["output"]] = {"class_type": "SaveVideo", "inputs": {
         "filename_prefix": f"video/FaceRefineWan_{uuid.uuid4().hex[:12]}",
         "format": "auto", "codec": "auto", "video": ["r_create", 0]}}
@@ -1026,6 +1046,16 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     if not 0.05 <= denoise <= 1.0:
         raise ValueError(f"denoise must be between 0.05 and 1.0, got {denoise}")
     seed = resolve_seed(job_input.get("seed"))
+    canvas = job_input.get("canvas")
+    if canvas in (None, "", "auto"):
+        canvas = None
+    else:
+        try:
+            canvas = int(canvas)
+        except (TypeError, ValueError):
+            raise ValueError(f"canvas must be 'auto' or a size in pixels, got {job_input.get('canvas')!r}")
+        if canvas not in REFINE_CANVAS_SIZES:
+            raise ValueError(f"canvas must be 'auto' or one of {sorted(REFINE_CANVAS_SIZES)}, got {canvas}")
     # Wan redraws face crops, not the scene, so it gets a face prompt (the
     # node's generic one unless overridden) - never the source's H3 prompt.
     prompt = (job_input.get("prompt") or "").strip()
@@ -1037,7 +1067,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     upscale_scale = None
     if job_input.get("upscale_back", True):
         upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
-    workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt)
+    workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt, canvas)
 
     comfy_start = time.time()
     try:
@@ -1061,6 +1091,10 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         if text:
             reports.append(text[0] if isinstance(text, list) else text)
 
+    for name in ["r_select_report"] + [f"r{i}_pick_report" for i in range(subjects)]:
+        text = result.get("outputs", {}).get(name, {}).get("text")
+        if text:
+            reports.append(text[0] if isinstance(text, list) else text)
     wan_report = result.get("outputs", {}).get("r_wan_report", {}).get("text")
     if wan_report:
         reports.append(wan_report[0] if isinstance(wan_report, list) else wan_report)
@@ -1071,6 +1105,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         "videoKey": video_key,
         "mode": REFINE_MODE,
         "first_time_download": downloaded,
+        "canvas": canvas or "auto",
         "source_video_key": source_key,
         "subjects": subjects,
         "denoise": denoise,

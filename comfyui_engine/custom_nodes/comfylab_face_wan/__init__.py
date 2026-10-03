@@ -13,6 +13,12 @@ goes through the sampler's standard noise mask (SetLatentNoiseMask's
 mechanism), and frames whose mask is ~0 get their original crop back
 untouched. A subject whose mask is zero everywhere is skipped outright.
 
+Speed: every subject with the same crop size is redrawn in ONE batched Wan
+call, and only over the frames that need it - leading/trailing frames where
+nobody's face is small (or the face was lost) are not generated at all
+(their crops come back untouched). If the batch doesn't fit in VRAM it falls
+back to one subject at a time.
+
 Memory: one node does every subject so Wan loads once per refine, and it
 loads, samples and unloads inside the node. Nothing Wan-related is left in
 ComfyUI's output cache (only the image tensors are returned), and on the way
@@ -22,6 +28,7 @@ an H3 generation after a refine is not sharing memory with Wan.
 
 import gc
 import logging
+import sys
 import time
 
 import numpy as np
@@ -34,6 +41,7 @@ from comfy_extras.nodes_model_advanced import ModelSamplingSD3
 TAG = "[ComfyLabWanFace]"
 MAX_SUBJECTS = 4
 KEEP_BELOW = 0.02  # mask value under which a frame keeps its original crop
+RANGE_MARGIN = 4   # extra frames kept either side of the active range, as context
 
 
 def _log(msg):
@@ -176,11 +184,33 @@ class ComfyLabWanFaceRedraw:
             report.append(f"Wan loaded in {time.time() - t0:.1f}s ({_ram_gb()}, {_vram_gb()})")
             _log(report[-1])
 
-            for i, crops, strength in todo:
+            groups = {}
+            for item in todo:
+                groups.setdefault(tuple(item[1].shape[1:3]), []).append(item)
+            for (h, w), group in groups.items():
                 t1 = time.time()
-                outputs[i] = self._redraw_one(model, vae, positive, negative, crops, strength,
-                                              denoise, steps, seed + i)
-                report.append(f"subject {i}: redrawn in {time.time() - t1:.1f}s")
+                ids = [i for i, _, _ in group]
+                try:
+                    redrawn, span = self._redraw_batch(model, vae, positive, negative, group,
+                                                       denoise, steps, seed)
+                    outputs.update(redrawn)
+                    report.append(f"subjects {ids} ({w}x{h}): batched, frames {span[0]}-{span[1] - 1} "
+                                  f"of {group[0][1].shape[0]} generated, {time.time() - t1:.1f}s")
+                except mm.OOM_EXCEPTION:
+                    if len(group) == 1:
+                        raise
+                    mm.soft_empty_cache(True)
+                    report.append(f"subjects {ids}: batch did not fit in VRAM - one at a time")
+                    _log(report[-1])
+                    for item in group:
+                        t2 = time.time()
+                        redrawn, span = self._redraw_batch(model, vae, positive, negative, [item],
+                                                           denoise, steps, seed)
+                        outputs.update(redrawn)
+                        report.append(f"subject {item[0]}: frames {span[0]}-{span[1] - 1} generated, "
+                                      f"{time.time() - t2:.1f}s")
+                        _log(report[-1])
+                    continue
                 _log(report[-1])
         finally:
             self._release(unet, clip, vae)
@@ -194,28 +224,47 @@ class ComfyLabWanFaceRedraw:
         return self._result(outputs, subjects, report)
 
     @staticmethod
-    def _redraw_one(model, vae, positive, negative, crops, strength, denoise, steps, seed):
-        n, h, w = crops.shape[0], crops.shape[1], crops.shape[2]
+    def _redraw_batch(model, vae, positive, negative, group, denoise, steps, seed):
+        """group: [(subject, crops [n,h,w,c], strength [n])] with one crop size.
+        Generates only the span of frames where some subject's strength is
+        above KEEP_BELOW (plus a little context), as one batch. Returns
+        ({subject: crops}, (start, end))."""
+        n, h, w = group[0][1].shape[0], group[0][1].shape[1], group[0][1].shape[2]
         if h % 16 or w % 16:
             raise ValueError(f"crop size {w}x{h} must be a multiple of 16 for Wan")
+        active = np.zeros(n, dtype=bool)
+        for _, _, strength in group:
+            active |= strength >= KEEP_BELOW
+        idx = np.flatnonzero(active)
+        start = max(0, int(idx[0]) - RANGE_MARGIN)
+        end = min(n, int(idx[-1]) + 1 + RANGE_MARGIN)
+        span = end - start
         # Wan's video VAE takes 4k+1 frames: pad by repeating the last frame.
-        n_pad = ((n - 1 + 3) // 4) * 4 + 1
-        frames = crops[..., :3]
-        if n_pad > n:
-            frames = torch.cat([frames, frames[-1:].repeat(n_pad - n, 1, 1, 1)], dim=0)
-        latent = nodes.VAEEncode().encode(vae, frames)[0]
-        mask = np.pad(strength, (0, n_pad - n), mode="edge")
-        mask = torch.from_numpy(mask).float().view(n_pad, 1, 1, 1).expand(n_pad, 1, h, w).contiguous()
-        latent = dict(latent)
-        latent["noise_mask"] = mask  # SetLatentNoiseMask's layout; reshape_mask maps it onto the video latent
+        span_pad = ((span - 1 + 3) // 4) * 4 + 1
+
+        latents, masks = [], []
+        for _, crops, strength in group:
+            frames = crops[start:end, :, :, :3]
+            if span_pad > span:
+                frames = torch.cat([frames, frames[-1:].repeat(span_pad - span, 1, 1, 1)], dim=0)
+            latents.append(nodes.VAEEncode().encode(vae, frames)[0]["samples"])
+            m = np.pad(strength[start:end], (0, span_pad - span), mode="edge")
+            masks.append(torch.from_numpy(m).float().view(1, 1, span_pad, 1, 1).expand(1, 1, span_pad, h, w))
+        # The sampler's standard noise mask (SetLatentNoiseMask's mechanism):
+        # comfy.utils.reshape_mask maps [B,1,T,H,W] onto the video latent.
+        latent = {"samples": torch.cat(latents, dim=0), "noise_mask": torch.cat(masks, dim=0).contiguous()}
         sampled = nodes.common_ksampler(model, seed, steps, 1.0, "euler", "simple",
-                                        positive, negative, latent, denoise=denoise)[0]
-        images = nodes.VAEDecode().decode(vae, sampled)[0][:n].to(crops.device, crops.dtype).clamp(0.0, 1.0)
-        if crops.shape[-1] > 3:
-            images = torch.cat([images, crops[..., 3:]], dim=-1)
-        keep = torch.from_numpy(strength < KEEP_BELOW).to(images.device)
-        images[keep] = crops[keep]
-        return images
+                                        positive, negative, latent, denoise=denoise)[0]["samples"]
+
+        out = {}
+        for b, (subject, crops, strength) in enumerate(group):
+            images = nodes.VAEDecode().decode(vae, {"samples": sampled[b:b + 1]})[0][:span]
+            result = crops.clone()
+            result[start:end, :, :, :3] = images.to(crops.device, crops.dtype).clamp(0.0, 1.0)
+            keep = torch.from_numpy(strength < KEEP_BELOW).to(result.device)
+            result[keep] = crops[keep]
+            out[subject] = result
+        return out, (start, end)
 
     @staticmethod
     def _release(*objects):
@@ -235,5 +284,57 @@ class ComfyLabWanFaceRedraw:
         return crops + ("\n".join(report),)
 
 
-NODE_CLASS_MAPPINGS = {"ComfyLabWanFaceRedraw": ComfyLabWanFaceRedraw}
-NODE_DISPLAY_NAME_MAPPINGS = {"ComfyLabWanFaceRedraw": "ComfyLab Wan Face Redraw"}
+class ComfyLabFacePickIndex:
+    """One detection pass, many people: takes the face_pick from the pack's
+    H3 Load Video + Face Select (which detects every face and cut once) and
+    re-picks it for person `index` (largest-face order, per shot), so each
+    H3 Face Track + Crop reuses those boxes instead of detecting the video
+    again. Shots that never hold index+1 faces are marked as not containing
+    this person - their frames keep their original pixels - instead of the
+    pack's fallback of re-using the last face in the shot (which redraws
+    the same person several times). If no shot holds that many faces, the
+    pack's fallback is kept so the tracker still has something to follow."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"face_pick": ("H3FACEPICK",),
+                             "index": ("INT", {"default": 0, "min": 0, "max": 63})}}
+
+    RETURN_TYPES = ("H3FACEPICK", "STRING")
+    RETURN_NAMES = ("face_pick", "report")
+    FUNCTION = "run"
+    CATEGORY = "ComfyLab"
+
+    def run(self, face_pick, index):
+        select_cls = nodes.NODE_CLASS_MAPPINGS.get("H3FaceSelect")
+        if select_cls is None:
+            raise RuntimeError("ComfyUI-H3-FaceRefine's H3FaceSelect is not loaded")
+        pack = sys.modules[select_cls.__module__]
+        boxes, confs = face_pick["boxes"], face_pick["confs"]
+        segs = [(int(a), int(b)) for a, b in face_pick["segments"]]
+        width, height = face_pick["src_size"]
+        picks = pack._auto_pick(boxes, confs, segs, width, height,
+                                pack._review_select("largest_face"), int(index))
+        present = [max((len(boxes[f]) for f in range(a, b)), default=0) > index for a, b in segs]
+        if any(present):
+            for k, (a, b) in enumerate(segs):
+                if not present[k]:
+                    picks[k] = {"segment": [a, b], "frame": -1, "box": -1,
+                                "index": pack._ABSENT, "absent": True}
+        out = dict(face_pick)
+        out["picks"] = picks
+        shots = [k + 1 for k, here in enumerate(present) if here]
+        report = (f"person {index}: in shot(s) {shots or 'none'} of {len(segs)}"
+                  + ("" if any(present) else " - fewer faces than that anywhere, re-using the last face"))
+        _log(report)
+        return (out, report)
+
+
+NODE_CLASS_MAPPINGS = {
+    "ComfyLabWanFaceRedraw": ComfyLabWanFaceRedraw,
+    "ComfyLabFacePickIndex": ComfyLabFacePickIndex,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ComfyLabWanFaceRedraw": "ComfyLab Wan Face Redraw",
+    "ComfyLabFacePickIndex": "ComfyLab Face Pick (person N)",
+}
