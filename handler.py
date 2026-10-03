@@ -962,7 +962,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 # looked up by videoKey, since H3 regenerates the crop against it.
 REFINE_MODE = "face_refine"
 REFINE_MAX_SUBJECTS = 4
-REFINE_DEFAULT_DENOISE = 0.2   # README: 0.15-0.25 when H3PerFrameDenoise is bypassed (it is - see build_refine_payload)
+REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base; see build_refine_payload for why it still holds with H3PerFrameDenoise bypassed
 REFINE_STEPS = 8               # matches the 8-step turbo LoRA (LORA_CHOICES["turbo"])
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
 
@@ -1124,8 +1124,11 @@ def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upsca
         # patches neutralised sampling there, and here the timestep reaching H3 came out
         # as garbage (NaN / -129) with it in the path. The reporter's workaround - wire
         # the injected latent straight into the sampler - is what this does; the README
-        # says to drop the base denoise to 0.15-0.25 when the per-frame node is bypassed
-        # (REFINE_DEFAULT_DENOISE). The lock's model output feeds guider and scheduler.
+        # says to drop the base denoise to 0.15-0.25 when the per-frame node is bypassed,
+        # but only so LARGE faces aren't rewritten: the node scales the 0.4 base by 1.0 at
+        # <=30px faces and 0.35 at >=120px. Refine targets small faces (ours measured
+        # 15-38px), where the node would have applied ~0.4 anyway, so a flat 0.4 matches
+        # the pack's intent here. The lock's model output feeds guider and scheduler.
         wf[p + "dbg_model"] = {"class_type": "ComfyLabDebugModel", "inputs": {
             "model": [p + "lock", 0], "label": f"pass {i} H3 forward", "calls": 2}}
         wf[p + "dbg_cond"] = {"class_type": "ComfyLabDebugConditioning", "inputs": {
