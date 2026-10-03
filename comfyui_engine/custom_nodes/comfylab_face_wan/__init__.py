@@ -13,7 +13,7 @@ goes through the sampler's standard noise mask (SetLatentNoiseMask's
 mechanism), and frames whose mask is ~0 get their original crop back
 untouched. A subject whose mask is zero everywhere is skipped outright.
 
-Speed: every subject with the same crop size is redrawn in ONE batched Wan
+Speed: every subject with the same crop size and frame count is redrawn in ONE batched Wan
 call, and only over the frames that need it - leading/trailing frames where
 nobody's face is small (or the face was lost) are not generated at all
 (their crops come back untouched). If the batch doesn't fit in VRAM it falls
@@ -186,8 +186,11 @@ class ComfyLabWanFaceRedraw:
 
             groups = {}
             for item in todo:
-                groups.setdefault(tuple(item[1].shape[1:3]), []).append(item)
-            for (h, w), group in groups.items():
+                # Batch only crops with the same frame count AND size: the tracker
+                # drops frames of shots a person isn't in, so two people can have
+                # different numbers of crops even at the same canvas size.
+                groups.setdefault(tuple(item[1].shape[0:3]), []).append(item)
+            for (_, h, w), group in groups.items():
                 t1 = time.time()
                 ids = [i for i, _, _ in group]
                 try:
