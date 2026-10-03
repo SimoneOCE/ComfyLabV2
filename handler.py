@@ -849,7 +849,8 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 #   {"mode": "face_refine", "source_video_key": "<key>.mp4",
 #    "subjects": 1-4, "denoise": 0.05-1.0 (default 0.5), "seed": ...,
 #    "prompt": optional face prompt (blank = the node's generic one),
-#    "canvas": "auto" (default) | 384 | 512 | 640 | 768}
+#    "canvas": "auto" (default) | 384 | 512 | 640 | 768,
+#    "steps": 2-8 (default 4, what the lightx2v LoRA is distilled for)}
 REFINE_MODE = "face_refine"
 REFINE_MAX_SUBJECTS = 4
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
@@ -950,7 +951,8 @@ def prepare_refine_source(video_key):
     return filename, factor
 
 
-def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt, canvas=None):
+def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt, canvas=None,
+                         steps=WAN_REFINE_STEPS):
     """The pack's H3FaceSelect loads the video and detects every face and cut
     ONCE; ComfyLabFacePickIndex re-picks that for each person, so each
     tracker reuses the boxes instead of detecting again. All crops are
@@ -974,7 +976,7 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         "lora_name": WAN_REFINE_FILES["lora"][0]["filename"],
         "clip_name": WAN_REFINE_FILES["clip"][0]["filename"],
         "vae_name": WAN_REFINE_FILES["vae"][0]["filename"],
-        "prompt": wan_prompt or "", "denoise": denoise, "steps": WAN_REFINE_STEPS,
+        "prompt": wan_prompt or "", "denoise": denoise, "steps": steps,
         "shift": WAN_REFINE_SHIFT, "seed": seed,
         # The pack's H3PerFrameDenoise ramp, ending at zero: faces at or
         # above 120px are left exactly as they are.
@@ -1056,6 +1058,12 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             raise ValueError(f"canvas must be 'auto' or a size in pixels, got {job_input.get('canvas')!r}")
         if canvas not in REFINE_CANVAS_SIZES:
             raise ValueError(f"canvas must be 'auto' or one of {sorted(REFINE_CANVAS_SIZES)}, got {canvas}")
+    try:
+        steps = int(job_input.get("steps", WAN_REFINE_STEPS))
+    except (TypeError, ValueError):
+        raise ValueError(f"steps must be a whole number, got {job_input.get('steps')!r}")
+    if not 2 <= steps <= 8:
+        raise ValueError(f"steps must be 2-8, got {steps}")
     # Wan redraws face crops, not the scene, so it gets a face prompt (the
     # node's generic one unless overridden) - never the source's H3 prompt.
     prompt = (job_input.get("prompt") or "").strip()
@@ -1067,7 +1075,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     upscale_scale = None
     if job_input.get("upscale_back", True):
         upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
-    workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt, canvas)
+    workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt, canvas, steps)
 
     comfy_start = time.time()
     try:
@@ -1106,6 +1114,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         "mode": REFINE_MODE,
         "first_time_download": downloaded,
         "canvas": canvas or "auto",
+        "steps": steps,
         "source_video_key": source_key,
         "subjects": subjects,
         "denoise": denoise,
