@@ -757,6 +757,18 @@ def submit_and_wait(workflow, timeout_seconds=None, should_cancel=None, should_f
         history = r.json()
         if prompt_id in history:
             entry = history[prompt_id]
+            status = entry.get("status") or {}
+            if status.get("status_str") == "error":
+                # A node raised mid-run. Without this the caller went looking
+                # for SaveVideo's output and reported a bare KeyError '92'
+                # (seen on the first face_refine runs) instead of the cause.
+                for kind, data in status.get("messages") or []:
+                    if kind == "execution_error":
+                        raise RuntimeError(
+                            f"ComfyUI failed in node {data.get('node_id')} ({data.get('node_type')}): "
+                            f"{data.get('exception_type')}: {data.get('exception_message')}"
+                        )
+                raise RuntimeError(f"ComfyUI reported an error: {json.dumps(status)[:2000]}")
             if interrupted and NODE_IDS["output"] not in entry.get("outputs", {}):
                 # Stopped before the output node ran - a real cancel, not a
                 # generation failure.
