@@ -102,19 +102,13 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git ComfyUI \
 # (see the FROM line's comment) and the proven pod's own build
 # (torch.__version__ == "2.10.0+cu130"). ComfyUI's own requirements.txt
 # doesn't pin a CUDA build, and pulling from the default PyPI index would
-# grab a CPU-only or mismatched-CUDA wheel. torchvision/torchaudio left
-# unpinned to whatever version pip resolves as compatible with this exact
-# torch build.
-#
-# torchvision/torchaudio pinned to torch 2.10's own releases. torchaudio was
-# unpinned and resolved to 2.11.0+cu130, whose wheel declares NO torch
-# requirement - so pip happily paired it with torch 2.10, and its compiled
-# lib failed to load ("undefined symbol: torch_dtype_float4_e2m1fn_x2"),
-# taking down every custom node that imports it (MiniMaxH3NativeAudioLock).
-# torchvision happened to resolve right (its wheels pin torch), but pinned
-# here too so it can't drift.
+# grab a CPU-only or mismatched-CUDA wheel. torchvision pinned to torch
+# 2.10's own release so it can't drift. No torchaudio: core ComfyUI dropped
+# it, and its only user here (MiniMaxH3NativeAudioLock, for the old H3 face
+# refine) is gone. If it ever comes back, pin it to 2.10.0+cu130 - an
+# unpinned torchaudio resolved to 2.11 and failed to load against torch 2.10.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
-    torch==2.10.0+cu130 torchvision==0.25.0+cu130 torchaudio==2.10.0+cu130
+    torch==2.10.0+cu130 torchvision==0.25.0+cu130
 
 RUN pip install --no-cache-dir -r ComfyUI/requirements.txt
 
@@ -129,26 +123,20 @@ RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git ComfyUI/custom_nodes/
     && pip install --no-cache-dir -r requirements.txt
 
 # Face refine (post-generation "refine faces" pass - see handler.py's
-# run_face_refine). Carasibana/ComfyUI-H3-FaceRefine (MIT) is pure Python;
-# its detector/scene-cut deps are wheels. insightface is deliberately NOT
-# installed (needs a C++ build): the refine graph runs with identity
-# matching off, which never imports it. MiniMaxH3NativeAudioLock (keeps the
-# clip's real audio fixed so lipsync survives the refine) ships inside the
-# Shrek3OnVH5 workflow repo; only that one folder is copied in. It imports
-# torchaudio, hence the torchaudio pin above.
+# run_face_refine). Only the face tracker (H3FaceTrackCrop) and stitch-back
+# (H3FaceStitch) of Carasibana/ComfyUI-H3-FaceRefine (MIT) are used; the
+# redraw is our comfylab_face_wan node. Pure Python, and its nodes import
+# their detector/scene-cut deps lazily (only when a refine runs).
+# insightface is deliberately NOT installed (needs a C++ build): identity
+# matching is off, which never imports it.
 ARG FACEREFINE_COMMIT=d8521d14fe0d721d80cd9417fff5a559cbc21aba
-ARG NATIVEAUDIOLOCK_COMMIT=11a95f623b98496923714db99da0aecec672cbd4
 RUN git clone https://github.com/Carasibana/ComfyUI-H3-FaceRefine.git ComfyUI/custom_nodes/ComfyUI-H3-FaceRefine \
     && cd ComfyUI/custom_nodes/ComfyUI-H3-FaceRefine \
     && git checkout "$FACEREFINE_COMMIT" \
     && pip install --no-cache-dir "ultralytics==8.4.171" scipy "scenedetect==0.7.1"
-RUN git clone https://github.com/Shrek3OnVH5/MiniMax-H3-NativeAudio-MusicVideo-Workflow.git /tmp/h3-nal \
-    && git -C /tmp/h3-nal checkout "$NATIVEAUDIOLOCK_COMMIT" \
-    && cp -r /tmp/h3-nal/custom_nodes/ComfyUI-H3-NativeAudioLock ComfyUI/custom_nodes/ComfyUI-H3-NativeAudioLock \
-    && rm -rf /tmp/h3-nal
-# Fail the BUILD, not a user's job, if either of the two imports that broke
-# on a worker comes back.
-RUN python -c "import torch, torchaudio, cv2; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| cv2', cv2.__version__)"
+# Fail the BUILD, not a user's job, if cv2 (the tracker's detector needs it;
+# it broke on a worker once for want of libGL) can't import.
+RUN python -c "import torch, cv2; print('torch', torch.__version__, '| cv2', cv2.__version__)"
 
 COPY comfyui_engine ./comfyui_engine
 COPY handler.py .

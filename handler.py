@@ -140,14 +140,7 @@ LORA_CHOICES = {
 # no-upscale job stayed at native resolution.
 NVIDIA_VSR_SCALE = 2.0
 NVIDIA_VSR_QUALITY = "ULTRA"
-# "nvidia_vsr_hb": same upscale, NVIDIA's HIGHBITRATE_ULTRA mode - their
-# upscale for clean sources, which skips the compression-artifact
-# suppression the standard modes apply. The official node can't select it,
-# so this goes through our own ComfyLabRTXVideoSuperResolution
-# (comfyui_engine/custom_nodes/comfylab_rtx_vsr) - same processing loop,
-# full mode list.
-NVIDIA_VSR_HB_QUALITY = "HIGHBITRATE_ULTRA"
-UPSCALE_METHODS = {"none", "nvidia_vsr", "nvidia_vsr_hb"}
+UPSCALE_METHODS = {"none", "nvidia_vsr"}
 # Attention A/B (see apply_attention_mode). ComfyUI's own H3 guide
 # (docs.comfy.org/tutorials/video/minimax/minimax-h3, "Quality degradation
 # with INT8 attention") says Sage's INT8 attention causes morphing late in a
@@ -374,43 +367,12 @@ def save_input_image(b64_data, prefix):
     return filename
 
 
-# Diffusion-model bake-off (job field "model"). All are pruned int8 ConvRot
-# H3 checkpoints - same architecture and ~21GB as the base, so speed and
-# memory are unchanged (checkpoint headers inspected: 50 blocks,
-# adaln_t_table pruned layout, comfy_quant int8). Non-base files download
-# on first use to the volume (see ensure_model_file), not at boot, so a
-# worker only pays for the ones actually tested.
-#   base        - Comfy-Org's official pruned int8 (the existing default)
-#   dasiwa_v3   - DaSiWa Hybrid V3 fine-tune (FL2VA+Ref2VA hybrid; what
-#                 production runs is its V1). Gated repo: needs HF_TOKEN
-#                 with the repo's terms accepted.
-#   singularity - Singularity v1.3 fine-tune; claims reduced face distortion
-#                 in medium-to-long shots. The *Pruned* int8 file (the
-#                 non-pruned one is 34GB).
+# Diffusion model (job field "model"). Only Comfy-Org's official pruned
+# int8 remains: the fine-tune bake-off (DaSiWa V3, Singularity v1.3, fal
+# Realism People LoRA) is over - none of them changed the melted faces, which
+# are an H3 limit on small heads (see PROMPT_FRAMING_RULES.md).
 MODEL_CHOICES = {
     "base": {"filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
-    "dasiwa_v3": {
-        "filename": "dasiwa_minimax_h3_hybrid_v3_int8_convrot.safetensors",
-        "repo": "darksidewalker/MiniMaxH3",
-        "repo_path": "model/DasiwaMinimaxH3_dasiwaHybridV3_3263052-INT8 ConvRot.safetensors",
-    },
-    "singularity": {
-        "filename": "minimax_h3_singularity_ref2va_pruned_v1.3_int8.safetensors",
-        "repo": "WarmBloodAban/Minimax-h3_Singularity",
-        "repo_path": "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors",
-    },
-}
-
-# fal's MiniMax H3 Realism People LoRA (job field "realism_lora": true).
-# Touches only the shared attention projections, so it loads on the pruned
-# builds and works for T2V/I2V/R2V. Its trigger word is prepended to the
-# prompt automatically; 1.0 is fal's intended strength.
-REALISM_LORA = {
-    "filename": "fal_h3_realism_people_t2v_i2v_r2v.safetensors",
-    "repo": "fal/MiniMax-H3-Realism-People-LoRA",
-    "repo_path": "h3-realism-people-t2v-i2v-r2v.safetensors",
-    "trigger": "r34l1sm",
-    "strength": 1.0,
 }
 
 
@@ -449,56 +411,9 @@ def ensure_model_file(spec, subdir):
     print(f"Downloaded {spec['filename']} in {round(time.time() - start)}s.")
 
 
-# One-time cleanup: a session may have been stopped mid-way through the very
-# first bake-off downloads (2026-10-02). Deletes the bake-off files (and any
-# .part leftovers) once per volume so they re-download clean, then leaves a
-# marker so it never runs again. Base model files are never touched.
-BAKEOFF_CLEAR_MARKER = os.path.join(VOLUME_DIR, ".bakeoff_downloads_cleared_v1")
-
-
-def clear_bakeoff_downloads_once():
-    if os.path.exists(BAKEOFF_CLEAR_MARKER):
-        return
-    targets = [(MODEL_CHOICES[k], "diffusion_models") for k in MODEL_CHOICES if "repo" in MODEL_CHOICES[k]]
-    targets.append((REALISM_LORA, "loras"))
-    for spec, subdir in targets:
-        path = os.path.join(VOLUME_MODELS_DIR, subdir, spec["filename"])
-        for p in (path, path + ".part"):
-            if os.path.exists(p):
-                os.remove(p)
-                print(f"One-time bake-off cleanup: removed {p}")
-    with open(BAKEOFF_CLEAR_MARKER, "w") as f:
-        f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
-    print("One-time bake-off cleanup done; marker written, will not run again.")
-
-
-# Downloaded at session start, before the session reports ready, so the
-# first job on each bake-off model isn't also a ~21GB download. Comma list
-# of MODEL_CHOICES keys and/or "realism_lora"; overridable per endpoint via
-# PRELOAD_MODELS ("" = none). Each file is fetched once per volume - later
-# sessions find it already there and skip straight past.
-PRELOAD_MODELS = os.environ.get("PRELOAD_MODELS", "dasiwa_v3,singularity,realism_lora")
-
-
-def preload_models():
-    """Best-effort: a failure (e.g. DaSiWa without HF_TOKEN) is logged and
-    skipped rather than failing the session - that model's own job will
-    retry the download and fail with the clear gated-repo error instead."""
-    for key in (k.strip() for k in PRELOAD_MODELS.split(",") if k.strip()):
-        try:
-            if key == "realism_lora":
-                ensure_model_file(REALISM_LORA, "loras")
-            elif key in MODEL_CHOICES:
-                ensure_model_file(MODEL_CHOICES[key], "diffusion_models")
-            else:
-                print(f"PRELOAD_MODELS: unknown entry {key!r}, skipping.")
-        except Exception as e:
-            print(f"Preload of {key} failed, continuing without it: {e}")
-
-
 def build_prompt_payload(job_input, upscale_method="none"):
     """Builds the full workflow graph for one generation. upscale_method
-    "nvidia_vsr" / "nvidia_vsr_hb" splices RTX VSR into the SAME submission
+    "nvidia_vsr" splices RTX VSR into the SAME submission
     as everything else (matching how production's koboldcpp path does upscale - one
     request, not two).
     """
@@ -586,10 +501,9 @@ def build_prompt_payload(job_input, upscale_method="none"):
     # comment) - splice a LoraLoaderModelOnly node between the base UNET
     # loader and PathchSageAttentionKJ only when one's requested, leaving
     # today's direct wiring untouched otherwise.
-    # Diffusion model (bake-off) - swaps the UNETLoader's file.
     workflow[NODE_IDS["unet_loader"]]["inputs"]["unet_name"] = MODEL_CHOICES[job_input.get("model", "base")]["filename"]
 
-    # LoRA chain: UNETLoader -> [turbo LoRA] -> [realism LoRA] -> Sage/guider.
+    # LoRA chain: UNETLoader -> [turbo LoRA] -> Sage/guider.
     model_src = [NODE_IDS["unet_loader"], 0]
     lora_key = job_input.get("lora")
     if lora_key and lora_key in LORA_CHOICES:
@@ -605,19 +519,6 @@ def build_prompt_payload(job_input, upscale_method="none"):
         model_src = ["_lora", 0]
         if "steps" not in job_input:
             workflow[NODE_IDS["steps"]]["inputs"]["steps"] = preset["default_steps"]
-    if job_input.get("realism_lora"):
-        workflow["_realism_lora"] = {
-            "inputs": {
-                "model": model_src,
-                "lora_name": REALISM_LORA["filename"],
-                "strength_model": REALISM_LORA["strength"],
-            },
-            "class_type": "LoraLoaderModelOnly",
-        }
-        model_src = ["_realism_lora", 0]
-        prompt_inputs = workflow[NODE_IDS["prompt_and_dims"]]["inputs"]
-        if not prompt_inputs["prompt"].startswith(REALISM_LORA["trigger"]):
-            prompt_inputs["prompt"] = f"{REALISM_LORA['trigger']}, {prompt_inputs['prompt']}"
     workflow[NODE_IDS["sage_attention"]]["inputs"]["model"] = model_src
 
     apply_attention_mode(workflow, job_input.get("attention", "sage"))
@@ -650,16 +551,6 @@ def build_prompt_payload(job_input, upscale_method="none"):
                 "quality": NVIDIA_VSR_QUALITY,
             },
             "class_type": "RTXVideoSuperResolution",
-        }
-        workflow["105:91"]["inputs"]["images"] = ["_nvidia_vsr", 0]
-    elif upscale_method == "nvidia_vsr_hb":
-        workflow["_nvidia_vsr"] = {
-            "inputs": {
-                "images": ["105:10", 0],
-                "scale": job_input.get("upscale_scale", NVIDIA_VSR_SCALE),
-                "quality": NVIDIA_VSR_HB_QUALITY,
-            },
-            "class_type": "ComfyLabRTXVideoSuperResolution",
         }
         workflow["105:91"]["inputs"]["images"] = ["_nvidia_vsr", 0]
 
@@ -886,7 +777,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
     upscale_method = job_input.get("upscale_method", "none")
     # Unknown values used to fall through build_prompt_payload's if/elif
     # and silently produce an un-upscaled video - seen on a real run when a
-    # newer test page sent "nvidia_vsr_hb" to a worker still on the build
+    # newer test page sent an upscale option to a worker still on the build
     # before that option existed. Fail the job loudly instead.
     if upscale_method not in UPSCALE_METHODS:
         raise ValueError(
@@ -907,9 +798,6 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
     model = job_input.get("model", "base")
     if model not in MODEL_CHOICES:
         raise ValueError(f"Unknown model {model!r} - this worker supports {sorted(MODEL_CHOICES)}")
-    ensure_model_file(MODEL_CHOICES[model], "diffusion_models")
-    if job_input.get("realism_lora"):
-        ensure_model_file(REALISM_LORA, "loras")
     workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
     comfy_start = time.time()
     result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
@@ -939,41 +827,31 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
         "seed": job_input["seed"],
         "attention": attention,
         "model": model,
-        "realism_lora": bool(job_input.get("realism_lora")),
         "comfy_seconds": comfy_seconds,
     }
 
 
 # --- Face refine (post-generation, opt-in) --------------------------------
 # Base H3 renders faces badly once a head is a small part of the frame (see
-# MERGE_NOTES.md "Known limitation"). This is the community fix: Carasibana's
-# ComfyUI-H3-FaceRefine (pinned in the Dockerfile) tracks one face through
-# the clip, crops so it fills a 768 canvas, lets H3 redraw just that crop at
-# low denoise (turbo LoRA, 8 steps), and stitches it back. Graph mirrors the
-# pack's own H3_Face_Refine_Auto_Select example, minus VideoHelperSuite /
-# Impact Pack (core LoadVideo/CreateVideo/SaveVideo do the same job here).
+# MERGE_NOTES.md "Known limitation"). ComfyUI-H3-FaceRefine's tracker
+# (H3FaceTrackCrop) follows each face through the clip and crops so it fills
+# a canvas; our comfylab_face_wan node redraws those crops with Wan 2.2's
+# low-noise 14B model (+ 4-step lightx2v LoRA), at a per-frame strength that
+# leaves faces 120px and up untouched; the pack's H3FaceStitch pastes them
+# back. (The pack's own H3 redraw was dropped: its H3PerFrameDenoise breaks
+# sampling on our ComfyUI - issue #19 on the pack.)
+#
+# The Wan files are NOT part of the engine script, so session start and H3
+# generation are unchanged; the first refine on a volume downloads them
+# (~22.5GB, once per volume).
 #
 # Job shape (comfylab_gpu_session_jobs.input):
 #   {"mode": "face_refine", "source_video_key": "<key>.mp4",
-#    "subjects": 1-4, "denoise": 0.2-0.6, "seed": ..., "prompt": optional,
-#    "engine": "h3" (default) | "wan"}
-# One subject = one tracked person per pass; passes are chained, each
-# stitching onto the previous pass's output (the pack's documented way to
-# do several people). The prompt defaults to the source job's own prompt,
-# looked up by videoKey, since H3 regenerates the crop against it.
+#    "subjects": 1-4, "denoise": 0.05-1.0 (default 0.5), "seed": ...,
+#    "prompt": optional face prompt (blank = the node's generic one)}
 REFINE_MODE = "face_refine"
 REFINE_MAX_SUBJECTS = 4
-REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base; H3PerFrameDenoise scales it down per frame for big faces
-REFINE_STEPS = 8               # matches the 8-step turbo LoRA (LORA_CHOICES["turbo"])
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
-
-# "Refine faces (Wan)" engine: same tracker and stitch-back as above, but the
-# crops are redrawn by Wan 2.2's low-noise 14B model (comfylab_face_wan node)
-# instead of H3. Its files are NOT part of preload or the engine script, so
-# session start and H3 generation are unchanged; the first Wan refine on a
-# volume downloads them (~22.5GB, once per volume).
-REFINE_ENGINE_H3 = "h3"
-REFINE_ENGINE_WAN = "wan"
 WAN_REFINE_DEFAULT_DENOISE = 0.5   # starting sigma ~0.83 at shift 5, under the low-noise expert's 0.875 boundary
 WAN_REFINE_STEPS = 4               # the 4-step lightx2v LoRA
 WAN_REFINE_SHIFT = 5.0
@@ -1009,26 +887,6 @@ def ensure_wan_refine_files(report_stage=None):
     for spec, sub in missing:
         ensure_model_file(spec, sub)
     return True
-
-
-def find_source_prompt(video_key, hops=3):
-    """The prompt a video was generated with, from the session job that
-    produced it. Follows refine jobs back to the original generation."""
-    for _ in range(hops):
-        rows = sb_get(
-            "comfylab_gpu_session_jobs",
-            {"output->>videoKey": f"eq.{video_key}", "select": "input", "limit": "1"},
-        )
-        if not rows:
-            return None
-        src_input = rows[0].get("input") or {}
-        if src_input.get("prompt"):
-            return src_input["prompt"]
-        if src_input.get("mode") == REFINE_MODE and src_input.get("source_video_key"):
-            video_key = src_input["source_video_key"]
-            continue
-        return None
-    return None
 
 
 def downscale_video_for_refine(src_path, dst_path, max_w=1344, max_h=768):
@@ -1090,129 +948,10 @@ def prepare_refine_source(video_key):
     return filename, factor
 
 
-def build_refine_payload(source_filename, prompt, subjects, denoise, seed, upscale_scale):
-    model_src = ["r_lora", 0]
-    wf = {
-        "r_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
-        "r_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["r_load", 0]}},
-        "r_unet": {"class_type": "UNETLoader", "inputs": {
-            "unet_name": MODEL_CHOICES["base"]["filename"], "weight_dtype": "default"}},
-        "r_lora": {"class_type": "LoraLoaderModelOnly", "inputs": {
-            "model": ["r_unet", 0], "lora_name": LORA_CHOICES["turbo"]["filename"],
-            "strength_model": LORA_CHOICES["turbo"]["multiplier"]}},
-        "r_sage": {"class_type": "PathchSageAttentionKJ", "inputs": {
-            "model": model_src, "sage_attention": "auto", "allow_compile": False}},
-        "r_clip": {"class_type": "CLIPLoader", "inputs": {
-            "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}},
-        "r_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
-        "r_avae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
-        "r_sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "er_sde"}},
-        "r_noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
-    }
-    # Logging-only pass-through nodes (comfyui_engine/custom_nodes/comfylab_debug)
-    # while the refine's "KeyError: nan" is diagnosed. They print tensor stats
-    # to the worker log and change no values.
-    def dbg_image(node_id, src, label):
-        wf[node_id] = {"class_type": "ComfyLabDebugImage", "inputs": {"images": src, "label": label}}
-        return [node_id, 0]
-
-    def dbg_latent(node_id, src, label):
-        wf[node_id] = {"class_type": "ComfyLabDebugLatent", "inputs": {"latent": src, "label": label}}
-        return [node_id, 0]
-
-    images = dbg_image("r_dbg_frames", ["r_comp", 0], "source frames")
-    wf["r_dbg_audio"] = {"class_type": "ComfyLabDebugAudio", "inputs": {"audio": ["r_comp", 1], "label": "source audio"}}
-    audio = ["r_dbg_audio", 0]
-    for i in range(subjects):
-        p = f"r{i}_"
-        wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
-            "images": images, "detector": FACE_DETECTOR, "confidence": 0.35,
-            "crop_factor": 3.0, "canvas_width": 768, "canvas_height": 768,
-            "canvas_mode": "auto_capped_768", "smooth_window": 21, "size_smooth_window": 51,
-            "smooth_method": "gaussian", "size_mode": "per_frame",
-            # Identity matching (insightface) deliberately off - it needs a
-            # compiled package we don't install. Continuity + select rank
-            # still hold one face per shot.
-            "identity_track": False, "identity_threshold": 0.28,
-            "select": "largest_face", "select_index": i, "fallback_detector": "none",
-            "fallback_head_frac": 0.5, "identity_model": "insightface",
-            # Our prompts are multi-shot (hard cuts); re-pick the subject per shot.
-            "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
-            "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
-        wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
-        wf[p + "r2v"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
-            "clip": ["r_clip", 0], "vae": ["r_vae", 0], "audio_vae": ["r_avae", 0],
-            "prompt": prompt, "width": [p + "track", 4], "height": [p + "track", 5],
-            "length": [p + "track", 6], "ref_image_size": "match"}}
-            # No reference audio here (the pack's example passes the clip's
-            # audio as ref_audios.ref_audio_0). With it, the text conditioning
-            # came out entirely NaN on our setup (debug run 4504b86a), while
-            # plain text conditioning - what every normal generation uses -
-            # is clean. Lip sync is anchored by the audio lock below instead.
-        # Audio lock runs BEFORE the video inject (the pack's example does it
-        # after). Debug run 4504b86a: core's own encode of this soundtrack
-        # (reference audio, early in the graph) was clean, but the lock's
-        # identical encode after the big video-VAE inject came out NaN.
-        # H3InjectVideoLatent copies the latent dict and only swaps the video
-        # stream, so the locked audio and its noise mask pass through intact.
-        wf[p + "lock"] = {"class_type": "MiniMaxH3NativeAudioLock", "inputs": {
-            "model": ["r_sage", 0],
-            "av_latent": dbg_latent(p + "dbg_r2v", [p + "r2v", 1], f"pass {i} r2v latent"),
-            "audio_vae": ["r_avae", 0], "audio": audio}}
-        wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
-            "av_latent": dbg_latent(p + "dbg_lock", [p + "lock", 1], f"pass {i} after audio lock"),
-            "images": dbg_image(p + "dbg_crops", [p + "track", 0], f"pass {i} crops"),
-            "vae": ["r_vae", 0]}}
-        wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
-            "model": [p + "lock", 0],
-            "av_latent": dbg_latent(p + "dbg_inject", [p + "inject", 0], f"pass {i} after inject"),
-            "transform": [p + "track", 1],
-            "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.35,
-            "scale_mode": "absolute_px", "face_px_small": 30.0, "face_px_large": 120.0,
-            "gamma": 1.0, "smooth_frames": 9}}
-        wf[p + "dbg_model"] = {"class_type": "ComfyLabDebugModel", "inputs": {
-            "model": [p + "pfd", 2], "label": f"pass {i} H3 forward", "calls": 2}}
-        wf[p + "dbg_cond"] = {"class_type": "ComfyLabDebugConditioning", "inputs": {
-            "conditioning": [p + "r2v", 0], "label": f"pass {i} r2v conditioning"}}
-        wf[p + "guider"] = {"class_type": "BasicGuider", "inputs": {
-            "model": [p + "dbg_model", 0], "conditioning": [p + "dbg_cond", 0]}}
-        wf[p + "sched"] = {"class_type": "BasicScheduler", "inputs": {
-            "scheduler": "simple", "steps": REFINE_STEPS, "denoise": denoise, "model": [p + "pfd", 2]}}
-        wf[p + "dbg_sigmas"] = {"class_type": "ComfyLabDebugSigmas", "inputs": {
-            "sigmas": [p + "sched", 0], "model": [p + "pfd", 2], "label": f"pass {i} sigmas"}}
-        wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
-            "noise": ["r_noise", 0], "guider": [p + "guider", 0], "sampler": ["r_sampler", 0],
-            "sigmas": [p + "dbg_sigmas", 0],
-            "latent_image": dbg_latent(p + "dbg_pfd", [p + "pfd", 0], f"pass {i} after per-frame denoise")}}
-        wf[p + "decode"] = {"class_type": "VAEDecode", "inputs": {"samples": [p + "sample", 0], "vae": ["r_vae", 0]}}
-        wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
-            "base_images": images, "refined_crops": [p + "decode", 0], "transform": [p + "track", 1],
-            "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
-            "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
-        images = [p + "stitch", 0]
-
-    # Back up to the size the source was delivered at (it was downscaled to
-    # native before refining - see downscale_video_for_refine).
-    if upscale_scale:
-        wf["r_vsr"] = {"class_type": "RTXVideoSuperResolution", "inputs": {
-            "images": images, "resize_type": "scale by multiplier",
-            "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
-        images = ["r_vsr", 0]
-    wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
-        "fps": 24, "bit_depth": 8, "images": images, "audio": audio}}
-    # Same node id as the generation graph's SaveVideo, so submit_and_wait's
-    # cancel detection and _output_video_info_and_path work unchanged.
-    wf[NODE_IDS["output"]] = {"class_type": "SaveVideo", "inputs": {
-        "filename_prefix": f"video/FaceRefine_{uuid.uuid4().hex[:12]}",
-        "format": "auto", "codec": "auto", "video": ["r_create", 0]}}
-    return wf
-
-
-def build_refine_payload_wan(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt):
-    """Wan engine: every subject is tracked on the source frames, all crops
-    are redrawn in one ComfyLabWanFaceRedraw node (Wan loads once, and is
-    unloaded inside the node when it finishes), then stitched back one
-    subject after another. Tracker and stitch settings are the H3 graph's."""
+def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt):
+    """Every subject is tracked on the source frames, all crops are redrawn
+    in one ComfyLabWanFaceRedraw node (Wan loads once, and is unloaded inside
+    the node when it finishes), then stitched back one subject after another."""
     wf = {
         "r_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
         "r_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["r_load", 0]}},
@@ -1226,8 +965,8 @@ def build_refine_payload_wan(source_filename, subjects, denoise, seed, upscale_s
         "vae_name": WAN_REFINE_FILES["vae"][0]["filename"],
         "prompt": wan_prompt or "", "denoise": denoise, "steps": WAN_REFINE_STEPS,
         "shift": WAN_REFINE_SHIFT, "seed": seed,
-        # Same ramp as H3PerFrameDenoise's defaults, ending at zero: faces at
-        # or above 120px are left exactly as they are.
+        # The pack's H3PerFrameDenoise ramp, ending at zero: faces at or
+        # above 120px are left exactly as they are.
         "face_px_small": 30.0, "face_px_large": 120.0, "smooth_frames": 9,
         "sage_attention": True,
     }
@@ -1280,38 +1019,25 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         raise ValueError(f"subjects must be a whole number, got {job_input.get('subjects')!r}")
     if not 1 <= subjects <= REFINE_MAX_SUBJECTS:
         raise ValueError(f"subjects must be 1-{REFINE_MAX_SUBJECTS}, got {subjects}")
-    engine = (job_input.get("engine") or REFINE_ENGINE_H3).strip().lower()
-    if engine not in (REFINE_ENGINE_H3, REFINE_ENGINE_WAN):
-        raise ValueError(f"engine must be '{REFINE_ENGINE_H3}' or '{REFINE_ENGINE_WAN}', got {engine!r}")
-    default_denoise = WAN_REFINE_DEFAULT_DENOISE if engine == REFINE_ENGINE_WAN else REFINE_DEFAULT_DENOISE
     try:
-        denoise = float(job_input.get("denoise", default_denoise))
+        denoise = float(job_input.get("denoise", WAN_REFINE_DEFAULT_DENOISE))
     except (TypeError, ValueError):
         raise ValueError(f"denoise must be a number, got {job_input.get('denoise')!r}")
     if not 0.05 <= denoise <= 1.0:
         raise ValueError(f"denoise must be between 0.05 and 1.0, got {denoise}")
     seed = resolve_seed(job_input.get("seed"))
-    if engine == REFINE_ENGINE_WAN:
-        # Wan redraws face crops, not the scene, so it gets a face prompt
-        # (the node's default) rather than the source's whole-scene prompt.
-        prompt = (job_input.get("prompt") or "").strip()
-        downloaded = ensure_wan_refine_files(report_stage)
-        if report_stage:
-            report_stage("Refining faces (Wan)")
-    else:
-        downloaded = False
-        prompt = (job_input.get("prompt") or "").strip() or find_source_prompt(source_key)
-        if not prompt:
-            raise ValueError(f"No prompt given and none found for {source_key} - pass one in the job")
+    # Wan redraws face crops, not the scene, so it gets a face prompt (the
+    # node's generic one unless overridden) - never the source's H3 prompt.
+    prompt = (job_input.get("prompt") or "").strip()
+    downloaded = ensure_wan_refine_files(report_stage)
+    if report_stage:
+        report_stage("Refining faces")
 
     source_filename, factor = prepare_refine_source(source_key)
     upscale_scale = None
     if job_input.get("upscale_back", True):
         upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
-    if engine == REFINE_ENGINE_WAN:
-        workflow = build_refine_payload_wan(source_filename, subjects, denoise, seed, upscale_scale, prompt)
-    else:
-        workflow = build_refine_payload(source_filename, prompt, subjects, denoise, seed, upscale_scale)
+    workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt)
 
     comfy_start = time.time()
     try:
@@ -1344,7 +1070,6 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     return {
         "videoKey": video_key,
         "mode": REFINE_MODE,
-        "engine": engine,
         "first_time_download": downloaded,
         "source_video_key": source_key,
         "subjects": subjects,
@@ -1527,8 +1252,6 @@ def run_session(session_id):
     try:
         ensure_comfyui_engine()
         symlink_models_to_volume()
-        clear_bakeoff_downloads_once()
-        preload_models()
         start_comfyui_if_needed()
     except Exception as e:
         print(f"Session {session_id}: ComfyUI failed to start ({e}) - ending session.")

@@ -238,23 +238,9 @@ else
 fi
 pip install "nvidia-vfx==$NVIDIA_VFX_VERSION"
 
-# Our own copy of the RTX VSR node with NVIDIA's HIGHBITRATE modes exposed
-# (see comfyui_engine/custom_nodes/comfylab_rtx_vsr/__init__.py). Shipped in
-# this repo, so it's copied fresh from the image on every worker boot -
-# overwritten, never "already present", so an updated image always wins.
-COMFYLAB_NODES_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/comfylab_rtx_vsr"
-rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
-cp -r "$COMFYLAB_NODES_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_rtx_vsr"
-echo "[comfylab-engine] Installed comfylab_rtx_vsr custom node."
-
-# Logging-only debug nodes for the face refine graph (see their docstring).
-COMFYLAB_DEBUG_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/comfylab_debug"
-rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_debug"
-cp -r "$COMFYLAB_DEBUG_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_debug"
-echo "[comfylab-engine] Installed comfylab_debug custom node."
-
-# "Refine faces (Wan)" redraw node (see its docstring). Code only - the Wan
-# model files are downloaded by the handler on the first Wan refine.
+# "Refine faces" redraw node (Wan 2.2 - see its docstring). Shipped in this
+# repo and copied fresh from the image on every boot. Code only - the Wan
+# model files are downloaded by the handler on the first refine.
 COMFYLAB_FACE_WAN_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/custom_nodes/comfylab_face_wan"
 rm -rf "$COMFYUI_DIR/custom_nodes/comfylab_face_wan"
 cp -r "$COMFYLAB_FACE_WAN_SRC" "$COMFYUI_DIR/custom_nodes/comfylab_face_wan"

@@ -55,30 +55,16 @@ agrees it's a property of head-size-in-frame, not output resolution
   upscale, then re-upscales), keep both original and refined versions
   (decide how that counts toward library caps). Test-page version:
   handler.py run_face_refine / "Refine faces" panel.
-- Two refine engines on the test page (job input `engine`):
-  - `h3` - ComfyUI-H3-FaceRefine as shipped. Its H3PerFrameDenoise (what
-    keeps large faces from being redrawn) breaks sampling on our ComfyUI
-    (issue #19 on the pack; works on 0.34, broken on 0.36/0.38).
-  - `wan` - same tracker and stitch-back, crops redrawn by Wan 2.2 low-noise
-    14B + 4-step lightx2v LoRA (`comfylab_face_wan` node). Per-frame strength
-    through core's standard noise mask: full at <=30px faces, none at
-    >=120px (those frames keep their original pixels). Wan files (~22.5GB)
-    download on the first Wan refine, not at session start; Wan loads once
-    per refine and is unloaded from VRAM and RAM before the job ends. Not
-    audio-aware - lip sync to be judged on the first results.
-- **At merge, if Wan is the engine we keep: remove the H3-only refine
-  pieces.** Startup cost today is small (no model loads, no downloads at
-  session start), but these exist only for the H3 engine:
-  - `MiniMaxH3NativeAudioLock` (Dockerfile copy from the Shrek3OnVH5 repo) -
-    the one H3-refine piece imported at every ComfyUI start, and it pulls in
-    torchaudio;
-  - the torchaudio pin and the libgl1/libglib2.0-0 note tied to it (keep
-    torchvision's pin; check nothing else imports torchaudio first - core
-    ComfyUI dropped it);
-  - `comfylab_debug` nodes (copied every boot) and the debug wiring in
-    `build_refine_payload`;
-  - `build_refine_payload`, `REFINE_DEFAULT_DENOISE`/`REFINE_STEPS`, the H3
-    option on the test page.
+- Refine engine: ComfyUI-H3-FaceRefine's tracker and stitch-back, crops
+  redrawn by Wan 2.2 low-noise 14B + 4-step lightx2v LoRA
+  (`comfylab_face_wan` node). Per-frame strength through core's standard
+  noise mask: full at <=30px faces, none at >=120px (those frames keep their
+  original pixels). Wan files (~22.5GB) download on the first refine, not at
+  session start; Wan loads once per refine and is unloaded from VRAM and RAM
+  before the job ends. Not audio-aware - lip sync to be judged on the first
+  results. The pack's own H3 redraw was removed (its H3PerFrameDenoise breaks
+  sampling on our ComfyUI - issue #19 on the pack; works on 0.34, broken on
+  0.36/0.38), along with its audio-lock node, torchaudio and the debug nodes.
 - **Wan refine to-dos (noted, not built - after the current test):**
   - Auto people count: before building the graph, run face_yolov8m on the
     video, count people per shot, build one pass per person who ever has a
@@ -87,9 +73,6 @@ agrees it's a property of head-size-in-frame, not output resolution
   - Drop the prompt override for Wan: always use the node's generic face
     prompt (one override applies to every person, and the source prompt is
     a whole-scene H3-format prompt that never goes to Wan).
-  Keep for Wan: the ComfyUI-H3-FaceRefine pack (its tracker and stitch are
-  used; its nodes import lazily, ultralytics only when a refine runs),
-  ultralytics/scipy/scenedetect, face_yolov8m.pt.
 
 ## Other to-dos (not merge-blocking)
 
@@ -108,13 +91,16 @@ agrees it's a property of head-size-in-frame, not output resolution
   - Give each speaker or character a stable identity on first appearance.
   - Don't overload short clips: too many characters/events in ~7s makes
     faces small and glitchy.
-- **Consider later: freeze bake-off model downloads to a fixed version.**
-  `ensure_model_file` in `handler.py` downloads DaSiWa V3, Singularity and
-  the fal LoRA from each repo's `main`. If an author re-uploads a file, a
-  fresh volume (or a re-download) silently gets the new version. Pinning
-  each URL to its HuggingFace commit (`resolve/<sha>/...` instead of
-  `resolve/main/...`) would make results reproducible. Matters most once a
-  model is chosen for production. Not done yet.
+- **Consider later: freeze the Wan refine downloads to a fixed version.**
+  `ensure_model_file` in `handler.py` downloads the Wan files from Comfy-Org's
+  repos' `main`. If a file is re-uploaded, a fresh volume silently gets the
+  new version. Pinning each URL to its HuggingFace commit (`resolve/<sha>/...`)
+  would make results reproducible. Not done yet.
+- **Done: removed the fine-tune bake-off and HIGHBITRATE VSR.** DaSiWa V3,
+  Singularity v1.3 and the fal Realism People LoRA (none changed the melted
+  faces) are gone from the code, preload and test page; delete their files
+  from the volume by hand. The HIGHBITRATE_ULTRA RTX VSR option and its custom
+  node are gone too; the standard RTX VSR (ULTRA) upscale stays.
 - **Done: restored an unsaved koboldcpp video.** Job `4ba19710` on the live
   site (2026-10-03, Alpha Timber prompt) produced
   `ad4ddca3-f097-41aa-ba2b-da1ffbb69d5c.mp4`, but the save was blocked
