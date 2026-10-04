@@ -125,9 +125,13 @@ agrees it's a property of head-size-in-frame, not output resolution
   - Prompt: the generic face prompt stays. The man's face on the mother came
     from the whole-scene prompt, not the cut: 0.6 with one clip per person
     and the generic prompt showed no man's face.
-  - Side effect to fix later: with the generic prompt the shot-3 builder's
-    lips follow the off-screen narration (too fast, jaggy). The scene prompt
-    said the narrator is off-screen; no easy fix (each option adds a layer).
+  - Known side effect, accepted for now (user: "talking isn't a big deal"):
+    with the generic prompt the shot-3 builder's mouth moves when nobody is
+    talking (too fast, jaggy). Not the audio - 32fb5f03 used the same
+    frame-aligned audio with the scene prompt and his mouth stayed still;
+    the scene prompt said the narrator is off-screen, the generic one says
+    nothing. If it needs fixing: send H3 only that shot's part of the scene
+    prompt (needs detected cuts matched to the prompt's shot numbers).
   - The girl's face (smallest, 23-29px) flickers back to melted near the end:
     the detector misses it on a few frames (308, 353-356, 360). Detector now
     runs at 960px instead of 640 (face_detector.py) - a 23px face reached it
