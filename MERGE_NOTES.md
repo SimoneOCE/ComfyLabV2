@@ -365,3 +365,7 @@ Then 60/62 -> 60/65 (jobs 3e107710 / 75075b9e, 0.3 and 0.4): with the pick
 fix all four friends were redrawn, but the woman on the left (59-63px) was 62px+
 for the first ~16 frames of her shot, so those kept the original face. 65 covers
 her max of 63 (the paste is full up to ~64px).
+
+Possible default change (user, 2026-10-04, not decided): Wan strength 0.4
+instead of 0.3 for faces 32px and up. 0.3 and 0.4 both looked good on the park
+video once the faces were inside the range. Small faces stay at 0.6.
