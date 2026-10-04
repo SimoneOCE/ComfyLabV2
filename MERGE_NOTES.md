@@ -417,3 +417,17 @@ Job 3d29b7fd on da2f6e17 (the 7s family clip):
    redrawn.
 
 The 8-frame gap fill (`gaps.py`) stays, by the user's choice.
+
+## Official face-refine settings for the port (user, 2026-10-04)
+
+Signed off after the park (813cdb5d), Alpha Timber (cba2f8ef) and family clip
+(da2f6e17) runs:
+
+- Engine: Wan 2.2 low-noise + lightx2v, 4 steps
+- Strength: 0.3 per clip; 0.6 for clips whose face is typically under 32px
+- Face range: full up to 60px, untouched from 80px (paste full up to ~76px)
+- Crop: 2x the face; detector bar 0.25 at 1280px
+- Floor: 18px to count/pick a person; a tracked person is fixed down to 12px
+- Picking: in-range faces only, in order, no two people on one face
+- Detection gaps of up to 8 frames inside a shot are bridged
+- Duplicate check on; generic face prompt; button-only, never automatic

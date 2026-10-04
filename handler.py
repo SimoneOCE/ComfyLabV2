@@ -895,7 +895,9 @@ REFINE_FACE_PX_SMALL = 60.0        # full strength at or below this (was 45)
 # 62 -> 65 (user, 2026-10-04): the woman on the left of the park shot is
 # 59-63px and sat at 62-63px for the shot's first ~16 frames, so those were
 # left unfixed while the rest of her shot was redrawn.
-REFINE_FACE_PX_LARGE = 65.0        # none at or above this (was 62, 60, before that 120)
+# 65 -> 80 (user, 2026-10-04): the official setting after the park, Alpha
+# Timber and family-clip tests. The Wan paste is full up to ~76px.
+REFINE_FACE_PX_LARGE = 80.0        # none at or above this (was 65, 62, 60, before that 120)
 # Crop = this many face heights (the pack's default is 3). At 2 the face fills
 # half the crop instead of a third, so the redraw gets ~1.5x the pixels on it;
 # less context around the face. User, 2026-10-04.
