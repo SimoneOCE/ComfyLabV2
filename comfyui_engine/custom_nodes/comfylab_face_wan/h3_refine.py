@@ -115,6 +115,28 @@ class ComfyLabH3AudioLock:
         return (out, report)
 
 
+def pfd_strength(transform, denoise_multiplier_small_face, denoise_multiplier_large_face,
+                 face_px_small, face_px_large, gamma, smooth_frames):
+    """Per-frame strength exactly as H3PerFrameDenoise.run computes it
+    (absolute_px), plus each frame's face height."""
+    from . import _pack_module
+    pack = _pack_module()
+    boxes = transform["boxes"]
+    cf = float(transform.get("crop_factor", 3.0)) or 3.0
+    face = np.array([b[3] / cf for b in boxes], dtype=np.float64)
+    lo, hi = float(face_px_small), float(face_px_large)
+    t = np.zeros_like(face) if hi - lo < 1e-6 else np.clip((face - lo) / (hi - lo), 0.0, 1.0)
+    t = t ** float(gamma)
+    strength = denoise_multiplier_small_face + (denoise_multiplier_large_face - denoise_multiplier_small_face) * t
+    segs = transform.get("segments") or [(0, len(strength))]
+    segs = [(int(a), int(b)) for a, b in segs if int(a) < len(strength)]
+    strength = pack._smooth_seg(strength, int(smooth_frames), "gaussian", segs or [(0, len(strength))])
+    absent = transform.get("absent")
+    if absent and len(absent) == len(strength):
+        strength[np.array(absent, dtype=bool)] = 0.0
+    return np.clip(strength, 0.0, 1.0), face
+
+
 class ComfyLabStrengthWeights:
     @classmethod
     def INPUT_TYPES(cls):
@@ -136,24 +158,8 @@ class ComfyLabStrengthWeights:
 
     def run(self, transform, denoise_multiplier_small_face, denoise_multiplier_large_face,
             face_px_small, face_px_large, gamma, smooth_frames):
-        from . import _pack_module
-        pack = _pack_module()
-        # H3PerFrameDenoise.run's curve (absolute_px), step for step.
-        boxes = transform["boxes"]
-        cf = float(transform.get("crop_factor", 3.0)) or 3.0
-        face = np.array([b[3] / cf for b in boxes], dtype=np.float64)
-        lo, hi = float(face_px_small), float(face_px_large)
-        t = np.zeros_like(face) if hi - lo < 1e-6 else np.clip((face - lo) / (hi - lo), 0.0, 1.0)
-        t = t ** float(gamma)
-        strength = denoise_multiplier_small_face + (denoise_multiplier_large_face - denoise_multiplier_small_face) * t
-        segs = transform.get("segments") or [(0, len(strength))]
-        segs = [(int(a), int(b)) for a, b in segs if int(a) < len(strength)]
-        strength = pack._smooth_seg(strength, int(smooth_frames), "gaussian", segs or [(0, len(strength))])
-        absent = transform.get("absent")
-        if absent and len(absent) == len(strength):
-            strength[np.array(absent, dtype=bool)] = 0.0
-        strength = np.clip(strength, 0.0, 1.0)
-
+        strength, face = pfd_strength(transform, denoise_multiplier_small_face, denoise_multiplier_large_face,
+                                      face_px_small, face_px_large, gamma, smooth_frames)
         out = dict(transform)
         base = out.get("weights") or [1.0] * len(strength)
         ramp = np.clip(strength / WEIGHT_RAMP, 0.0, 1.0)
@@ -198,6 +204,221 @@ class ComfyLabH3StepCheck:
 
         m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "comfylab_h3_step_check", check)
         return (m,)
+
+
+KEEP_BELOW = 0.02   # strength under which a frame keeps its original crop (as the Wan engine)
+RANGE_MARGIN = 4    # frames of context kept either side of a small-face stretch (as the Wan engine)
+REDRAW_MAX = 512    # crops bigger than this are redrawn at this size (as the Wan engine)
+H3_MULTIPLE = 32    # H3 canvases are multiples of 32 (comfy_extras/nodes_minimax_h3.py CANVAS_MULTIPLE)
+
+
+def h3_grid(n):
+    """Smallest H3 frame count (17k+5) holding n frames."""
+    n = max(5, int(n))
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+class ComfyLabH3FaceRedraw:
+    """The H3 engine's redraw, built like ComfyLabWanFaceRedraw:
+
+    - one clip per person per SHOT (H3 never sees a hard cut - a person's
+      crops can string several shots together, and H3 redrawing them as one
+      video carried one shot's face into the next: job 848f54fc put the
+      shot-3 builder's face on the shot-4 mother);
+    - each clip covers only the stretch where the face is small, plus
+      RANGE_MARGIN frames either side, padded to H3's 17k+5 grid;
+    - redrawn at no more than REDRAW_MAX, resized back after;
+    - the prompt is encoded once for every clip;
+    - each clip goes through the pack's H3PerFrameDenoise (its slice of the
+      tracker's transform) for its per-frame strength - its latent, not its
+      patched model (see the module docstring) - and ComfyLabH3AudioLock for
+      the audio of exactly its frames;
+    - frames not redrawn keep the original crop, and the returned transforms'
+      stitch weights follow the same strength curve (zero where nothing was
+      redrawn).
+
+    Not ported from the Wan node: batching clips of the same size. H3's own
+    mask handling (comfy/model_base.py MiniMaxH3._denoise_mask_values) takes
+    the per-frame mask of the FIRST batch row for every row's timesteps, so
+    batched clips would all run at the first clip's strengths. Clips run one
+    at a time."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {}
+        for i in range(1, MAX_SUBJECTS):
+            optional[f"crops_{i}"] = ("IMAGE",)
+            optional[f"transform_{i}"] = ("H3FACEXFORM",)
+        return {
+            "required": {
+                "crops_0": ("IMAGE",),
+                "transform_0": ("H3FACEXFORM",),
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "audio_vae": ("VAE",),
+                "audio": ("AUDIO",),
+                "fps": ("FLOAT", {"default": 24.0}),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "denoise": ("FLOAT", {"default": 0.4, "min": 0.05, "max": 1.0, "step": 0.01}),
+                "steps": ("INT", {"default": 8, "min": 1, "max": 50}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "sampler_name": ("STRING", {"default": "er_sde"}),
+                "denoise_multiplier_small_face": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0}),
+                "denoise_multiplier_large_face": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0}),
+                "face_px_small": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 1000.0}),
+                "face_px_large": ("FLOAT", {"default": 120.0, "min": 2.0, "max": 2000.0}),
+                "gamma": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 4.0}),
+                "smooth_frames": ("INT", {"default": 9, "min": 1, "max": 61}),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = ("IMAGE",) * MAX_SUBJECTS + ("STRING",) + ("H3FACEXFORM",) * MAX_SUBJECTS
+    RETURN_NAMES = (tuple(f"crops_{i}" for i in range(MAX_SUBJECTS)) + ("report",)
+                    + tuple(f"transform_{i}" for i in range(MAX_SUBJECTS)))
+    FUNCTION = "redraw"
+    CATEGORY = "ComfyLab"
+
+    def redraw(self, model, clip, vae, audio_vae, audio, fps, prompt, denoise, steps, seed, sampler_name,
+               denoise_multiplier_small_face, denoise_multiplier_large_face, face_px_small, face_px_large,
+               gamma, smooth_frames, **subjects):
+        import time
+        start = time.time()
+        curve = dict(denoise_multiplier_small_face=denoise_multiplier_small_face,
+                     denoise_multiplier_large_face=denoise_multiplier_large_face,
+                     face_px_small=face_px_small, face_px_large=face_px_large,
+                     gamma=gamma, smooth_frames=smooth_frames)
+        report = []
+        work = []
+        for i in range(MAX_SUBJECTS):
+            crops, transform = subjects.get(f"crops_{i}"), subjects.get(f"transform_{i}")
+            if crops is None or transform is None:
+                continue
+            n = min(crops.shape[0], len(transform["boxes"]))
+            strength, face = pfd_strength(transform, **curve)
+            strength = strength[:n]
+            line = (f"subject {i}: {n} frames, face {face.min():.0f}-{face.max():.0f}px, "
+                    f"strength max {strength.max():.2f} mean {strength.mean():.2f}, "
+                    f"kept as-is {int((strength < KEEP_BELOW).sum())}/{n} frames")
+            _log(line)
+            report.append(line)
+            work.append((i, crops, strength, transform))
+
+        # One clip per person per shot, only where the face is small (+ margin).
+        clips = []
+        for i, crops, strength, transform in work:
+            n = len(strength)
+            for a, b in (transform.get("segments") or [(0, n)]):
+                a, b = max(0, int(a)), min(n, int(b))
+                idx = np.flatnonzero(strength[a:b] >= KEEP_BELOW)
+                if idx.size == 0:
+                    continue
+                clip_start = max(a, a + int(idx[0]) - RANGE_MARGIN)
+                clip_end = min(b, a + int(idx[-1]) + 1 + RANGE_MARGIN)
+                clips.append((i, clip_start, clip_end))
+
+        outputs = {i: crops for i, crops, _, _ in work}
+        redrawn = {i: np.zeros(len(st), dtype=bool) for i, _, st, _ in work}
+        if clips:
+            text = prompt.strip() or ("close-up of a real person's face, natural realistic facial features, "
+                                      "sharp clear eyes, detailed natural skin texture, natural mouth")
+            t0 = time.time()
+            # What MiniMaxH3ReferenceToVideo does with no references - once, for every clip.
+            positive = clip.encode_from_tokens_scheduled(clip.tokenize(text, minimax_ref_items=[]))
+            report.append(f"prompt encoded once in {time.time() - t0:.1f}s")
+            _log(report[-1])
+            crops_by = {i: c for i, c, _, _ in work}
+            xform_by = {i: t for i, _, _, t in work}
+            results = {i: c.clone() for i, c in crops_by.items()}
+            for i, clip_start, clip_end in clips:
+                t1 = time.time()
+                rw, rh = self._redraw_clip(model, vae, audio_vae, audio, fps, positive, crops_by[i], xform_by[i],
+                                           clip_start, clip_end, results[i], denoise, steps, seed, sampler_name,
+                                           curve)
+                redrawn[i][clip_start:clip_end] = True
+                report.append(f"person {i} frames {clip_start}-{clip_end - 1} - redrawn at {rw}x{rh}, "
+                              f"{time.time() - t1:.1f}s")
+                _log(report[-1])
+            for i, result in results.items():
+                strength = next(st for j, _, st, _ in work if j == i)
+                keep = torch.from_numpy((strength < KEEP_BELOW) | ~redrawn[i]).to(result.device)
+                keep = keep[:result.shape[0]]
+                result[:keep.shape[0]][keep] = crops_by[i][:keep.shape[0]][keep]
+                outputs[i] = result
+        else:
+            report.append("every tracked face is already large enough - nothing redrawn")
+            _log(report[-1])
+
+        # Stitch weights from the same strength, zero wherever nothing was redrawn.
+        transforms = {}
+        for i, crops, strength, transform in work:
+            t = dict(transform)
+            base = list(t.get("weights") or [1.0] * len(strength))
+            ramp = np.clip(strength / WEIGHT_RAMP, 0.0, 1.0) * redrawn[i]
+            t["weights"] = [float(w) * float(r) for w, r in zip(base, ramp)] + base[len(ramp):]
+            transforms[i] = t
+        report.append(f"node total {time.time() - start:.1f}s")
+        _log(report[-1])
+
+        first = outputs.get(0, subjects.get("crops_0"))
+        crops_out = tuple(outputs.get(i, first) for i in range(MAX_SUBJECTS))
+        first_t = transforms.get(0, subjects.get("transform_0"))
+        xforms = tuple(transforms.get(i, first_t) for i in range(MAX_SUBJECTS))
+        return crops_out + ("\n".join(report),) + xforms
+
+    @staticmethod
+    def _redraw_clip(model, vae, audio_vae, audio, fps, positive, crops, transform, start, end, target,
+                     denoise, steps, seed, sampler_name, curve):
+        import torch.nn.functional as F
+        import nodes
+        from comfy_extras.nodes_custom_sampler import (BasicGuider, BasicScheduler, KSamplerSelect,
+                                                       RandomNoise, SamplerCustomAdvanced)
+        from comfy_extras.nodes_minimax_h3 import _empty_av_latent
+        from . import _pack_module
+        pack = _pack_module()
+
+        span = end - start
+        length = h3_grid(span)
+        pad = length - span
+        frames = crops[start:end, :, :, :3]
+        h, w = frames.shape[1:3]
+        scale = min(1.0, REDRAW_MAX / max(h, w))
+        rh = max(H3_MULTIPLE, int(round(h * scale / H3_MULTIPLE)) * H3_MULTIPLE)
+        rw = max(H3_MULTIPLE, int(round(w * scale / H3_MULTIPLE)) * H3_MULTIPLE)
+        if (h, w) != (rh, rw):
+            frames = F.interpolate(frames.movedim(-1, 1).float(), size=(rh, rw), mode="area").movedim(1, -1)
+        if pad:
+            frames = torch.cat([frames, frames[-1:].repeat(pad, 1, 1, 1)], dim=0)
+
+        # The clip's slice of the tracker's transform; padding frames are marked
+        # absent, so H3PerFrameDenoise gives them zero strength.
+        boxes = list(transform["boxes"])[start:end]
+        sub = dict(transform)
+        sub["boxes"] = boxes + [boxes[-1]] * pad
+        sub["segments"] = [(0, length)]
+        sub["absent"] = (list(transform.get("absent") or [False] * len(transform["boxes"]))[start:end]
+                         + [True] * pad)
+        source = list(transform.get("source") or range(len(transform["boxes"])))[start:end]
+        source = source + [source[-1]] * pad
+
+        latent, _ = _empty_av_latent(rw, rh, length)
+        latent, _ = ComfyLabH3AudioLock().run(latent, audio_vae, audio, transform={"source": source}, fps=fps)
+        latent, _ = pack.H3InjectVideoLatent().run(latent, frames, vae)
+        latent, _, _ = pack.H3PerFrameDenoise().run(model, latent, sub, scale_mode="absolute_px", **curve)
+
+        sigmas = BasicScheduler.execute(model, "simple", steps, denoise).args[0]
+        sampled = SamplerCustomAdvanced.execute(
+            RandomNoise.execute(seed).args[0], BasicGuider.execute(model, positive).args[0],
+            KSamplerSelect.execute(sampler_name).args[0], sigmas, latent).args[0]
+        images = nodes.VAEDecode().decode(vae, sampled)[0][:span]
+        if (h, w) != (rh, rw):
+            images = F.interpolate(images.movedim(-1, 1).float(), size=(h, w), mode="bicubic",
+                                   align_corners=False, antialias=True).movedim(1, -1)
+        target[start:end, :, :, :3] = images.to(target.device, target.dtype).clamp(0.0, 1.0)
+        return rw, rh
 
 
 def _handoff_path(name):
@@ -281,6 +502,7 @@ NODE_CLASS_MAPPINGS = {
     "ComfyLabH3StepCheck": ComfyLabH3StepCheck,
     "ComfyLabSaveRefineCrops": ComfyLabSaveRefineCrops,
     "ComfyLabLoadRefineCrops": ComfyLabLoadRefineCrops,
+    "ComfyLabH3FaceRedraw": ComfyLabH3FaceRedraw,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ComfyLabH3AudioLock": "ComfyLab H3 Audio Lock",
@@ -288,4 +510,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ComfyLabH3StepCheck": "ComfyLab H3 Step Check",
     "ComfyLabSaveRefineCrops": "ComfyLab Save Refine Crops (hand-off)",
     "ComfyLabLoadRefineCrops": "ComfyLab Load Refine Crops (hand-off)",
+    "ComfyLabH3FaceRedraw": "ComfyLab H3 Face Redraw",
 }

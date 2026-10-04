@@ -97,6 +97,19 @@ agrees it's a property of head-size-in-frame, not output resolution
   seconds; it now gets exactly those frames' audio.
   **If we go with the Wan engine instead:** add the same auto-reload of H3
   after a Wan refine (to do, not built).
+  **H3 brought up to the Wan engine's optimisations (2026-10-04)** after a
+  0.6 run put a man's face on the shot-4 mother (job 848f54fc, and again on
+  the original video): person 0's crop strung shot 3 (the builder) and shot
+  4 (the mother) into one clip, H3 kept one face across it, and the prompt
+  it redrew against was the whole 4-shot story (mostly men). Now one node,
+  ComfyLabH3FaceRedraw, like ComfyLabWanFaceRedraw: one clip per person per
+  shot, only the small-face stretch +-4 frames, redrawn at <=512px, prompt
+  encoded once, generic face prompt (as Wan; override still works), frames
+  not redrawn keep their pixels with zero paste weight. H3PerFrameDenoise
+  still sets each clip's per-frame strength (on the clip's slice of the
+  tracking). Not ported: batching same-size clips - H3's mask code
+  (MiniMaxH3._denoise_mask_values) uses the first batch row's mask for
+  every row, so batched clips would share one clip's strengths.
   Later (asked 2026-10-04, not built): a 4-step option using Comfy-Org's
   4-step turbo LoRA (minimax_h3_fl2v_turbo_4step_v1.0_768p, LORA_CHOICES
   "fast" - already on the volume, nothing to download). Roughly halves the

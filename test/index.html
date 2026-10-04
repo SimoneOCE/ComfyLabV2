@@ -664,14 +664,11 @@ async function runJob() {
   statusEl.textContent = 'No active GPU session - click "Run GPU" first. This endpoint no longer accepts jobs without one.';
 }
 
-// H3 engine: always 8 steps (turbo LoRA), redraws against the source video's
-// own prompt, and starts at the pack's 0.4 strength (Wan's default is 0.6).
+// H3 engine: always 8 steps (turbo LoRA) and starts at the pack's 0.4
+// strength (Wan's default is 0.6). Both engines use a generic face prompt.
 function refineEngineChanged(fromUser = true) {
   const h3 = document.getElementById('refineEngine').value === 'h3';
   document.getElementById('refineStepsLabel').style.display = h3 ? 'none' : '';
-  document.getElementById('refinePromptHint').textContent = h3
-    ? 'Prompt override (optional - blank uses the prompt the source video was generated with)'
-    : 'Face prompt override (optional - blank uses a generic face prompt; applies to every person)';
   if (fromUser) {
     const denoise = document.getElementById('refineDenoise');
     denoise.value = h3 ? '0.4' : '0.6';

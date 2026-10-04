@@ -840,7 +840,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 # low-noise 14B model (+ 4-step lightx2v LoRA), at a per-frame strength that
 # leaves faces 120px and up untouched; the pack's H3FaceStitch pastes them
 # back. The pack's own H3 redraw is the second engine ("engine": "h3", see
-# build_h3_refine_payload): its H3PerFrameDenoise model patches broke
+# build_h3_redraw_payload): its H3PerFrameDenoise model patches broke
 # sampling on our ComfyUI (issue #19 on the pack), so that engine keeps the
 # node's per-frame mask and leaves its patches out.
 #
@@ -858,7 +858,7 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 #    "engine": "wan" (default) | "h3"}
 #
 # "engine": "h3" - the pack's own H3 redraw, back as a second engine (see
-# build_h3_refine_payload). Nothing extra to download: it uses the H3 model,
+# build_h3_redraw_payload). Nothing extra to download: it uses the H3 model,
 # turbo LoRA, text encoder and VAEs the engine script already put on the
 # volume, through the generation graph's own loader nodes, so the copy a
 # generation already loaded is reused rather than loaded twice.
@@ -905,27 +905,6 @@ def ensure_wan_refine_files(report_stage=None):
     for spec, sub in missing:
         ensure_model_file(spec, sub)
     return True
-
-
-def find_source_prompt(video_key, hops=3):
-    """The prompt a video was generated with, from the session job that
-    produced it. Follows refine jobs back to the original generation. The H3
-    engine redraws each crop against it (the pack's documented setup)."""
-    for _ in range(hops):
-        rows = sb_get(
-            "comfylab_gpu_session_jobs",
-            {"output->>videoKey": f"eq.{video_key}", "select": "input", "limit": "1"},
-        )
-        if not rows:
-            return None
-        src_input = rows[0].get("input") or {}
-        if src_input.get("prompt") and src_input.get("mode") != REFINE_MODE:
-            return src_input["prompt"]
-        if src_input.get("mode") == REFINE_MODE and src_input.get("source_video_key"):
-            video_key = src_input["source_video_key"]
-            continue
-        return None
-    return None
 
 
 def downscale_video_for_refine(src_path, dst_path, max_w=1344, max_h=768):
@@ -1135,27 +1114,21 @@ def h3_refine_tracker(source, pick, canvas, i):
 
 
 def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None):
-    """Step 1 of 2 of the H3 engine: the pack's own H3 redraw, one per
-    person: Track + Crop -> H3 Reference to Video (the source's prompt) ->
-    audio lock -> Inject Video Latent -> H3PerFrameDenoise -> sampler ->
-    decode. The redrawn crops and their stitch transforms are written to a
-    hand-off file (ComfyLabSaveRefineCrops); step 2 (build_h3_stitch_payload)
-    stitches them in after the worker has unloaded H3 and cleared ComfyUI's
-    cache. Stitching and upscaling a 15s clip with H3 and its text encoder
-    still in RAM (~35GB) ran the worker out of memory (job 1a45f78a).
-
-    H3PerFrameDenoise is in the path and sets every frame's strength: full
-    on faces <= 30px, falling to ZERO at >= 120px, zero where the tracker
-    lost the face - so already-good faces are not redrawn. Its LATENT (that
-    mask) goes to the sampler; its patched MODEL does not. Our ComfyUI
-    applies an H3 per-frame mask natively, and the node's two model patches
-    (written for older ComfyUI) stacked on top sent a negative timestep and
-    then NaN into H3 (pack issue #19). ComfyLabStrengthWeights rebuilds the
-    same curve as stitch weights, so zero-strength frames keep the video's
-    own pixels; ComfyLabH3StepCheck stops the job at the first bad step."""
+    """Step 1 of 2 of the H3 engine: track each person, then one
+    ComfyLabH3FaceRedraw node redraws everyone - built like the Wan engine's
+    node: one clip per person per shot (never across a cut), only the
+    small-face stretch of each shot, at no more than 512px, prompt encoded
+    once. Each clip's per-frame strength comes from the pack's
+    H3PerFrameDenoise (full on faces <= 30px, zero at >= 120px, zero where
+    the face is lost); its latent is used, not its patched model (see
+    comfylab_face_wan/h3_refine.py). The redrawn crops and their stitch
+    transforms are written to a hand-off file; step 2
+    (build_h3_stitch_payload) stitches them in after the worker has unloaded
+    H3 and cleared ComfyUI's cache - stitching and upscaling a 15s clip with
+    H3 and its text encoder still in RAM (~35GB) ran the worker out of memory
+    (job 1a45f78a)."""
     wf = {"r_select": refine_select_node(source_filename)}
     source = ["r_select", 0]
-    audio = ["r_select", 1]
     # The generation graph's own node ids and inputs (workflow_template.json),
     # so ComfyUI's cache hands back the models a generation already loaded.
     base_lora = LORA_CHOICES["turbo"]
@@ -1170,14 +1143,16 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
     wf["h_sage"] = {"class_type": "PathchSageAttentionKJ", "inputs": {
         "model": ["h_lora", 0], "sage_attention": "auto", "allow_compile": False}}
     wf["h_check"] = {"class_type": "ComfyLabH3StepCheck", "inputs": {"model": ["h_sage", 0], "label": "h3 refine"}}
-    wf["h_sampler"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "er_sde"}}
-    wf["h_noise"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}}
-    wf["h_sched"] = {"class_type": "BasicScheduler", "inputs": {
-        "scheduler": "simple", "steps": H3_REFINE_STEPS, "denoise": denoise, "model": ["h_check", 0]}}
-    # Same values for H3PerFrameDenoise and the stitch weights built from it.
-    curve = {"denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
-             "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE,
-             "gamma": 1.0, "smooth_frames": 9}
+    redraw_inputs = {
+        "model": ["h_check", 0], "clip": ["105:13", 0], "vae": ["105:11", 0], "audio_vae": ["105:24", 0],
+        "audio": ["r_select", 1], "fps": ["r_select", 6],
+        "prompt": prompt or "", "denoise": denoise, "steps": H3_REFINE_STEPS, "seed": seed,
+        "sampler_name": "er_sde",
+        # H3PerFrameDenoise's ramp, ending at zero: faces at or above 120px
+        # are left exactly as they are.
+        "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
+        "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE, "gamma": 1.0, "smooth_frames": 9,
+    }
     save_inputs = {"name": handoff_name}
     for i in range(subjects):
         p = f"r{i}_"
@@ -1187,32 +1162,12 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         wf[p + "pick_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pick", 1]}}
         wf[p + "track"] = h3_refine_tracker(source, [p + "pick", 0], canvas, i)
         wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
-        wf[p + "r2v"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
-            "clip": ["105:13", 0], "vae": ["105:11", 0], "audio_vae": ["105:24", 0],
-            "prompt": prompt, "width": [p + "track", 4], "height": [p + "track", 5],
-            "length": [p + "track", 6], "ref_image_size": "match"}}
-        # The transform tells the lock which source frames this crop holds,
-        # so H3 hears the audio of those frames.
-        wf[p + "lock"] = {"class_type": "ComfyLabH3AudioLock", "inputs": {
-            "av_latent": [p + "r2v", 1], "audio_vae": ["105:24", 0], "audio": audio,
-            "transform": [p + "track", 1], "fps": ["r_select", 6]}}
-        wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
-            "av_latent": [p + "lock", 0], "images": [p + "track", 0], "vae": ["105:11", 0]}}
-        wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
-            "model": ["h_check", 0], "av_latent": [p + "inject", 0], "transform": [p + "track", 1],
-            "scale_mode": "absolute_px", **curve}}
-        wf[p + "pfd_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pfd", 1]}}
-        wf[p + "guider"] = {"class_type": "BasicGuider", "inputs": {
-            "model": ["h_check", 0], "conditioning": [p + "r2v", 0]}}
-        wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
-            "noise": ["h_noise", 0], "guider": [p + "guider", 0], "sampler": ["h_sampler", 0],
-            "sigmas": ["h_sched", 0], "latent_image": [p + "pfd", 0]}}
-        wf[p + "decode"] = {"class_type": "VAEDecode", "inputs": {"samples": [p + "sample", 0], "vae": ["105:11", 0]}}
-        wf[p + "weights"] = {"class_type": "ComfyLabStrengthWeights", "inputs": {
-            "transform": [p + "track", 1], **curve}}
-        wf[p + "weights_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "weights", 1]}}
-        save_inputs[f"crops_{i}"] = [p + "decode", 0]
-        save_inputs[f"transform_{i}"] = [p + "weights", 0]
+        redraw_inputs[f"crops_{i}"] = [p + "track", 0]
+        redraw_inputs[f"transform_{i}"] = [p + "track", 1]
+        save_inputs[f"crops_{i}"] = ["r_h3", i]
+        save_inputs[f"transform_{i}"] = ["r_h3", 5 + i]
+    wf["r_h3"] = {"class_type": "ComfyLabH3FaceRedraw", "inputs": redraw_inputs}
+    wf["r_h3_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_h3", 4]}}
     wf["r_select_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_select", 4]}}
     # Same node id as the generation graph's SaveVideo, so submit_and_wait's
     # cancel detection works unchanged.
@@ -1334,16 +1289,13 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         raise ValueError(f"steps must be a whole number, got {job_input.get('steps')!r}")
     if not 2 <= steps <= 8:
         raise ValueError(f"steps must be 2-8, got {steps}")
-    # Wan redraws face crops, not the scene, so it gets a face prompt (the
-    # node's generic one unless overridden) - never the source's H3 prompt.
-    # The H3 engine redraws against the source's own prompt (the pack's setup).
+    # Both engines redraw face crops, not the scene, so they get a face prompt
+    # (the node's generic one unless overridden) - never the source's whole
+    # multi-shot prompt. With it, H3 redrew a shot-4 woman against a prompt
+    # mostly about the men in shots 1-3 (job 848f54fc).
     prompt = (job_input.get("prompt") or "").strip()
     if engine == "h3":
         steps = H3_REFINE_STEPS
-        if not prompt:
-            prompt = find_source_prompt(source_key) or ""
-        if not prompt:
-            raise ValueError(f"No prompt given and none found for {source_key} - pass one in the job")
     stages = {}
     node_rows = []
     t = time.time()
@@ -1455,9 +1407,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         if text:
             reports.append(text[0] if isinstance(text, list) else text)
 
-    extra = ([f"r{i}_{k}" for i in range(subjects) for k in ("pfd_report", "weights_report")]
-             if engine == "h3" else [])
-    for name in ["r_select_report"] + [f"r{i}_pick_report" for i in range(subjects)] + extra:
+    for name in ["r_select_report"] + [f"r{i}_pick_report" for i in range(subjects)] + ["r_h3_report"]:
         text = result.get("outputs", {}).get(name, {}).get("text")
         if text:
             reports.append(text[0] if isinstance(text, list) else text)
