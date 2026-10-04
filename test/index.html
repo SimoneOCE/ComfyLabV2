@@ -250,6 +250,40 @@
   </label>
   <button id="refineBtn" onclick="runRefine()">Refine faces</button>
 
+  <h2>Blind A/B test</h2>
+  <p style="color:#888; font-size:0.85rem;">
+    Paste two video keys in any order. They're shuffled with the browser's cryptographic random
+    generator (a fair coin flip, not Math.random) and shown as A and B. Vote first; the page then
+    reveals which model made each, read from the job's own record. Use the same prompt and seed on
+    both for a fair look test.
+  </p>
+  <label>Video key 1 <input id="abKey1" type="text" placeholder="ee8d7362-545c-458e-b4be-274471e9d6c3.mp4" /></label>
+  <label>Video key 2 <input id="abKey2" type="text" placeholder="....mp4" /></label>
+  <button type="button" onclick="abLoad()">Shuffle and load</button>
+  <div id="abStatus" style="margin:6px 0; font-size:0.9rem;"></div>
+  <div id="abArea" style="display:none;">
+    <div style="display:flex; flex-wrap:wrap; gap:12px;">
+      <div style="flex:1 1 320px; min-width:0;">
+        <h3 style="margin:4px 0;">A</h3>
+        <video id="abVideoA" controls playsinline style="width:100%;"></video>
+        <div id="abRevealA" style="font-size:0.85rem; color:#9c9;"></div>
+      </div>
+      <div style="flex:1 1 320px; min-width:0;">
+        <h3 style="margin:4px 0;">B</h3>
+        <video id="abVideoB" controls playsinline style="width:100%;"></video>
+        <div id="abRevealB" style="font-size:0.85rem; color:#9c9;"></div>
+      </div>
+    </div>
+    <button type="button" onclick="abPlayBoth()">Play both from the start (B muted)</button>
+    <div id="abVoteRow" style="margin-top:8px;">
+      Which looks better?
+      <button type="button" onclick="abVote('A')">A</button>
+      <button type="button" onclick="abVote('B')">B</button>
+      <button type="button" onclick="abVote('tie')">Tie</button>
+    </div>
+    <div id="abTally" style="margin-top:8px; font-size:0.85rem; color:#aaa;"></div>
+  </div>
+
   <h2>Resolve an existing video key</h2>
   <p style="color:#888; font-size:0.85rem;">
     Test/debug the S3 presigned-URL logic against a video you already generated, without paying for
@@ -652,6 +686,91 @@ async function resolveVideoUrl(videoKey) {
     Key: `outputs/${videoKey}`,
     Expires: 3600,
   });
+}
+
+// ---- Blind A/B test ----
+let abPair = null;  // { A: key, B: key, voted: false }
+
+function abCoinFlip() {
+  // One unbiased bit from the platform CSPRNG (no modulo bias: a single bit
+  // of a uniform 32-bit value is exactly 50/50).
+  return (crypto.getRandomValues(new Uint32Array(1))[0] & 1) === 1;
+}
+
+async function abLoad() {
+  const status = document.getElementById('abStatus');
+  const k1 = document.getElementById('abKey1').value.trim();
+  const k2 = document.getElementById('abKey2').value.trim();
+  if (!k1 || !k2) { status.textContent = 'Paste both video keys.'; return; }
+  if (k1 === k2) { status.textContent = 'Those are the same key.'; return; }
+  const swap = abCoinFlip();
+  abPair = { A: swap ? k2 : k1, B: swap ? k1 : k2, voted: false };
+  // Clear the inputs so the order they were pasted in can't give it away.
+  document.getElementById('abKey1').value = '';
+  document.getElementById('abKey2').value = '';
+  for (const id of ['abRevealA', 'abRevealB']) document.getElementById(id).textContent = '';
+  document.getElementById('abVoteRow').style.display = '';
+  try {
+    document.getElementById('abVideoA').src = await resolveVideoUrl(abPair.A);
+    document.getElementById('abVideoB').src = await resolveVideoUrl(abPair.B);
+    document.getElementById('abArea').style.display = '';
+    status.textContent = 'Shuffled. Watch both, then vote.';
+  } catch (err) {
+    status.textContent = `Could not load the videos: ${err.message}`;
+  }
+  abShowTally();
+}
+
+function abPlayBoth() {
+  const a = document.getElementById('abVideoA'), b = document.getElementById('abVideoB');
+  b.muted = true;
+  a.currentTime = 0; b.currentTime = 0;
+  a.play(); b.play();
+}
+
+async function abModelFor(key) {
+  try {
+    const rows = await sbRequest('GET', 'comfylab_gpu_session_jobs', {
+      params: { select: 'output,input', 'output->>videoKey': `eq.${key}`, limit: '1' },
+    });
+    const row = rows && rows[0];
+    if (!row) return 'unknown (no job record)';
+    return (row.output && row.output.model) || (row.input && row.input.model) || 'base (recorded before models were logged)';
+  } catch (err) {
+    return `unknown (${err.message})`;
+  }
+}
+
+async function abVote(choice) {
+  if (!abPair || abPair.voted) return;
+  abPair.voted = true;
+  document.getElementById('abVoteRow').style.display = 'none';
+  const [modelA, modelB] = await Promise.all([abModelFor(abPair.A), abModelFor(abPair.B)]);
+  document.getElementById('abRevealA').textContent = `A was ${modelA} - ${abPair.A}`;
+  document.getElementById('abRevealB').textContent = `B was ${modelB} - ${abPair.B}`;
+  const winner = choice === 'A' ? modelA : choice === 'B' ? modelB : 'tie';
+  document.getElementById('abStatus').textContent =
+    choice === 'tie' ? 'You called it a tie.' : `You picked ${choice}: ${winner}.`;
+  try {
+    const tally = JSON.parse(localStorage.getItem('comfylab_abTally') || '{}');
+    tally[winner] = (tally[winner] || 0) + 1;
+    localStorage.setItem('comfylab_abTally', JSON.stringify(tally));
+  } catch (e) {}
+  abShowTally();
+}
+
+function abShowTally() {
+  let tally = {};
+  try { tally = JSON.parse(localStorage.getItem('comfylab_abTally') || '{}'); } catch (e) {}
+  const parts = Object.entries(tally).map(([k, v]) => `${k}: ${v}`);
+  document.getElementById('abTally').innerHTML = parts.length
+    ? `Running tally (this browser): ${parts.join(', ')} <button type="button" onclick="abResetTally()">Reset</button>`
+    : '';
+}
+
+function abResetTally() {
+  try { localStorage.removeItem('comfylab_abTally'); } catch (e) {}
+  abShowTally();
 }
 
 async function runJob() {
