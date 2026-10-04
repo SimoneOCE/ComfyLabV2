@@ -347,3 +347,16 @@ value one click away:
 
 All three apply to both engines. The 32px small-face strength split (Wan) is
 unchanged.
+
+## Bug: the park friend in pink was skipped (fixed 2026-10-04)
+
+On 813cdb5d (job 7dd06a26) the count found four faces to fix in shot 2
+(61/60/58/56px), but persons 2 and 3 both locked onto a 16px background face,
+so one friend was never redrawn. `ComfyLabFacePickIndex` ranked among ALL faces
+on its lock frame, skipping the shot's "large face" count first. That count is
+the most large faces on screen at once anywhere in the shot, not on the lock
+frame. With faces hovering at the 62px line, the skip overshot past the
+friends onto tiny background people. Now (`_small_face_lock`) it ranks only
+the in-range faces (18 to under 62px), and everyone in a shot locks on the
+same frame, the one with the most in-range faces, so no two people start on
+the same face. Both engines use this node.
