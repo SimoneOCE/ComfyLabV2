@@ -116,6 +116,13 @@ agrees it's a property of head-size-in-frame, not output resolution
   unchanged context, the identity anchor for someone walking toward the
   camera. Ruled out (user, 2026-10-04): giving H3 a reference photo of the
   person's face.
+  **To do (noted 2026-10-04, not built): Stop GPU must kill instantly -
+  force kill, whatever is running.** Today a job in progress is force-killed
+  on Stop (should_force_kill), but the worker's own warmup generations are
+  not: the post-H3-refine reload (~47s), the session-start warmup and the
+  re-warm after a ComfyUI crash all call run_generation without
+  should_force_kill, so a Stop during one waits for it to finish - and that
+  GPU time is billed. Pass the same session-stopped check to all of them.
   Later (asked 2026-10-04, not built): a 4-step option using Comfy-Org's
   4-step turbo LoRA (minimax_h3_fl2v_turbo_4step_v1.0_768p, LORA_CHOICES
   "fast" - already on the volume, nothing to download). Roughly halves the
