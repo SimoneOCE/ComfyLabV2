@@ -360,3 +360,8 @@ friends onto tiny background people. Now (`_small_face_lock`) it ranks only
 the in-range faces (18 to under 62px), and everyone in a shot locks on the
 same frame, the one with the most in-range faces, so no two people start on
 the same face. Both engines use this node.
+
+Then 60/62 -> 60/65 (jobs 3e107710 / 75075b9e, 0.3 and 0.4): with the pick
+fix all four friends were redrawn, but the woman on the left (59-63px) was 62px+
+for the first ~16 frames of her shot, so those kept the original face. 65 covers
+her max of 63 (the paste is full up to ~64px).
