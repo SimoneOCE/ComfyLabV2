@@ -139,6 +139,9 @@ agrees it's a property of head-size-in-frame, not output resolution
     vs 8.6-12s), but it also found a 16px "face" on ~5 frames near 311 that
     the counter makes a 4th person. Bumped to 1280 (user, 2026-10-04) - watch
     for extra faces. Both engines.
+  - Wan steps: 4 is the default again (user, 2026-10-04). Redraw time on
+    cba2f8ef at 0.6: 4 steps 90.5s, 3 steps 82.6-93.1s, 2 steps 66.0s (2
+    looked okay; ~20s saved, ~10% of the refine). 3/2 stay as test options.
   - H3 steps: 8 (8-step turbo LoRA, default), or 4/3/2 with the 4-step
     768p turbo LoRA - to be compared (roadmap step 1).
   - Decision: if H3 is chosen, the Wan engine gets removed.
