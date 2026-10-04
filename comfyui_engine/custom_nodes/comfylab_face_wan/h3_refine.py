@@ -277,7 +277,12 @@ class ComfyLabH3FaceRedraw:
                 "gamma": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 4.0}),
                 "smooth_frames": ("INT", {"default": 9, "min": 1, "max": 61}),
             },
-            "optional": optional,
+            "optional": {
+                **optional,
+                # Off: one clip per person over their whole track, across cuts -
+                # the pack's (and the first H3 engine's) behaviour. For testing.
+                "split_shots": ("BOOLEAN", {"default": True}),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",) * MAX_SUBJECTS + ("STRING",) + ("H3FACEXFORM",) * MAX_SUBJECTS
@@ -288,7 +293,7 @@ class ComfyLabH3FaceRedraw:
 
     def redraw(self, model, clip, vae, audio_vae, audio, fps, prompt, denoise, steps, seed, sampler_name,
                denoise_multiplier_small_face, denoise_multiplier_large_face, face_px_small, face_px_large,
-               gamma, smooth_frames, **subjects):
+               gamma, smooth_frames, split_shots=True, **subjects):
         import time
         start = time.time()
         curve = dict(denoise_multiplier_small_face=denoise_multiplier_small_face,
@@ -317,7 +322,8 @@ class ComfyLabH3FaceRedraw:
         clips = []
         for i, crops, strength, transform in work:
             n = len(strength)
-            for a, b in (transform.get("segments") or [(0, n)]):
+            segments = (transform.get("segments") or [(0, n)]) if split_shots else [(0, n)]
+            for a, b in segments:
                 a, b = max(0, int(a)), min(n, int(b))
                 if b > a and (strength[a:b] >= KEEP_BELOW).any():
                     clips.append((i, a, b))
@@ -400,7 +406,13 @@ class ComfyLabH3FaceRedraw:
         boxes = list(transform["boxes"])[start:end]
         sub = dict(transform)
         sub["boxes"] = boxes + [boxes[-1]] * pad
-        sub["segments"] = [(0, length)]
+        # The clip's own shot boundaries (one when split per shot), shifted to
+        # the clip and capped by the padding.
+        sub["segments"] = [(max(0, int(a) - start), min(span, int(b) - start))
+                           for a, b in (transform.get("segments") or [(0, len(transform["boxes"]))])
+                           if int(b) > start and int(a) < end] or [(0, span)]
+        if pad:
+            sub["segments"] = sub["segments"] + [(span, length)]
         sub["absent"] = (list(transform.get("absent") or [False] * len(transform["boxes"]))[start:end]
                          + [True] * pad)
         source = list(transform.get("source") or range(len(transform["boxes"])))[start:end]

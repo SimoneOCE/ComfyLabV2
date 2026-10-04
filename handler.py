@@ -1113,7 +1113,8 @@ def h3_refine_tracker(source, pick, canvas, i):
         "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
 
 
-def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None):
+def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None,
+                            split_shots=True):
     """Step 1 of 2 of the H3 engine: track each person, then one
     ComfyLabH3FaceRedraw node redraws everyone - built like the Wan engine's
     node: one clip per person per shot (never across a cut; the whole shot,
@@ -1152,6 +1153,7 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         # are left exactly as they are.
         "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
         "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE, "gamma": 1.0, "smooth_frames": 9,
+        "split_shots": bool(split_shots),
     }
     save_inputs = {"name": handoff_name}
     for i in range(subjects):
@@ -1294,6 +1296,9 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     # multi-shot prompt. With it, H3 redrew a shot-4 woman against a prompt
     # mostly about the men in shots 1-3 (job 848f54fc).
     prompt = (job_input.get("prompt") or "").strip()
+    # H3 only, for testing: false = one clip per person across cuts (the first
+    # H3 engine's behaviour) instead of one per person per shot.
+    split_shots = job_input.get("split_shots", True) is not False
     if engine == "h3":
         steps = H3_REFINE_STEPS
     stages = {}
@@ -1354,7 +1359,8 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             handoff_path = os.path.join(COMFYUI_DIR, "temp", "refine_handoff", f"{handoff}.pt")
             t = time.time()
             redraw = submit_and_wait(
-                build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas),
+                build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas,
+                                        split_shots),
                 should_cancel=should_cancel, should_force_kill=should_force_kill)
             stages["comfy_h3_redraw"] = time.time() - t
             if redraw.get("force_killed") or redraw.get("cancelled"):
@@ -1429,6 +1435,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         "videoKey": video_key,
         "mode": REFINE_MODE,
         "engine": engine,
+        "split_shots": split_shots if engine == "h3" else None,
         "first_time_download": downloaded,
         "canvas": canvas or "auto",
         "steps": steps,
