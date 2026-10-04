@@ -449,3 +449,16 @@ and its own turbo LoRA (`minimax_h3_ref2v_turbo_4step_v0.1`). The installed
 fl2va model only does text and start/end frames. Pending the user's call on
 download, load and RAM. The worker's existing single `ref_image` path would
 run reference conditioning on the fl2va model, which isn't what it's for.
+
+## DaSiWa Hybrid V3 back as a per-session model (test, 2026-10-04)
+
+Test page "H3 model for this session" dropdown, sent as `model` with the
+session-start job. `run_session` downloads it to the volume if missing (21GB,
+gated repo, uses the endpoint's HF_TOKEN), then the warmup, every re-warm,
+the post-refine reload, every generation without its own `model`, and the H3
+refine engine all use it, so a session only ever has one H3 model loaded.
+Purpose: an aesthetics A/B against base (the only earlier comparison,
+cba2f8ef vs 7f224640, differed in attention mode too), turbo compatibility
+(never tested on DaSiWa), then start/end frames and reference images. If it
+wins, it can be the single model and reference images need no second
+checkpoint or swapping.

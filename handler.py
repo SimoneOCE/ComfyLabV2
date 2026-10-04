@@ -374,6 +374,19 @@ def save_input_image(b64_data, prefix):
 # are an H3 limit on small heads (see PROMPT_FRAMING_RULES.md).
 MODEL_CHOICES = {
     "base": {"filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
+    # Back for a second look (user, 2026-10-04): an aesthetics A/B and, if it
+    # holds up, one model for text, start/end frames AND reference images -
+    # it's an FL2VA+Ref2VA hybrid, a community fine-tune (production's
+    # koboldcpp runs its V1). Same pruned int8 ConvRot layout and ~21GB as
+    # base (headers inspected in the bake-off), so speed and memory match.
+    # Chosen per session at Start GPU (job field "model" on the session
+    # start), downloaded to the volume on the first session that picks it.
+    # Gated repo: needs the endpoint's HF_TOKEN with its terms accepted.
+    "dasiwa_v3": {
+        "filename": "dasiwa_minimax_h3_hybrid_v3_int8_convrot.safetensors",
+        "repo": "darksidewalker/MiniMaxH3",
+        "repo_path": "model/DasiwaMinimaxH3_dasiwaHybridV3_3263052-INT8 ConvRot.safetensors",
+    },
 }
 
 
@@ -1208,7 +1221,7 @@ def h3_refine_tracker(source, pick, canvas, i, tune):
 
 
 def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None,
-                            split_shots=False, steps=H3_REFINE_STEPS, tune=None):
+                            split_shots=False, steps=H3_REFINE_STEPS, tune=None, h3_model="base"):
     """Step 1 of 2 of the H3 engine: track each person, then one
     ComfyLabH3FaceRedraw node redraws everyone - built like the Wan engine's
     node: one clip per person per shot (never across a cut; the whole shot,
@@ -1229,7 +1242,7 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
     # so ComfyUI's cache hands back the models a generation already loaded.
     base_lora = LORA_CHOICES[H3_REFINE_STEP_LORAS[steps]]
     wf["105:6"] = {"class_type": "UNETLoader", "inputs": {
-        "unet_name": MODEL_CHOICES["base"]["filename"], "weight_dtype": "default"}}
+        "unet_name": MODEL_CHOICES[h3_model]["filename"], "weight_dtype": "default"}}
     wf["105:13"] = {"class_type": "CLIPLoader", "inputs": {
         "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}}
     wf["105:11"] = {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}}
@@ -1381,6 +1394,10 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     if not 0.05 <= small_denoise <= 1.0:
         raise ValueError(f"small_denoise must be between 0.05 and 1.0, got {small_denoise}")
     tune = refine_tuning(job_input)
+    # The H3 engine reuses the session's loaded H3 (set by run_session).
+    h3_model = job_input.get("model") or "base"
+    if h3_model not in MODEL_CHOICES:
+        raise ValueError(f"Unknown model {h3_model!r}")
     seed = resolve_seed(job_input.get("seed"))
     canvas = job_input.get("canvas")
     if canvas in (None, "", "auto"):
@@ -1475,7 +1492,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             t = time.time()
             redraw = submit_and_wait(
                 build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas,
-                                        split_shots, steps, tune),
+                                        split_shots, steps, tune, h3_model),
                 should_cancel=should_cancel, should_force_kill=should_force_kill)
             stages["comfy_h3_redraw"] = time.time() - t
             if redraw.get("force_killed") or redraw.get("cancelled"):
@@ -1729,17 +1746,23 @@ def finish_job(job_row_id, output):
         print(f"Could not write final result for job {job_row_id}: {e}")
 
 
-def run_session(session_id):
-    """The held-open loop - see the module docstring above this section."""
+def run_session(session_id, model="base"):
+    """The held-open loop - see the module docstring above this section.
+    model: the H3 model this session loads (MODEL_CHOICES key). The warmup,
+    every re-warm and every generation without its own "model" use it."""
     session_start = time.time()
     last_activity = time.time()
     last_heartbeat = 0.0
     jobs_processed = 0
-    print(f"Session {session_id}: held-open loop starting.")
+    print(f"Session {session_id}: held-open loop starting (model: {model}).")
 
     try:
         ensure_comfyui_engine()
         symlink_models_to_volume()
+        t = time.time()
+        ensure_model_file(MODEL_CHOICES[model], "diffusion_models")  # no-op once on the volume
+        if time.time() - t > 5:
+            print(f"Session {session_id}: downloaded the {model} model in {round(time.time() - t)}s.")
         start_comfyui_if_needed()
     except Exception as e:
         print(f"Session {session_id}: ComfyUI failed to start ({e}) - ending session.")
@@ -1766,9 +1789,10 @@ def run_session(session_id):
             "height": 320,
             "duration": 1.0,
             "steps": 1,
+            "model": model,
         }, upload=False)
         warmup_seconds = round(time.time() - warmup_start, 1)
-        print(f"Session {session_id}: warmup generation done ({warmup_seconds}s).")
+        print(f"Session {session_id}: warmup generation done ({warmup_seconds}s, model {model}).")
     except Exception as e:
         print(f"Session {session_id}: warmup generation failed, continuing anyway ({e}).")
 
@@ -1781,6 +1805,7 @@ def run_session(session_id):
             "session_id": session_id,
             "jobs_processed": jobs_processed,
             "warmup_seconds": warmup_seconds,
+            "model": model,
             "session_duration_seconds": round(time.time() - session_start, 1),
         }
         summary.update(extra)
@@ -1844,10 +1869,13 @@ def run_session(session_id):
                 if (job_row["input"] or {}).get("mode") == REFINE_MODE:
                     job_runner = run_face_refine
                     runner_kwargs["report_stage"] = lambda text: set_job_stage(job_row["id"], text)
+                    job_input = {"model": model, **(job_row["input"] or {})}
                 else:
                     job_runner = run_generation
+                    # A generation without its own "model" uses the session's.
+                    job_input = {"model": model, **(job_row["input"] or {})}
                 result = job_runner(
-                    job_row["input"],
+                    job_input,
                     should_cancel=lambda: is_job_cancel_requested(job_row["id"]),
                     should_force_kill=lambda: (
                         is_job_force_cancel_requested(job_row["id"])
@@ -1890,6 +1918,7 @@ def run_session(session_id):
                     "height": 320,
                     "duration": 1.0,
                     "steps": 1,
+                    "model": model,
                 }, upload=False)
             except Exception as e:
                 print(f"Session {session_id}: failed to restart after ComfyUI {reason} ({e}) - ending session.")
@@ -1908,6 +1937,7 @@ def run_session(session_id):
                     "height": 320,
                     "duration": 1.0,
                     "steps": 1,
+                    "model": model,
                 }, upload=False)
                 print(f"Session {session_id}: H3 reloaded after the face refine "
                       f"({round(time.time() - reload_start, 1)}s).")
@@ -1936,7 +1966,10 @@ def handler(job):
     if not session_id:
         return {"error": "This endpoint only accepts session-mode jobs (session_id required). Start a GPU session first."}
 
-    return run_session(session_id)
+    model = job_input.get("model") or "base"
+    if model not in MODEL_CHOICES:
+        return {"error": f"Unknown model {model!r} - this worker supports {sorted(MODEL_CHOICES)}"}
+    return run_session(session_id, model)
 
 
 runpod.serverless.start({"handler": handler})

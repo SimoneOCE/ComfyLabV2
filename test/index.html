@@ -141,6 +141,12 @@
   <label>Supabase Anon Key
     <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
   </label>
+  <label>H3 model for this session (picked at Run GPU; the warmup and every generation use it)
+    <select id="sessionModel">
+      <option value="base" selected>Base - MiniMax official (current default)</option>
+      <option value="dasiwa_v3">DaSiWa Hybrid V3 - community fine-tune, text + start/end + reference (first session downloads ~21GB)</option>
+    </select>
+  </label>
   <button id="gpuSessionBtn" onclick="toggleGpuSession()">Run GPU</button>
   <div id="gpuSessionStatus" style="margin-top:8px; font-size:0.85rem; color:#9c9;">No session.</div>
 
@@ -529,7 +535,7 @@ async function toggleGpuSession() {
     const runResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({ input: { session_id: sessionId } }),
+      body: JSON.stringify({ input: { session_id: sessionId, model: document.getElementById('sessionModel').value } }),
     });
     const runData = await runResp.json();
     if (!runData.id) {
