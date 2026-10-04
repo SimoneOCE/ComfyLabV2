@@ -466,7 +466,8 @@ class ComfyLabSmallFaceCount:
             big = f" - too big, left alone: {', '.join(big)}" if big else ""
             lines.append(f"shot {k + 1}: {sm} small face(s), {lg} large{px}{big}")
         if face_px_min > 0:
-            lines.append(f"faces under {face_px_min:.0f}px or from {face_px_large:.0f}px up are left alone")
+            lines.append(f"faces under {face_px_min:.0f}px or from {face_px_large:.0f}px up are left alone "
+                         f"(a person already being fixed is followed below {face_px_min:.0f}px)")
         if found > people:
             lines.append(f"{found} small faces in one shot - the {people} largest of them are refined")
         report = "\n".join(lines)
@@ -474,27 +475,82 @@ class ComfyLabSmallFaceCount:
         return (people, report)
 
 
-def _small_face_lock(boxes, a, b, index, face_px_large, face_px_min=0.0):
-    """(frame, box) for person `index` in shot [a, b): the index-th largest
-    face from face_px_min up to under face_px_large, on the FIRST frame of the
-    shot holding that many such faces (the pack's own lock rule, ranked over
-    in-range faces only). (-1, -1) if no frame holds that many.
+def _in_range(boxes_f, face_px_large, face_px_min):
+    """[(height, box index)] of the faces in range on one frame, largest first
+    (ties left to right so ranks don't swap)."""
+    inside = [(float(q[3]) - float(q[1]), j) for j, q in enumerate(boxes_f)
+              if face_px_min <= float(q[3]) - float(q[1]) < face_px_large]
+    inside.sort(key=lambda hj: (-hj[0], float(boxes_f[hj[1]][0])))
+    return inside
 
-    Not "the frame with the most faces": tried that so all people shared a
-    lock frame, but on Alpha Timber (cba2f8ef) that frame was 329, near the
-    end of the family shot where a stray 4th face shows up - tracked back
-    from there the father was lost and the daughter's slot sat on a face
-    seen on 13 frames, so she wasn't fixed. Locked at the shot's start (264)
-    she was tracked on 94 frames. Two people landing on one face is what the
-    duplicate check is for."""
-    for f in range(int(a), min(int(b), len(boxes))):
-        inside = [(float(q[3]) - float(q[1]), j) for j, q in enumerate(boxes[f])
-                  if face_px_min <= float(q[3]) - float(q[1]) < face_px_large]
-        if len(inside) > index:
-            # Largest first; ties left to right so ranks don't swap.
-            inside.sort(key=lambda hj: (-hj[0], float(boxes[f][hj[1]][0])))
-            return f, inside[index][1]
-    return -1, -1
+
+def _centre(q):
+    return (float(q[0]) + float(q[2])) / 2.0, (float(q[1]) + float(q[3])) / 2.0
+
+
+def _follow(boxes, frame, box, to_frame):
+    """Where the face at (frame, box) is on to_frame (>= frame): stepped
+    forward one frame at a time to the nearest detection within a face
+    height, staying put across frames where there is none. A rough stand-in
+    for the tracker's continuity, good enough to tell which face is whose a
+    few frames apart."""
+    cx, cy = _centre(boxes[frame][box])
+    h = float(boxes[frame][box][3]) - float(boxes[frame][box][1])
+    for f in range(frame + 1, to_frame + 1):
+        best, best_d = None, None
+        for q in boxes[f]:
+            qx, qy = _centre(q)
+            d = ((qx - cx) ** 2 + (qy - cy) ** 2) ** 0.5
+            if d <= max(h, 1.0) and (best_d is None or d < best_d):
+                best, best_d = q, d
+        if best is not None:
+            cx, cy = _centre(best)
+            h = float(best[3]) - float(best[1])
+    return cx, cy, h
+
+
+def _small_face_lock(boxes, a, b, index, face_px_large, face_px_min=0.0):
+    """(frame, box) for person `index` in shot [a, b), or (-1, -1) if no
+    frame holds that many faces in range (face_px_min up to under
+    face_px_large).
+
+    People are settled in order. Person j locks on the FIRST frame of the
+    shot holding j+1 in-range faces (the pack's own lock rule) and takes the
+    largest in-range face there that persons 0..j-1 haven't already got -
+    their faces followed forward from their own lock frames.
+
+    Why each part:
+    - first frame, not "the frame with the most faces": that put everyone's
+      lock near the end of the Alpha Timber family shot (cba2f8ef, frame 329,
+      where a stray 4th face appears); tracked back from there the daughter
+      was never fixed.
+    - skipping faces already taken, not plain "j-th largest": on the family
+      clip (da2f6e17) the three faces are ~29/29/26px, the size order
+      shuffles between frames, and person 2's 3rd-largest on frame 3 was
+      person 0's face - the duplicate check dropped it and the father was
+      never fixed."""
+    taken = []  # (frame, box) per earlier person
+    for j in range(index + 1):
+        lock = None
+        for f in range(int(a), min(int(b), len(boxes))):
+            inside = _in_range(boxes[f], face_px_large, face_px_min)
+            if len(inside) <= j:
+                continue
+            others = []
+            for tf, tb in taken:
+                cx, cy, h = _follow(boxes, tf, tb, f)
+                near = min(range(len(boxes[f])), key=lambda k: (
+                    (_centre(boxes[f][k])[0] - cx) ** 2 + (_centre(boxes[f][k])[1] - cy) ** 2))
+                others.append(near)
+            free = [k for _, k in inside if k not in others]
+            # Everyone in range already taken (a person counted twice):
+            # fall back to rank j - the duplicate check drops it later.
+            lock = (f, free[0] if free else inside[j][1])
+            break
+        if lock is None:
+            return -1, -1
+        taken.append(lock)
+    return taken[index]
 
 
 class ComfyLabFacePickIndex:

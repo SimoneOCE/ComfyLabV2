@@ -874,7 +874,12 @@ REFINE_MAX_SUBJECTS = 4            # most people refined per shot (the largest s
 # sizes the face count now logs.
 # 2026-10-04: floor 22 -> 18 - on Alpha Timber the daughter measured 20-24px,
 # so 22 skipped her on part of the shot.
-REFINE_FACE_PX_MIN = 18.0          # smaller faces are ignored: not counted, tracked or pasted
+REFINE_FACE_PX_MIN = 18.0          # smaller faces are ignored: not counted or picked as a person
+# Once a person IS being tracked, their face keeps being fixed down to this
+# (user, 2026-10-04): on the family clip (da2f6e17) all three faces shrink to
+# 15-17px near the end, and at 18px those frames kept the melted original.
+# Background people stay out - they're never picked (REFINE_FACE_PX_MIN).
+REFINE_FACE_PX_MIN_TRACKED = 12.0
 # Wan: a clip (person x shot) whose face is typically under this gets the
 # small-face strength instead. 0.3 looked best on most faces but was too gentle
 # on the Alpha Timber mother (23-30px) and daughter (20-24px), where 0.6 was
@@ -1117,7 +1122,7 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         # The pack's H3PerFrameDenoise ramp, ending at zero: faces at or
         # above 120px are left exactly as they are.
         "face_px_small": tune["face_px_small"], "face_px_large": tune["face_px_large"], "smooth_frames": 9,
-        "face_px_min": REFINE_FACE_PX_MIN,
+        "face_px_min": REFINE_FACE_PX_MIN_TRACKED,
         # Per clip: small_denoise when the face is typically under
         # REFINE_FACE_PX_TINY, denoise otherwise.
         "small_denoise": small_denoise, "small_face_px": REFINE_FACE_PX_TINY,
@@ -1238,7 +1243,7 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         # are left exactly as they are.
         "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
         "face_px_small": tune["face_px_small"], "face_px_large": tune["face_px_large"], "gamma": 1.0,
-        "smooth_frames": 9, "face_px_min": REFINE_FACE_PX_MIN,
+        "smooth_frames": 9, "face_px_min": REFINE_FACE_PX_MIN_TRACKED,
         "split_shots": bool(split_shots),
         # The detector's own face boxes, for the duplicate-person check.
         "face_pick": ["r_select", 2],

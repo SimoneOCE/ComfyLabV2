@@ -395,3 +395,25 @@ frames 268, 311-312 and 314. `gaps.py` now treats gaps of up to 8 frames
 are only raised, so real dropouts (face turned away, left the shot) and shot
 edges fade exactly as before. Both engines; the subject line in the report
 says how many frames were bridged.
+
+## Family clip: father skipped, faces lost at the end (fixed 2026-10-04)
+
+Job 3d29b7fd on da2f6e17 (the 7s family clip):
+
+1. Person 2 landed on person 0's face, so the duplicate check dropped it and
+   the father was never fixed. The three faces are ~29/29/26px, so the size
+   order shuffles frame to frame, and "3rd largest on frame 3" was person 0's
+   face. People are now settled in order: person j still locks on the first
+   frame holding j+1 in-range faces, but takes the largest face there that
+   persons 0..j-1 haven't got (their faces followed forward from their own
+   lock frames). Side effect on Alpha Timber: the 4th slot now goes to the
+   stray small face that appears late in the family shot (possibly the
+   reflection in the glass door) instead of doubling up on the daughter.
+2. All three faces shrink to 15-17px near the end, under the 18px floor, so
+   those frames kept the melted original. 18px still decides who counts and
+   gets picked as a person (background people stay out), but a person being
+   tracked is now fixed down to 12px (`REFINE_FACE_PX_MIN_TRACKED`). Risk: a
+   tracker that drifts onto a tiny background face mid-shot would get it
+   redrawn.
+
+The 8-frame gap fill (`gaps.py`) stays, by the user's choice.
