@@ -133,9 +133,12 @@ agrees it's a property of head-size-in-frame, not output resolution
     nothing. If it needs fixing: send H3 only that shot's part of the scene
     prompt (needs detected cuts matched to the prompt's shot numbers).
   - The girl's face (smallest, 23-29px) flickers back to melted near the end:
-    the detector misses it on a few frames (308, 353-356, 360). Detector now
-    runs at 960px instead of 640 (face_detector.py) - a 23px face reached it
-    at ~11px, now ~16px. Adds ~5-10s to face finding. Both engines.
+    the detector misses it on a few frames (308, 353-356, 360). Detector at
+    960px instead of 640 (face_detector.py; a 23px face reached it at ~11px,
+    then ~16px): her missed frames 6 -> 1, no measurable time cost (8.5-13s
+    vs 8.6-12s), but it also found a 16px "face" on ~5 frames near 311 that
+    the counter makes a 4th person. Bumped to 1280 (user, 2026-10-04) - watch
+    for extra faces. Both engines.
   - H3 steps: 8 (8-step turbo LoRA, default), or 4/3/2 with the 4-step
     768p turbo LoRA - to be compared (roadmap step 1).
   - Decision: if H3 is chosen, the Wan engine gets removed.

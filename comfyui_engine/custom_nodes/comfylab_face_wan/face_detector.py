@@ -1,12 +1,15 @@
-"""Runs the face detector at 960px instead of its 640px default.
+"""Runs the face detector at 1280px instead of its 640px default.
 
 ComfyUI-H3-FaceRefine's H3 Load Video + Face Select calls the detector
 (face_yolov8m) with ultralytics' defaults, which shrink every frame to 640px
 wide first. Our frames are 1344 wide, so a 23px face reaches the detector at
 ~11px and is missed now and then - the smallest face in a shot flickers back
-to its unfixed self on those frames (the girl in cba2f8ef's last shot). At
-960 it's ~16px, where this detector is reliable. Detection runs once per
-refine; the step goes from ~10s to ~15-20s for a 15s clip.
+to its unfixed self on those frames (the girl in cba2f8ef's last shot). 960
+(~16px) cut her missed frames from 6 to 1 at no measurable time cost
+(face finding 8.5-13s vs 8.6-12s at 640), but also picked up a 16px
+"face" seen on ~5 frames that the refine counts as a 4th person. 1280
+(~22px, near her real size) at the user's request (2026-10-04) - watch for
+more such extra faces.
 
 Done by wrapping the pack's _load_detector (a module global, so H3FaceSelect
 picks it up) and setting imgsz in the returned model's overrides, which
@@ -15,7 +18,7 @@ ultralytics merges into every predict call. The pack's code is unchanged.
 
 import logging
 
-DETECTOR_IMGSZ = 960
+DETECTOR_IMGSZ = 1280
 
 
 def install(pack):
