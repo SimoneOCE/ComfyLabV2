@@ -145,6 +145,24 @@ agrees it's a property of head-size-in-frame, not output resolution
   - H3 steps: 8 (8-step turbo LoRA, default), or 4/3/2 with the 4-step
     768p turbo LoRA - to be compared (roadmap step 1).
   - Decision: if H3 is chosen, the Wan engine gets removed.
+  **Decision (user, 2026-10-04): no automatic face fixing - "Fix faces"
+  stays a button the user presses after generation.** Face size is not a
+  reliable sign that a face is broken: on the Shrek video (51245f65, job
+  3b73aab9, Wan 0.6 / 4 steps) Lord Farquaad's ~27-111px face already
+  looked fine and the refine degraded it. Roadmap step 3 (auto-fix during
+  generation) is dropped; the faces-at-every-distance test is still useful
+  for the default size range.
+  Same job: both tracked "people" had identical tracks (175 frames, face
+  27-111px, mean strength 0.65) - two trackers on Farquaad's face, so he was
+  redrawn and pasted twice. The duplicate-tracker check (drop a person whose
+  face centre sits on an earlier person's for >half the shot) was declined
+  when this only showed on a refine-of-a-refine; this was an original video.
+  Not built - user to decide.
+  Stylised/cartoon videos: the generic face prompt asks for a realistic face.
+  Before production, gate the button on the video's style - most reliable:
+  the prompt enhancer outputs a fixed style label (photoreal / animated)
+  stored with each generation; fallback for videos without one: a quick
+  image check (CLIP) on a few frames, hiding the button when unsure.
   **To do (noted 2026-10-04, not built): Stop GPU must kill instantly -
   force kill, whatever is running.** Today a job in progress is force-killed
   on Stop (should_force_kill), but the worker's own warmup generations are
