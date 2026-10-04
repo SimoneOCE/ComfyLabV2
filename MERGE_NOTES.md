@@ -462,3 +462,18 @@ cba2f8ef vs 7f224640, differed in attention mode too), turbo compatibility
 (never tested on DaSiWa), then start/end frames and reference images. If it
 wins, it can be the single model and reference images need no second
 checkpoint or swapping.
+
+## Decision: base stays the text-to-video model (user, 2026-10-04)
+
+After the blind A/B (Batman too close to call; fisherman close-up DaSiWa by a
+landslide; cycling base narrowly, "cleaner, less movement" vs DaSiWa's "more
+motion, actually pedalling") and the Flash/Dora rerun of the user's favourite
+base generation (a9f8afdc) on DaSiWa, the user called it: base wins for
+text-to-video, "no contest". Base stays the default for text and start/end
+frames. Reference images go ahead on the swap plan: a reference job loads a
+reference-capable model and the next normal job swaps back. Which model that is
+(official Ref2VA or DaSiWa) is still open; a RunPod pod test of Ref2VA with the
+Fun ControlNet Union template (motion transfer, Higgsfield Genjutsu-style) is
+under way and will inform it. The DaSiWa session option stays on the test page
+for now. Not built yet: the idle-timer fix (idle clock should start after the
+warmup, not before a first-time download) and the reference-image UI.
