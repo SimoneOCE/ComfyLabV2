@@ -145,6 +145,12 @@
   <label>Video key to refine (fills in with your latest result)
     <input id="refineVideoKey" type="text" placeholder="938602e6-1f35-45bb-afb2-578061b00562.mp4" />
   </label>
+  <label>Engine
+    <select id="refineEngine" onchange="refineEngineChanged()">
+      <option value="wan" selected>Wan - site default</option>
+      <option value="h3">H3 (testing) - the pack's own H3 redraw; per-frame strength via H3PerFrameDenoise, 8 steps, nothing to download</option>
+    </select>
+  </label>
   <label>People to refine
     <select id="refineSubjects">
       <option value="auto" selected>Auto - site default (counts the small faces, up to 4 per shot)</option>
@@ -168,13 +174,13 @@
       <option value="384">Fast - fixed 384px, ~2x faster redraw, less detail per face (testing)</option>
     </select>
   </label>
-  <label>Redraw steps
+  <label id="refineStepsLabel">Redraw steps
     <select id="refineSteps">
       <option value="3" selected>3 - site default</option>
       <option value="4">4 - what the speed-up LoRA is built for (~25% slower redraw)</option>
     </select>
   </label>
-  <label>Face prompt override (optional - blank uses a generic face prompt; applies to every person)
+  <label><span id="refinePromptHint">Face prompt override (optional - blank uses a generic face prompt; applies to every person)</span>
     <textarea id="refinePrompt" placeholder="(generic face prompt)"></textarea>
   </label>
   <button id="refineBtn" onclick="runRefine()">Refine faces</button>
@@ -203,7 +209,7 @@ const PERSISTED_FIELDS = [
   'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
-  'refineVideoKey', 'refineSubjects', 'refineDenoise', 'refineCanvas', 'refineSteps',
+  'refineVideoKey', 'refineEngine', 'refineSubjects', 'refineDenoise', 'refineCanvas', 'refineSteps',
 ];
 
 // Show/hide toggle for the key fields. Defaults to shown; the choice is
@@ -249,6 +255,7 @@ function wireUpPersistence() {
 }
 
 loadPersistedFields();
+refineEngineChanged(false);
 wireUpPersistence();
 
 // A saved value that's no longer an option (e.g. "sparse" after it was
@@ -657,6 +664,21 @@ async function runJob() {
   statusEl.textContent = 'No active GPU session - click "Run GPU" first. This endpoint no longer accepts jobs without one.';
 }
 
+// H3 engine: always 8 steps (turbo LoRA), redraws against the source video's
+// own prompt, and starts at the pack's 0.4 strength (Wan's default is 0.6).
+function refineEngineChanged(fromUser = true) {
+  const h3 = document.getElementById('refineEngine').value === 'h3';
+  document.getElementById('refineStepsLabel').style.display = h3 ? 'none' : '';
+  document.getElementById('refinePromptHint').textContent = h3
+    ? 'Prompt override (optional - blank uses the prompt the source video was generated with)'
+    : 'Face prompt override (optional - blank uses a generic face prompt; applies to every person)';
+  if (fromUser) {
+    const denoise = document.getElementById('refineDenoise');
+    denoise.value = h3 ? '0.4' : '0.6';
+    denoise.dispatchEvent(new Event('input'));  // so the remembered value follows
+  }
+}
+
 async function runRefine() {
   const btn = document.getElementById('refineBtn');
   const statusEl = document.getElementById('status');
@@ -683,6 +705,7 @@ async function runRefine() {
     denoise: Number(document.getElementById('refineDenoise').value),
     canvas: document.getElementById('refineCanvas').value,
     steps: Number(document.getElementById('refineSteps').value),
+    engine: document.getElementById('refineEngine').value,
   };
   const seedRaw = document.getElementById('seed').value.trim();
   if (seedRaw !== '') {

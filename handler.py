@@ -839,8 +839,10 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 # a canvas; our comfylab_face_wan node redraws those crops with Wan 2.2's
 # low-noise 14B model (+ 4-step lightx2v LoRA), at a per-frame strength that
 # leaves faces 120px and up untouched; the pack's H3FaceStitch pastes them
-# back. (The pack's own H3 redraw was dropped: its H3PerFrameDenoise breaks
-# sampling on our ComfyUI - issue #19 on the pack.)
+# back. The pack's own H3 redraw is the second engine ("engine": "h3", see
+# build_h3_refine_payload): its H3PerFrameDenoise model patches broke
+# sampling on our ComfyUI (issue #19 on the pack), so that engine keeps the
+# node's per-frame mask and leaves its patches out.
 #
 # The Wan files are NOT part of the engine script, so session start and H3
 # generation are unchanged; the first refine on a volume downloads them
@@ -852,14 +854,24 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 #                any one shot, capped at 4), "denoise": 0.05-1.0 (default 0.6), "seed": ...,
 #    "prompt": optional face prompt (blank = the node's generic one),
 #    "canvas": "auto" (default) | 384 | 512 | 640 | 768,
-#    "steps": 2-8 (default 3)}
+#    "steps": 2-8 (default 3; the H3 engine always runs 8),
+#    "engine": "wan" (default) | "h3"}
+#
+# "engine": "h3" - the pack's own H3 redraw, back as a second engine (see
+# build_h3_refine_payload). Nothing extra to download: it uses the H3 model,
+# turbo LoRA, text encoder and VAEs the engine script already put on the
+# volume, through the generation graph's own loader nodes, so the copy a
+# generation already loaded is reused rather than loaded twice.
 REFINE_MODE = "face_refine"
+REFINE_ENGINES = {"wan", "h3"}
 REFINE_MAX_SUBJECTS = 4            # most people refined per shot (the largest small faces win)
 REFINE_FACE_PX_LARGE = 120.0       # faces this tall or more are left as they are
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
 WAN_REFINE_DEFAULT_DENOISE = 0.6   # the "Fix faces" setting (chosen on test 96cb3da1); starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
 WAN_REFINE_STEPS = 3               # the "Fix faces" setting (chosen on test 96cb3da1); the lightx2v LoRA is distilled for 4
 WAN_REFINE_SHIFT = 5.0
+H3_REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base denoise; H3PerFrameDenoise scales it per frame
+H3_REFINE_STEPS = 8               # the 8-step turbo LoRA (LORA_CHOICES["turbo"])
 REFINE_CANVAS_SIZES = {384, 512, 640, 768}  # job "canvas"; default "auto" (tracker picks, capped at 768)
 WAN_REFINE_FILES = {
     "unet": ({"filename": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
@@ -893,6 +905,27 @@ def ensure_wan_refine_files(report_stage=None):
     for spec, sub in missing:
         ensure_model_file(spec, sub)
     return True
+
+
+def find_source_prompt(video_key, hops=3):
+    """The prompt a video was generated with, from the session job that
+    produced it. Follows refine jobs back to the original generation. The H3
+    engine redraws each crop against it (the pack's documented setup)."""
+    for _ in range(hops):
+        rows = sb_get(
+            "comfylab_gpu_session_jobs",
+            {"output->>videoKey": f"eq.{video_key}", "select": "input", "limit": "1"},
+        )
+        if not rows:
+            return None
+        src_input = rows[0].get("input") or {}
+        if src_input.get("prompt") and src_input.get("mode") != REFINE_MODE:
+            return src_input["prompt"]
+        if src_input.get("mode") == REFINE_MODE and src_input.get("source_video_key"):
+            video_key = src_input["source_video_key"]
+            continue
+        return None
+    return None
 
 
 def downscale_video_for_refine(src_path, dst_path, max_w=1344, max_h=768):
@@ -1085,6 +1118,112 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
     return wf
 
 
+def h3_refine_tracker(source, pick, canvas, i):
+    return {"class_type": "H3FaceTrackCrop", "inputs": {
+        "images": source, "face_pick": pick,
+        "detector": FACE_DETECTOR, "confidence": 0.35,
+        "crop_factor": 3.0,
+        "canvas_width": canvas or 768, "canvas_height": canvas or 768,
+        "canvas_mode": "manual" if canvas else "auto_capped_768",
+        "smooth_window": 21, "size_smooth_window": 51,
+        "smooth_method": "gaussian", "size_mode": "per_frame",
+        "identity_track": False, "identity_threshold": 0.28,
+        "select": "largest_face", "select_index": i, "fallback_detector": "none",
+        "fallback_head_frac": 0.5, "identity_model": "insightface",
+        "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
+        "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
+
+
+def build_h3_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt, canvas=None):
+    """The pack's own H3 redraw, one pass per person, each stitched onto the
+    last (the pack's way to do several people): Track + Crop -> H3 Reference
+    to Video (the source's prompt) -> audio lock -> Inject Video Latent ->
+    H3PerFrameDenoise -> sampler -> decode -> Stitch.
+
+    H3PerFrameDenoise is in the path and sets every frame's strength: full
+    on faces <= 30px, falling to ZERO at >= 120px, zero where the tracker
+    lost the face - so already-good faces are not redrawn. Its LATENT (that
+    mask) goes to the sampler; its patched MODEL does not. Our ComfyUI
+    applies an H3 per-frame mask natively, and the node's two model patches
+    (written for older ComfyUI) stacked on top sent a negative timestep and
+    then NaN into H3 (pack issue #19). ComfyLabStrengthWeights rebuilds the
+    same curve as stitch weights, so zero-strength frames keep the video's
+    own pixels; ComfyLabH3StepCheck stops the job at the first bad step."""
+    wf = {"r_select": refine_select_node(source_filename)}
+    source = ["r_select", 0]
+    audio = ["r_select", 1]
+    # The generation graph's own node ids and inputs (workflow_template.json),
+    # so ComfyUI's cache hands back the models a generation already loaded.
+    base_lora = LORA_CHOICES["turbo"]
+    wf["105:6"] = {"class_type": "UNETLoader", "inputs": {
+        "unet_name": MODEL_CHOICES["base"]["filename"], "weight_dtype": "default"}}
+    wf["105:13"] = {"class_type": "CLIPLoader", "inputs": {
+        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}}
+    wf["105:11"] = {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}}
+    wf["105:24"] = {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}}
+    wf["h_lora"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+        "model": ["105:6", 0], "lora_name": base_lora["filename"], "strength_model": base_lora["multiplier"]}}
+    wf["h_sage"] = {"class_type": "PathchSageAttentionKJ", "inputs": {
+        "model": ["h_lora", 0], "sage_attention": "auto", "allow_compile": False}}
+    wf["h_check"] = {"class_type": "ComfyLabH3StepCheck", "inputs": {"model": ["h_sage", 0], "label": "h3 refine"}}
+    wf["h_sampler"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "er_sde"}}
+    wf["h_noise"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}}
+    wf["h_sched"] = {"class_type": "BasicScheduler", "inputs": {
+        "scheduler": "simple", "steps": H3_REFINE_STEPS, "denoise": denoise, "model": ["h_check", 0]}}
+    # Same values for H3PerFrameDenoise and the stitch weights built from it.
+    curve = {"denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
+             "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE,
+             "gamma": 1.0, "smooth_frames": 9}
+    images = source
+    for i in range(subjects):
+        p = f"r{i}_"
+        wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
+            "face_pick": ["r_select", 2], "index": i,
+            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE}}
+        wf[p + "pick_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pick", 1]}}
+        wf[p + "track"] = h3_refine_tracker(source, [p + "pick", 0], canvas, i)
+        wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
+        wf[p + "r2v"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
+            "clip": ["105:13", 0], "vae": ["105:11", 0], "audio_vae": ["105:24", 0],
+            "prompt": prompt, "width": [p + "track", 4], "height": [p + "track", 5],
+            "length": [p + "track", 6], "ref_image_size": "match"}}
+        wf[p + "lock"] = {"class_type": "ComfyLabH3AudioLock", "inputs": {
+            "av_latent": [p + "r2v", 1], "audio_vae": ["105:24", 0], "audio": audio}}
+        wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
+            "av_latent": [p + "lock", 0], "images": [p + "track", 0], "vae": ["105:11", 0]}}
+        wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
+            "model": ["h_check", 0], "av_latent": [p + "inject", 0], "transform": [p + "track", 1],
+            "scale_mode": "absolute_px", **curve}}
+        wf[p + "pfd_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pfd", 1]}}
+        wf[p + "guider"] = {"class_type": "BasicGuider", "inputs": {
+            "model": ["h_check", 0], "conditioning": [p + "r2v", 0]}}
+        wf[p + "sample"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["h_noise", 0], "guider": [p + "guider", 0], "sampler": ["h_sampler", 0],
+            "sigmas": ["h_sched", 0], "latent_image": [p + "pfd", 0]}}
+        wf[p + "decode"] = {"class_type": "VAEDecode", "inputs": {"samples": [p + "sample", 0], "vae": ["105:11", 0]}}
+        wf[p + "weights"] = {"class_type": "ComfyLabStrengthWeights", "inputs": {
+            "transform": [p + "track", 1], **curve}}
+        wf[p + "weights_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "weights", 1]}}
+        wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
+            "base_images": images, "refined_crops": [p + "decode", 0], "transform": [p + "weights", 0],
+            "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
+            "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
+        images = [p + "stitch", 0]
+    wf["r_select_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_select", 4]}}
+
+    if upscale_scale:
+        wf["r_vsr"] = {"class_type": "RTXVideoSuperResolution", "inputs": {
+            "images": images, "resize_type": "scale by multiplier",
+            "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
+        images = ["r_vsr", 0]
+    wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
+        "fps": ["r_select", 6], "bit_depth": 8, "images": images, "audio": audio}}
+    wf[NODE_IDS["output"]] = {"class_type": "ComfyLabSaveVideoNVENC", "inputs": {
+        "filename_prefix": f"video/FaceRefineH3_{uuid.uuid4().hex[:12]}",
+        "video": ["r_create", 0]}}
+    return wf
+
+
 def run_face_refine(job_input, should_cancel=None, should_force_kill=None, report_stage=None):
     source_key = (job_input.get("source_video_key") or "").strip()
     if not source_key:
@@ -1100,8 +1239,12 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             raise ValueError(f"subjects must be 1-{REFINE_MAX_SUBJECTS}, got {subjects}")
     else:
         subjects = None
+    engine = (job_input.get("engine") or "wan").strip().lower()
+    if engine not in REFINE_ENGINES:
+        raise ValueError(f"engine must be one of {sorted(REFINE_ENGINES)}, got {job_input.get('engine')!r}")
+    default_denoise = H3_REFINE_DEFAULT_DENOISE if engine == "h3" else WAN_REFINE_DEFAULT_DENOISE
     try:
-        denoise = float(job_input.get("denoise", WAN_REFINE_DEFAULT_DENOISE))
+        denoise = float(job_input.get("denoise", default_denoise))
     except (TypeError, ValueError):
         raise ValueError(f"denoise must be a number, got {job_input.get('denoise')!r}")
     if not 0.05 <= denoise <= 1.0:
@@ -1125,11 +1268,19 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         raise ValueError(f"steps must be 2-8, got {steps}")
     # Wan redraws face crops, not the scene, so it gets a face prompt (the
     # node's generic one unless overridden) - never the source's H3 prompt.
+    # The H3 engine redraws against the source's own prompt (the pack's setup).
     prompt = (job_input.get("prompt") or "").strip()
+    if engine == "h3":
+        steps = H3_REFINE_STEPS
+        if not prompt:
+            prompt = find_source_prompt(source_key) or ""
+        if not prompt:
+            raise ValueError(f"No prompt given and none found for {source_key} - pass one in the job")
     stages = {}
     node_rows = []
     t = time.time()
-    downloaded = ensure_wan_refine_files(report_stage)
+    # The H3 engine needs nothing beyond what the engine script downloads.
+    downloaded = ensure_wan_refine_files(report_stage) if engine == "wan" else False
     if downloaded:
         stages["wan_first_download"] = time.time() - t
     if report_stage:
@@ -1176,8 +1327,12 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
                 }
             if report_stage:
                 report_stage(f"Refining faces ({subjects} {'person' if subjects == 1 else 'people'})")
-        workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
-                                        canvas, steps)
+        if engine == "h3":
+            workflow = build_h3_refine_payload(source_filename, subjects, denoise, seed, upscale_scale,
+                                               prompt, canvas)
+        else:
+            workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
+                                            canvas, steps)
         t = time.time()
         result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
         stages["comfy_refine"] = time.time() - t
@@ -1200,7 +1355,9 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         if text:
             reports.append(text[0] if isinstance(text, list) else text)
 
-    for name in ["r_select_report"] + [f"r{i}_pick_report" for i in range(subjects)]:
+    extra = ([f"r{i}_{k}" for i in range(subjects) for k in ("pfd_report", "weights_report")]
+             if engine == "h3" else [])
+    for name in ["r_select_report"] + [f"r{i}_pick_report" for i in range(subjects)] + extra:
         text = result.get("outputs", {}).get(name, {}).get("text")
         if text:
             reports.append(text[0] if isinstance(text, list) else text)
@@ -1221,6 +1378,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     return {
         "videoKey": video_key,
         "mode": REFINE_MODE,
+        "engine": engine,
         "first_time_download": downloaded,
         "canvas": canvas or "auto",
         "steps": steps,

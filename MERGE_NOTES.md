@@ -62,9 +62,27 @@ agrees it's a property of head-size-in-frame, not output resolution
   original pixels). Wan files (~22.5GB) download on the first refine, not at
   session start; Wan loads once per refine and is unloaded from VRAM and RAM
   before the job ends. Not audio-aware - lip sync to be judged on the first
-  results. The pack's own H3 redraw was removed (its H3PerFrameDenoise breaks
-  sampling on our ComfyUI - issue #19 on the pack; works on 0.34, broken on
-  0.36/0.38), along with its audio-lock node, torchaudio and the debug nodes.
+  results.
+- **Second engine, H3 (testing, 2026-10-04; job `"engine": "h3"`, test page
+  Engine picker):** the pack's own H3 redraw, back with H3PerFrameDenoise in
+  the path (required - it's what keeps good faces untouched: full strength
+  <=30px, ZERO at >=120px, zero where the face is lost). Why it broke before:
+  our ComfyUI (0.35+) applies an H3 per-frame mask natively, and the node's
+  two model patches (written for older ComfyUI) stacked on top sent a
+  negative timestep then NaN into H3. Fix: the sampler gets the node's
+  LATENT (the per-frame mask) but not its patched MODEL. No pack fixes this
+  upstream (checked 2026-10-04: Carasibana 1.1.2, Accelerated, FaceRefine-
+  Plus, T8 1.89 - T8 copies the same patches and tested on ComfyUI 0.33).
+  Also: audio lock rebuilt without torchaudio (ComfyLabH3AudioLock, core
+  audio VAE), stitch weights from the same curve so zero-strength frames
+  keep the video's own pixels (ComfyLabStrengthWeights), and
+  ComfyLabH3StepCheck stops the job at the first bad timestep/NaN.
+  Download: nothing - same H3 model, turbo LoRA, text encoder and VAEs the
+  engine script already puts on the volume. Load: at refine time, through
+  the generation graph's own loader node ids, so the H3 a generation already
+  loaded is reused (no second copy); session start unchanged. Settings: base
+  denoise 0.4 (pack default), 8 steps er_sde, turbo LoRA, source prompt.
+  Untested on a GPU yet.
 - **"Fix faces" button settings (chosen 2026-10-03, test job 96cb3da1 on
   cba2f8ef):** strength (denoise) 0.6, 3 steps, Standard crop size (tracker
   canvas, redrawn at up to 512px), people counted automatically (up to 4

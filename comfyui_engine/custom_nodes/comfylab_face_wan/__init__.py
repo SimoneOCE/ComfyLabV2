@@ -455,6 +455,7 @@ except Exception as _e:  # logging-only helper; never block the nodes
 
 
 from .save_nvenc import ComfyLabSaveVideoNVENC  # noqa: E402
+from . import h3_refine as _h3_refine  # noqa: E402
 
 
 NODE_CLASS_MAPPINGS = {
@@ -462,10 +463,12 @@ NODE_CLASS_MAPPINGS = {
     "ComfyLabWanFaceRedraw": ComfyLabWanFaceRedraw,
     "ComfyLabFacePickIndex": ComfyLabFacePickIndex,
     "ComfyLabSmallFaceCount": ComfyLabSmallFaceCount,
+    **_h3_refine.NODE_CLASS_MAPPINGS,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ComfyLabWanFaceRedraw": "ComfyLab Wan Face Redraw",
     "ComfyLabFacePickIndex": "ComfyLab Face Pick (person N)",
     "ComfyLabSmallFaceCount": "ComfyLab Small Face Count",
     "ComfyLabSaveVideoNVENC": "ComfyLab Save Video (NVENC)",
+    **_h3_refine.NODE_DISPLAY_NAME_MAPPINGS,
 }
