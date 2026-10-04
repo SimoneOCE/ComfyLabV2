@@ -12,7 +12,9 @@ timestep then NaN into H3 (pack issue #19).
 
   ComfyLabH3AudioLock   - puts the clip's own soundtrack in the latent's
                           audio stream and holds it (mask 0) so lip sync
-                          follows the real audio. Core audio VAE + core
+                          follows the real audio - the audio of exactly the
+                          frames the crop covers (the tracker drops frames
+                          the person isn't in). Core audio VAE + core
                           resample only (the old MiniMaxH3NativeAudioLock
                           needed torchaudio).
   ComfyLabStrengthWeights - per-frame stitch weights from the same strength
@@ -22,6 +24,12 @@ timestep then NaN into H3 (pack issue #19).
   ComfyLabH3StepCheck   - logs the timestep H3 receives and stops the job at
                           the first step with a bad timestep or NaN output,
                           instead of failing later with "KeyError: nan".
+  ComfyLabSaveRefineCrops / ComfyLabLoadRefineCrops - hand the redrawn
+                          crops and their transforms from the redraw prompt
+                          to the stitch prompt through a file, so the worker
+                          can unload H3 and clear ComfyUI's cache in between
+                          (H3 + text encoder still in RAM during the stitch
+                          and upscale ran a 15s clip out of RAM).
 """
 
 import logging
@@ -33,8 +41,10 @@ import torch
 import comfy.audio
 import comfy.nested_tensor
 import comfy.patcher_extension
+import folder_paths
 
 TAG = "[ComfyLabH3Refine]"
+MAX_SUBJECTS = 4
 WEIGHT_RAMP = 0.2  # same hand-over as the Wan engine: full paste once strength reaches this
 
 
@@ -46,20 +56,41 @@ def _log(msg):
 class ComfyLabH3AudioLock:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"av_latent": ("LATENT",), "audio_vae": ("VAE",), "audio": ("AUDIO",)}}
+        return {"required": {"av_latent": ("LATENT",), "audio_vae": ("VAE",), "audio": ("AUDIO",)},
+                "optional": {"transform": ("H3FACEXFORM",), "fps": ("FLOAT", {"default": 24.0})}}
 
     RETURN_TYPES = ("LATENT", "STRING")
     RETURN_NAMES = ("av_latent", "report")
     FUNCTION = "run"
     CATEGORY = "ComfyLab"
 
-    def run(self, av_latent, audio_vae, audio):
+    @staticmethod
+    def _crop_audio(waveform, sr, source, fps):
+        """The audio under each frame the crop holds, in order - so a crop
+        that starts at frame 264 hears frame 264's audio, not the clip's
+        first seconds."""
+        per = sr / float(fps)
+        pieces = []
+        for f in source:
+            a, b = int(round(int(f) * per)), int(round((int(f) + 1) * per))
+            piece = waveform[..., a:b]
+            if piece.shape[-1] < b - a:  # past the end of the soundtrack
+                piece = torch.nn.functional.pad(piece, (0, b - a - piece.shape[-1]))
+            pieces.append(piece)
+        return torch.cat(pieces, dim=-1)
+
+    def run(self, av_latent, audio_vae, audio, transform=None, fps=24.0):
         samples = av_latent["samples"]
         if not isinstance(samples, comfy.nested_tensor.NestedTensor):
             raise ValueError("Expected a MiniMax H3 joint AV latent (NestedTensor)")
         video, latent_audio = list(samples.unbind())[:2]
         waveform = audio["waveform"]
         sr = int(audio["sample_rate"])
+        source = (transform or {}).get("source")
+        span = ""
+        if source:
+            waveform = self._crop_audio(waveform, sr, source, fps)
+            span = f" (frames {int(source[0])}-{int(source[-1])}, {len(source)} kept)"
         vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
         if sr != vae_sr:
             waveform = comfy.audio.resample(waveform, sr, vae_sr)
@@ -70,14 +101,15 @@ class ComfyLabH3AudioLock:
         if t_got >= t_need:
             z = z[..., :t_need]
         else:
-            z = torch.nn.functional.pad(z, (0, t_need - t_got), mode="replicate")
+            # Hold the last latent frame (replicate) for the missing tail.
+            z = torch.cat([z, z[..., -1:].expand(*z.shape[:-1], t_need - t_got)], dim=-1)
         if not torch.isfinite(z).all():
             raise RuntimeError("The clip's audio encoded to non-finite values")
         z = z.expand(latent_audio.shape[0], -1, -1, -1).contiguous()
         out = dict(av_latent)
         out["samples"] = comfy.nested_tensor.NestedTensor((video, z))
         out["noise_mask"] = comfy.nested_tensor.NestedTensor((torch.ones_like(video), torch.zeros_like(z)))
-        report = (f"audio lock: {waveform.shape[-1] / vae_sr:.2f}s at {vae_sr}Hz -> {t_got} latent frames "
+        report = (f"audio lock: {waveform.shape[-1] / vae_sr:.2f}s{span} at {vae_sr}Hz -> {t_got} latent frames "
                   f"(latent needs {t_need}), held at mask 0")
         _log(report)
         return (out, report)
@@ -168,13 +200,91 @@ class ComfyLabH3StepCheck:
         return (m,)
 
 
+def _handoff_path(name):
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        raise ValueError(f"bad hand-off name {name!r}")
+    # On the volume (the output dir): up to ~2.5GB for 4 people at 768 on a
+    # 15s clip, more than the container's own small disk can spare. The
+    # worker deletes it once the refine finishes.
+    return f"{folder_paths.get_output_directory()}/refine_handoff/{name}.pt"
+
+
+class ComfyLabSaveRefineCrops:
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {}
+        for i in range(1, MAX_SUBJECTS):
+            optional[f"crops_{i}"] = ("IMAGE",)
+            optional[f"transform_{i}"] = ("H3FACEXFORM",)
+        return {"required": {"name": ("STRING", {"default": ""}),
+                             "crops_0": ("IMAGE",), "transform_0": ("H3FACEXFORM",)},
+                "optional": optional}
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = "ComfyLab"
+
+    def run(self, name, **subjects):
+        import os
+        crops, transforms = [], []
+        for i in range(MAX_SUBJECTS):
+            c, t = subjects.get(f"crops_{i}"), subjects.get(f"transform_{i}")
+            if c is None or t is None:
+                break
+            # 8-bit, like the video they end up in.
+            crops.append((c[..., :3].clamp(0, 1) * 255.0).round().to(torch.uint8).cpu())
+            transforms.append(t)
+        path = _handoff_path(name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({"crops": crops, "transforms": transforms}, path)
+        mb = sum(c.numel() for c in crops) / 1e6
+        _log(f"saved {len(crops)} redrawn crop clip(s), {mb:.0f}MB, for the stitch prompt")
+        return {"ui": {"saved": [name], "subjects": [len(crops)]}}
+
+
+class ComfyLabLoadRefineCrops:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"name": ("STRING", {"default": ""})}}
+
+    RETURN_TYPES = ("IMAGE",) * MAX_SUBJECTS + ("H3FACEXFORM",) * MAX_SUBJECTS
+    RETURN_NAMES = (tuple(f"crops_{i}" for i in range(MAX_SUBJECTS))
+                    + tuple(f"transform_{i}" for i in range(MAX_SUBJECTS)))
+    FUNCTION = "run"
+    CATEGORY = "ComfyLab"
+
+    @classmethod
+    def IS_CHANGED(cls, name):
+        import os
+        try:
+            return os.path.getmtime(_handoff_path(name))
+        except OSError:
+            return float("nan")
+
+    def run(self, name):
+        data = torch.load(_handoff_path(name), weights_only=False)
+        crops = [c.float() / 255.0 for c in data["crops"]]
+        transforms = list(data["transforms"])
+        if not crops:
+            raise ValueError("hand-off file holds no crops")
+        while len(crops) < MAX_SUBJECTS:  # unused outputs - never wired
+            crops.append(crops[0])
+            transforms.append(transforms[0])
+        return tuple(crops) + tuple(transforms)
+
+
 NODE_CLASS_MAPPINGS = {
     "ComfyLabH3AudioLock": ComfyLabH3AudioLock,
     "ComfyLabStrengthWeights": ComfyLabStrengthWeights,
     "ComfyLabH3StepCheck": ComfyLabH3StepCheck,
+    "ComfyLabSaveRefineCrops": ComfyLabSaveRefineCrops,
+    "ComfyLabLoadRefineCrops": ComfyLabLoadRefineCrops,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ComfyLabH3AudioLock": "ComfyLab H3 Audio Lock",
     "ComfyLabStrengthWeights": "ComfyLab Strength -> Stitch Weights",
     "ComfyLabH3StepCheck": "ComfyLab H3 Step Check",
+    "ComfyLabSaveRefineCrops": "ComfyLab Save Refine Crops (hand-off)",
+    "ComfyLabLoadRefineCrops": "ComfyLab Load Refine Crops (hand-off)",
 }

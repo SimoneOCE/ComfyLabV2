@@ -1134,11 +1134,15 @@ def h3_refine_tracker(source, pick, canvas, i):
         "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
 
 
-def build_h3_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt, canvas=None):
-    """The pack's own H3 redraw, one pass per person, each stitched onto the
-    last (the pack's way to do several people): Track + Crop -> H3 Reference
-    to Video (the source's prompt) -> audio lock -> Inject Video Latent ->
-    H3PerFrameDenoise -> sampler -> decode -> Stitch.
+def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None):
+    """Step 1 of 2 of the H3 engine: the pack's own H3 redraw, one per
+    person: Track + Crop -> H3 Reference to Video (the source's prompt) ->
+    audio lock -> Inject Video Latent -> H3PerFrameDenoise -> sampler ->
+    decode. The redrawn crops and their stitch transforms are written to a
+    hand-off file (ComfyLabSaveRefineCrops); step 2 (build_h3_stitch_payload)
+    stitches them in after the worker has unloaded H3 and cleared ComfyUI's
+    cache. Stitching and upscaling a 15s clip with H3 and its text encoder
+    still in RAM (~35GB) ran the worker out of memory (job 1a45f78a).
 
     H3PerFrameDenoise is in the path and sets every frame's strength: full
     on faces <= 30px, falling to ZERO at >= 120px, zero where the tracker
@@ -1174,7 +1178,7 @@ def build_h3_refine_payload(source_filename, subjects, denoise, seed, upscale_sc
     curve = {"denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
              "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE,
              "gamma": 1.0, "smooth_frames": 9}
-    images = source
+    save_inputs = {"name": handoff_name}
     for i in range(subjects):
         p = f"r{i}_"
         wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
@@ -1187,8 +1191,11 @@ def build_h3_refine_payload(source_filename, subjects, denoise, seed, upscale_sc
             "clip": ["105:13", 0], "vae": ["105:11", 0], "audio_vae": ["105:24", 0],
             "prompt": prompt, "width": [p + "track", 4], "height": [p + "track", 5],
             "length": [p + "track", 6], "ref_image_size": "match"}}
+        # The transform tells the lock which source frames this crop holds,
+        # so H3 hears the audio of those frames.
         wf[p + "lock"] = {"class_type": "ComfyLabH3AudioLock", "inputs": {
-            "av_latent": [p + "r2v", 1], "audio_vae": ["105:24", 0], "audio": audio}}
+            "av_latent": [p + "r2v", 1], "audio_vae": ["105:24", 0], "audio": audio,
+            "transform": [p + "track", 1], "fps": ["r_select", 6]}}
         wf[p + "inject"] = {"class_type": "H3InjectVideoLatent", "inputs": {
             "av_latent": [p + "lock", 0], "images": [p + "track", 0], "vae": ["105:11", 0]}}
         wf[p + "pfd"] = {"class_type": "H3PerFrameDenoise", "inputs": {
@@ -1204,24 +1211,85 @@ def build_h3_refine_payload(source_filename, subjects, denoise, seed, upscale_sc
         wf[p + "weights"] = {"class_type": "ComfyLabStrengthWeights", "inputs": {
             "transform": [p + "track", 1], **curve}}
         wf[p + "weights_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "weights", 1]}}
-        wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
-            "base_images": images, "refined_crops": [p + "decode", 0], "transform": [p + "weights", 0],
+        save_inputs[f"crops_{i}"] = [p + "decode", 0]
+        save_inputs[f"transform_{i}"] = [p + "weights", 0]
+    wf["r_select_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_select", 4]}}
+    # Same node id as the generation graph's SaveVideo, so submit_and_wait's
+    # cancel detection works unchanged.
+    wf[NODE_IDS["output"]] = {"class_type": "ComfyLabSaveRefineCrops", "inputs": save_inputs}
+    return wf
+
+
+def build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff_name):
+    """Step 2 of 2 of the H3 engine, run after the worker has unloaded H3 and
+    cleared ComfyUI's cache: reload the source (plain decode - no face
+    finding), stitch each person's redrawn crops back one after another,
+    upscale back, encode."""
+    wf = {
+        "s_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
+        "s_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["s_load", 0]}},
+        "s_crops": {"class_type": "ComfyLabLoadRefineCrops", "inputs": {"name": handoff_name}},
+    }
+    images = ["s_comp", 0]
+    for i in range(subjects):
+        wf[f"s{i}_stitch"] = {"class_type": "H3FaceStitch", "inputs": {
+            "base_images": images, "refined_crops": ["s_crops", i], "transform": ["s_crops", 4 + i],
             "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
             "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
-        images = [p + "stitch", 0]
-    wf["r_select_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_select", 4]}}
-
+        images = [f"s{i}_stitch", 0]
     if upscale_scale:
         wf["r_vsr"] = {"class_type": "RTXVideoSuperResolution", "inputs": {
             "images": images, "resize_type": "scale by multiplier",
             "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
         images = ["r_vsr", 0]
     wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
-        "fps": ["r_select", 6], "bit_depth": 8, "images": images, "audio": audio}}
+        "fps": ["s_comp", 2], "bit_depth": 8, "images": images, "audio": ["s_comp", 1]}}
     wf[NODE_IDS["output"]] = {"class_type": "ComfyLabSaveVideoNVENC", "inputs": {
         "filename_prefix": f"video/FaceRefineH3_{uuid.uuid4().hex[:12]}",
         "video": ["r_create", 0]}}
     return wf
+
+
+def container_ram_used():
+    """Bytes this container is using against its memory limit (cgroup v2,
+    then v1). None if neither is readable. psutil would report the HOST's
+    RAM (755GB on these workers), not the ~89GB the worker is limited to."""
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def free_comfyui_memory(wait_seconds=60):
+    """Unloads every model and clears ComfyUI's output cache (POST /free),
+    then waits for it to happen. /free only sets flags; ComfyUI's worker acts
+    on them the next time it looks at its queue (the flag itself wakes it),
+    so this waits until the container's memory use stops falling."""
+    before = container_ram_used()
+    requests.post(f"{COMFYUI_URL}/free", json={"unload_models": True, "free_memory": True},
+                  timeout=10).raise_for_status()
+    time.sleep(2)
+    if before is None:
+        time.sleep(10)
+        print("Freed ComfyUI memory (container memory use not readable).")
+        return
+    last, steady = before, 0
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline and steady < 3:
+        time.sleep(1)
+        now = container_ram_used() or last
+        steady = steady + 1 if abs(now - last) < 256e6 else 0
+        last = now
+    print(f"Freed ComfyUI memory: {before / 1e9:.1f}GB -> {last / 1e9:.1f}GB used")
+
+
+def is_h3_refine_job(job_row):
+    job_input = (job_row or {}).get("input") or {}
+    return (job_input.get("mode") == REFINE_MODE
+            and str(job_input.get("engine") or "").strip().lower() == "h3")
 
 
 def run_face_refine(job_input, should_cancel=None, should_force_kill=None, report_stage=None):
@@ -1328,19 +1396,50 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             if report_stage:
                 report_stage(f"Refining faces ({subjects} {'person' if subjects == 1 else 'people'})")
         if engine == "h3":
-            workflow = build_h3_refine_payload(source_filename, subjects, denoise, seed, upscale_scale,
-                                               prompt, canvas)
+            # Two prompts with H3 unloaded in between - see build_h3_redraw_payload.
+            handoff = f"h3refine_{uuid.uuid4().hex[:12]}"
+            handoff_path = os.path.join(COMFYUI_OUTPUT_DIR, "refine_handoff", f"{handoff}.pt")
+            t = time.time()
+            redraw = submit_and_wait(
+                build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas),
+                should_cancel=should_cancel, should_force_kill=should_force_kill)
+            stages["comfy_h3_redraw"] = time.time() - t
+            if redraw.get("force_killed") or redraw.get("cancelled"):
+                result = redraw
+            else:
+                node_rows += fetch_node_timings(redraw)
+                redraw_outputs = redraw.get("outputs", {})
+                if report_stage:
+                    report_stage("Stitching faces back in")
+                t = time.time()
+                free_comfyui_memory()
+                stages["unload_h3"] = time.time() - t
+                t = time.time()
+                result = submit_and_wait(
+                    build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff),
+                    should_cancel=should_cancel, should_force_kill=should_force_kill)
+                stages["comfy_stitch_and_upscale"] = time.time() - t
+                # Reports live on the redraw prompt; keep them with the result.
+                if not (result.get("force_killed") or result.get("cancelled")):
+                    result.setdefault("outputs", {})
+                    for k, v in redraw_outputs.items():
+                        result["outputs"].setdefault(k, v)
         else:
             workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
                                             canvas, steps)
-        t = time.time()
-        result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
-        stages["comfy_refine"] = time.time() - t
+            t = time.time()
+            result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
+            stages["comfy_refine"] = time.time() - t
     finally:
         try:
             os.remove(os.path.join(COMFYUI_DIR, "input", source_filename))
         except OSError:
             pass
+        if engine == "h3":
+            try:
+                os.remove(handoff_path)
+            except (OSError, NameError):
+                pass
     comfy_seconds = round(time.time() - comfy_start, 1)
     if result.get("force_killed"):
         return {"cancelled": True, "force_killed": True}
@@ -1720,6 +1819,25 @@ def run_session(session_id):
                 print(f"Session {session_id}: failed to restart after ComfyUI {reason} ({e}) - ending session.")
                 mark_session_ended(session_id, "error")
                 return session_summary("worker_error", last_error=str(e))
+        elif is_h3_refine_job(job_row) and is_comfyui_ready():
+            # The H3 refine unloads H3 and its text encoder before stitching
+            # (see run_face_refine). Load them straight back - after the
+            # result is already delivered - so the next generation doesn't
+            # pay the ~40s reload. Same throwaway warmup as session start.
+            try:
+                reload_start = time.time()
+                run_generation({
+                    "prompt": "warmup",
+                    "width": 320,
+                    "height": 320,
+                    "duration": 1.0,
+                    "steps": 1,
+                }, upload=False)
+                print(f"Session {session_id}: H3 reloaded after the face refine "
+                      f"({round(time.time() - reload_start, 1)}s).")
+            except Exception as e:
+                print(f"Session {session_id}: H3 reload after the face refine failed, "
+                      f"the next generation will load it instead ({e}).")
 
         last_activity = time.time()
 

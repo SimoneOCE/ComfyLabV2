@@ -82,7 +82,20 @@ agrees it's a property of head-size-in-frame, not output resolution
   the generation graph's own loader node ids, so the H3 a generation already
   loaded is reused (no second copy); session start unchanged. Settings: base
   denoise 0.4 (pack default), 8 steps er_sde, turbo LoRA, source prompt.
-  Untested on a GPU yet.
+  First GPU run (job 1a45f78a, 2026-10-04, cba2f8ef, 3 people): sampling
+  clean - normal timesteps, no NaN, ~7-15s per person - but the worker ran
+  out of RAM (89GB) stitching + 2x upscaling with H3 and its text encoder
+  (~35GB) still loaded. Fixed (option A, chosen 2026-10-04): the H3 refine
+  is now two ComfyUI prompts - redraw, then POST /free (unload every model,
+  clear the cache), then stitch + upscale + encode, the crops handed over
+  through a file on the volume (ComfyLabSave/LoadRefineCrops). Right after
+  the result is delivered the session reloads H3 + text encoder (the same
+  1-step warmup as session start, ~40-55s) so the next generation doesn't
+  pay for it. Same run also exposed an audio-lock bug, fixed: each person's
+  crop only holds the frames they're in, so H3 was hearing the clip's first
+  seconds; it now gets exactly those frames' audio.
+  **If we go with the Wan engine instead:** add the same auto-reload of H3
+  after a Wan refine (to do, not built).
   Later (asked 2026-10-04, not built): a 4-step option using Comfy-Org's
   4-step turbo LoRA (minimax_h3_fl2v_turbo_4step_v1.0_768p, LORA_CHOICES
   "fast" - already on the volume, nothing to download). Roughly halves the
