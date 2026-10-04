@@ -109,6 +109,8 @@ class ComfyLabWanFaceRedraw:
         for i in range(1, MAX_SUBJECTS):
             optional[f"crops_{i}"] = ("IMAGE",)
             optional[f"transform_{i}"] = ("H3FACEXFORM",)
+        # The detector's own face boxes, for the duplicate-person check.
+        optional["face_pick"] = ("H3FACEPICK",)
         return {
             "required": {
                 "crops_0": ("IMAGE",),
@@ -159,7 +161,7 @@ class ComfyLabWanFaceRedraw:
 
         # Two trackers on one face (an extra "person" from a stray detection)
         # would redraw and paste it twice - see duplicates.py.
-        work, silenced, dup_report = duplicates.apply(work)
+        work, silenced, dup_report = duplicates.apply(work, subjects.get("face_pick"))
         for line in dup_report:
             _log(line)
             report.append(line)

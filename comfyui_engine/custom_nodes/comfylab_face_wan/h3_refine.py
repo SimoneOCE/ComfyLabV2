@@ -285,6 +285,8 @@ class ComfyLabH3FaceRedraw:
                 # person over their whole track, across cuts - per-shot clips
                 # made the faces clearly worse in testing.
                 "split_shots": ("BOOLEAN", {"default": False}),
+                # The detector's own face boxes, for the duplicate-person check.
+                "face_pick": ("H3FACEPICK",),
             },
         }
 
@@ -321,7 +323,7 @@ class ComfyLabH3FaceRedraw:
 
         # Two trackers on one face would redraw and paste it twice.
         from . import duplicates
-        work, silenced, dup_report = duplicates.apply(work)
+        work, silenced, dup_report = duplicates.apply(work, subjects.get("face_pick"))
         for line in dup_report:
             _log(line)
             report.append(line)

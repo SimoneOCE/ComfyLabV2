@@ -159,7 +159,11 @@ agrees it's a property of head-size-in-frame, not output resolution
   when this only showed on a refine-of-a-refine; this was an original video.
   Built (user go-ahead, 2026-10-04): comfylab_face_wan/duplicates.py, used
   by both redraw nodes. On source frames where both trackers detected a
-  face, same face = centres closer than half a face height; same face on
+  face, same face = both land on the same detector face box (the detection
+  inside the person's crop box nearest their face size and the box centre;
+  face_pick from H3 Load Video + Face Select) - not the crop boxes, whose
+  centre drifts off the face when clamped at the frame edge. Fallback
+  without detections: centres closer than half a face height. Same face on
   >50% of those frames -> the later person is dropped (not redrawn, zero
   paste weight); less -> kept, nothing pasted on the overlapping frames.
   Reports say "person N follows person M's face ... duplicate".

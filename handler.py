@@ -1045,6 +1045,8 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         # above 120px are left exactly as they are.
         "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE, "smooth_frames": 9,
         "sage_attention": True,
+        # The detector's own face boxes, for the duplicate-person check.
+        "face_pick": ["r_select", 2],
     }
     for i in range(subjects):
         p = f"r{i}_"
@@ -1158,6 +1160,8 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
         "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE, "gamma": 1.0, "smooth_frames": 9,
         "split_shots": bool(split_shots),
+        # The detector's own face boxes, for the duplicate-person check.
+        "face_pick": ["r_select", 2],
     }
     save_inputs = {"name": handoff_name}
     for i in range(subjects):
