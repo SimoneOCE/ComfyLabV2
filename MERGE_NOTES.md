@@ -123,6 +123,15 @@ agrees it's a property of head-size-in-frame, not output resolution
   re-warm after a ComfyUI crash all call run_generation without
   should_force_kill, so a Stop during one waits for it to finish - and that
   GPU time is billed. Pass the same session-stopped check to all of them.
+  **To consider (noted 2026-10-04, not built): reload H3 after a refine
+  without a warmup generation.** Today the reload runs the session-start
+  warmup (a 1-step 320x320 generation, ~47s in job 10e921bd's session) just
+  to get H3, the text encoder and the VAEs back into memory. A load-only
+  prompt (the loader nodes plus a minimal output node, no sampling) would
+  skip the throwaway generation. Check first: in the logs H3's "Model
+  Initialization" (~22s) happens at the first sampling step, not at load,
+  so a load-only reload may leave that part for the next generation - time
+  both and compare before switching.
   Later (asked 2026-10-04, not built): a 4-step option using Comfy-Org's
   4-step turbo LoRA (minimax_h3_fl2v_turbo_4step_v1.0_768p, LORA_CHOICES
   "fast" - already on the volume, nothing to download). Roughly halves the
