@@ -880,8 +880,21 @@ REFINE_FACE_PX_MIN = 18.0          # smaller faces are ignored: not counted, tra
 # on the Alpha Timber mother (23-30px) and daughter (20-24px), where 0.6 was
 # much better; the father (~27-45px, mostly in the upper 30s) and up stay on 0.3.
 REFINE_FACE_PX_TINY = 32.0
-REFINE_FACE_PX_SMALL = 45.0        # full strength at or below this
-REFINE_FACE_PX_LARGE = 60.0        # none at or above this (was 120)
+# 2026-10-04 (user): 45/60 -> 60/90. On the park video (813cdb5d) the friends
+# measured 56-59px - inside the old fade, so 0.3 and 0.4 barely touched them
+# and looked the same.
+REFINE_FACE_PX_SMALL = 60.0        # full strength at or below this (was 45)
+REFINE_FACE_PX_LARGE = 90.0        # none at or above this (was 60, before that 120)
+# Crop = this many face heights (the pack's default is 3). At 2 the face fills
+# half the crop instead of a third, so the redraw gets ~1.5x the pixels on it;
+# less context around the face. User, 2026-10-04.
+REFINE_CROP_FACTOR = 2.0
+# Detector score a box needs to count as a face (was 0.35). Lower keeps the
+# borderline real faces (turned, blurred, shadowed) the old bar dropped - on
+# 813cdb5d the middle friend went undetected for long stretches, and the
+# refine fades out wherever there's no detection. More junk clears the bar
+# too; the 18px floor and the duplicate check catch most of it.
+REFINE_DETECT_CONFIDENCE = 0.25
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
 WAN_REFINE_DEFAULT_DENOISE = 0.3   # faces REFINE_FACE_PX_TINY and up (user, 2026-10-04: 0.3 best on most faces; was 0.6)
 WAN_REFINE_SMALL_FACE_DENOISE = 0.6  # faces under REFINE_FACE_PX_TINY; starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
@@ -987,13 +1000,48 @@ def prepare_refine_source(video_key):
     return filename, factor
 
 
-def refine_select_node(source_filename):
+def default_refine_tuning():
+    return {"face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE,
+            "crop_factor": REFINE_CROP_FACTOR, "confidence": REFINE_DETECT_CONFIDENCE}
+
+
+def stitch_feather(tune):
+    """The paste's soft edge, in source px. Tuned at a 3x crop (24px); scaled
+    with the crop so a tighter crop's blend still fades out before the crop's
+    border - at 2x, an unscaled 24px blur left ~3% of the redraw showing at
+    the border on 28px faces, a faint box."""
+    return max(8, int(round(24 * tune["crop_factor"] / 3.0)))
+
+
+def refine_tuning(job_input):
+    """The size range, crop and detector bar, each overridable per job (test
+    page) so the old values can be compared without a redeploy."""
+    tune = default_refine_tuning()
+    for key, lo, hi in (("face_px_small", 10.0, 400.0), ("face_px_large", 10.0, 400.0),
+                        ("crop_factor", 1.5, 4.0), ("confidence", 0.1, 0.9)):
+        if job_input.get(key) in (None, ""):
+            continue
+        try:
+            value = float(job_input[key])
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a number, got {job_input[key]!r}")
+        if not lo <= value <= hi:
+            raise ValueError(f"{key} must be between {lo:g} and {hi:g}, got {value}")
+        tune[key] = value
+    if tune["face_px_large"] <= tune["face_px_small"]:
+        raise ValueError(f"face_px_large ({tune['face_px_large']:g}) must be above "
+                         f"face_px_small ({tune['face_px_small']:g})")
+    return tune
+
+
+def refine_select_node(source_filename, tune=None):
     """The pack's H3 Load Video + Face Select: loads the video and finds every
     face and cut in one pass. Built identically for the people-count prompt
     and the refine prompt, so ComfyUI's cache reuses the first one's result
     instead of detecting again."""
     return {"class_type": "H3FaceSelect", "inputs": {
-        "video": source_filename, "detector": FACE_DETECTOR, "confidence": 0.35,
+        "video": source_filename, "detector": FACE_DETECTOR,
+        "confidence": (tune or default_refine_tuning())["confidence"],
         "select": "largest_face", "select_index": 0, "confirmed_pick": "",
         "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
         "skip_first_frames": 0, "frame_load_cap": 0, "select_every_nth": 1,
@@ -1027,13 +1075,13 @@ def summarize_timings(stages, node_rows):
     }
 
 
-def build_people_count_payload(source_filename):
+def build_people_count_payload(source_filename, tune=None):
     """Short first prompt: face finding + ComfyLabSmallFaceCount. Its report's
     first line is "small_face_people=N found=M"."""
     return {
-        "r_select": refine_select_node(source_filename),
+        "r_select": refine_select_node(source_filename, tune),
         "r_count": {"class_type": "ComfyLabSmallFaceCount", "inputs": {
-            "face_pick": ["r_select", 2], "face_px_large": REFINE_FACE_PX_LARGE,
+            "face_pick": ["r_select", 2], "face_px_large": (tune or default_refine_tuning())["face_px_large"],
             "face_px_min": REFINE_FACE_PX_MIN,
             "max_people": REFINE_MAX_SUBJECTS}},
         "r_count_report": {"class_type": "PreviewAny", "inputs": {"source": ["r_count", 1]}},
@@ -1041,7 +1089,7 @@ def build_people_count_payload(source_filename):
 
 
 def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt, canvas=None,
-                         steps=WAN_REFINE_STEPS, small_denoise=WAN_REFINE_SMALL_FACE_DENOISE):
+                         steps=WAN_REFINE_STEPS, small_denoise=WAN_REFINE_SMALL_FACE_DENOISE, tune=None):
     """The pack's H3FaceSelect loads the video and detects every face and cut
     ONCE; ComfyLabFacePickIndex re-picks that for each person, so each
     tracker reuses the boxes instead of detecting again. All crops are
@@ -1049,7 +1097,8 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
     is unloaded inside the node when it finishes), then stitched back one
     subject after another. canvas: None = the tracker's auto size (capped at
     768), or a fixed square size (e.g. 384) for every crop."""
-    wf = {"r_select": refine_select_node(source_filename)}
+    tune = tune or default_refine_tuning()
+    wf = {"r_select": refine_select_node(source_filename, tune)}
     source = ["r_select", 0]
     audio = ["r_select", 1]
     redraw_inputs = {
@@ -1061,7 +1110,7 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         "shift": WAN_REFINE_SHIFT, "seed": seed,
         # The pack's H3PerFrameDenoise ramp, ending at zero: faces at or
         # above 120px are left exactly as they are.
-        "face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE, "smooth_frames": 9,
+        "face_px_small": tune["face_px_small"], "face_px_large": tune["face_px_large"], "smooth_frames": 9,
         "face_px_min": REFINE_FACE_PX_MIN,
         # Per clip: small_denoise when the face is typically under
         # REFINE_FACE_PX_TINY, denoise otherwise.
@@ -1076,14 +1125,14 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         # big enough are skipped, since the refine leaves them alone anyway.
         wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
             "face_pick": ["r_select", 2], "index": i,
-            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE,
+            "skip_large": True, "face_px_large": tune["face_px_large"],
             "face_px_min": REFINE_FACE_PX_MIN}}
         wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
             "images": source, "face_pick": [p + "pick", 0],
             # detector/confidence/cut settings are inert with a face_pick wired
             # (H3FaceSelect above already did that pass); kept valid for the schema.
-            "detector": FACE_DETECTOR, "confidence": 0.35,
-            "crop_factor": 3.0,
+            "detector": FACE_DETECTOR, "confidence": tune["confidence"],
+            "crop_factor": tune["crop_factor"],
             "canvas_width": canvas or 768, "canvas_height": canvas or 768,
             "canvas_mode": "manual" if canvas else "auto_capped_768",
             "smooth_window": 21, "size_smooth_window": 51,
@@ -1107,7 +1156,7 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
             # The redraw node's transform: its per-frame weights are zero on
             # frames it didn't redraw, so those keep the video's own pixels.
             "base_images": images, "refined_crops": ["r_wan", i], "transform": ["r_wan", 5 + i],
-            "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
+            "paste_region": "face_only", "mask_dilation": 24, "feather": stitch_feather(tune), "colour_match": 1.0,
             "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
         images = [p + "stitch", 0]
 
@@ -1126,11 +1175,11 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
     return wf
 
 
-def h3_refine_tracker(source, pick, canvas, i):
+def h3_refine_tracker(source, pick, canvas, i, tune):
     return {"class_type": "H3FaceTrackCrop", "inputs": {
         "images": source, "face_pick": pick,
-        "detector": FACE_DETECTOR, "confidence": 0.35,
-        "crop_factor": 3.0,
+        "detector": FACE_DETECTOR, "confidence": tune["confidence"],
+        "crop_factor": tune["crop_factor"],
         "canvas_width": canvas or 768, "canvas_height": canvas or 768,
         "canvas_mode": "manual" if canvas else "auto_capped_768",
         "smooth_window": 21, "size_smooth_window": 51,
@@ -1143,7 +1192,7 @@ def h3_refine_tracker(source, pick, canvas, i):
 
 
 def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None,
-                            split_shots=False, steps=H3_REFINE_STEPS):
+                            split_shots=False, steps=H3_REFINE_STEPS, tune=None):
     """Step 1 of 2 of the H3 engine: track each person, then one
     ComfyLabH3FaceRedraw node redraws everyone - built like the Wan engine's
     node: one clip per person per shot (never across a cut; the whole shot,
@@ -1157,7 +1206,8 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
     H3 and cleared ComfyUI's cache - stitching and upscaling a 15s clip with
     H3 and its text encoder still in RAM (~35GB) ran the worker out of memory
     (job 1a45f78a)."""
-    wf = {"r_select": refine_select_node(source_filename)}
+    tune = tune or default_refine_tuning()
+    wf = {"r_select": refine_select_node(source_filename, tune)}
     source = ["r_select", 0]
     # The generation graph's own node ids and inputs (workflow_template.json),
     # so ComfyUI's cache hands back the models a generation already loaded.
@@ -1181,7 +1231,7 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         # H3PerFrameDenoise's ramp, ending at zero: faces at or above 120px
         # are left exactly as they are.
         "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
-        "face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE, "gamma": 1.0,
+        "face_px_small": tune["face_px_small"], "face_px_large": tune["face_px_large"], "gamma": 1.0,
         "smooth_frames": 9, "face_px_min": REFINE_FACE_PX_MIN,
         "split_shots": bool(split_shots),
         # The detector's own face boxes, for the duplicate-person check.
@@ -1192,10 +1242,10 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         p = f"r{i}_"
         wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
             "face_pick": ["r_select", 2], "index": i,
-            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE,
+            "skip_large": True, "face_px_large": tune["face_px_large"],
             "face_px_min": REFINE_FACE_PX_MIN}}
         wf[p + "pick_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pick", 1]}}
-        wf[p + "track"] = h3_refine_tracker(source, [p + "pick", 0], canvas, i)
+        wf[p + "track"] = h3_refine_tracker(source, [p + "pick", 0], canvas, i, tune)
         wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
         redraw_inputs[f"crops_{i}"] = [p + "track", 0]
         redraw_inputs[f"transform_{i}"] = [p + "track", 1]
@@ -1210,11 +1260,12 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
     return wf
 
 
-def build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff_name):
+def build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff_name, tune=None):
     """Step 2 of 2 of the H3 engine, run after the worker has unloaded H3 and
     cleared ComfyUI's cache: reload the source (plain decode - no face
     finding), stitch each person's redrawn crops back one after another,
     upscale back, encode."""
+    tune = tune or default_refine_tuning()
     wf = {
         "s_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
         "s_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["s_load", 0]}},
@@ -1224,7 +1275,7 @@ def build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff_na
     for i in range(subjects):
         wf[f"s{i}_stitch"] = {"class_type": "H3FaceStitch", "inputs": {
             "base_images": images, "refined_crops": ["s_crops", i], "transform": ["s_crops", 4 + i],
-            "paste_region": "face_only", "mask_dilation": 24, "feather": 24, "colour_match": 1.0,
+            "paste_region": "face_only", "mask_dilation": 24, "feather": stitch_feather(tune), "colour_match": 1.0,
             "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
         images = [f"s{i}_stitch", 0]
     if upscale_scale:
@@ -1313,6 +1364,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         raise ValueError(f"small_denoise must be a number, got {job_input.get('small_denoise')!r}")
     if not 0.05 <= small_denoise <= 1.0:
         raise ValueError(f"small_denoise must be between 0.05 and 1.0, got {small_denoise}")
+    tune = refine_tuning(job_input)
     seed = resolve_seed(job_input.get("seed"))
     canvas = job_input.get("canvas")
     if canvas in (None, "", "auto"):
@@ -1371,7 +1423,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             if report_stage:
                 report_stage("Finding faces")
             t = time.time()
-            counted = submit_and_wait(build_people_count_payload(source_filename),
+            counted = submit_and_wait(build_people_count_payload(source_filename, tune),
                                       should_cancel=should_cancel, should_force_kill=should_force_kill)
             stages["comfy_find_and_count_faces"] = time.time() - t
             if counted.get("force_killed"):
@@ -1407,7 +1459,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             t = time.time()
             redraw = submit_and_wait(
                 build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas,
-                                        split_shots, steps),
+                                        split_shots, steps, tune),
                 should_cancel=should_cancel, should_force_kill=should_force_kill)
             stages["comfy_h3_redraw"] = time.time() - t
             if redraw.get("force_killed") or redraw.get("cancelled"):
@@ -1422,7 +1474,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
                 stages["unload_h3"] = time.time() - t
                 t = time.time()
                 result = submit_and_wait(
-                    build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff),
+                    build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff, tune),
                     should_cancel=should_cancel, should_force_kill=should_force_kill)
                 stages["comfy_stitch_and_upscale"] = time.time() - t
                 # Reports live on the redraw prompt; keep them with the result.
@@ -1432,7 +1484,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
                         result["outputs"].setdefault(k, v)
         else:
             workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
-                                            canvas, steps, small_denoise)
+                                            canvas, steps, small_denoise, tune)
             t = time.time()
             result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
             stages["comfy_refine"] = time.time() - t
@@ -1492,6 +1544,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         "denoise": denoise,
         "small_denoise": small_denoise if engine == "wan" else None,
         "small_face_px": REFINE_FACE_PX_TINY if engine == "wan" else None,
+        "tuning": tune,
         "seed": seed,
         "upscaled_back": upscale_scale,
         "timings": timings,

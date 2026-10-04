@@ -317,3 +317,28 @@ shows its strength.
 The floor dropped from 22px to 18px (`REFINE_FACE_PX_MIN`, shared by both
 engines) because the daughter measured 20-24px, so 22px missed her on part of
 the shot. H3's strength is unchanged (0.4, its own per-frame curve).
+
+## Park video: 0.3 and 0.4 looked the same (2026-10-04)
+
+The refine report on 813cdb5d explained it. The friends in shot 2 measured
+56-59px, inside the old 45->60px fade, so they got a partial pass or none and
+the strength barely mattered. One tracker landed on a 15px background face
+(then thrown out by the 18px floor). The best-tracked friend was only detected
+on 52 frames, and the refine fades out wherever there's no detection. The user
+asked for all three fixes; each is a job input / test-page option with the old
+value one click away:
+
+1. Size range: full strength up to 60px, untouched from 90px (was 45/60).
+   `REFINE_FACE_PX_SMALL`/`_LARGE`, job inputs `face_px_small`/`face_px_large`.
+   This reverses the earlier "the 57-64px friends are fine, leave them" call.
+2. Crop: 2x the face instead of 3x (`REFINE_CROP_FACTOR`, job input
+   `crop_factor`). The face fills half the crop, about 1.5x the pixels to
+   redraw, with less context around it. The stitch's soft edge scales with it
+   (`stitch_feather`: 24px at 3x, 16px at 2x). Unscaled, a 28px face at 2x
+   left ~3% of the redraw showing at the crop border.
+3. Detector bar 0.35 -> 0.25 (`REFINE_DETECT_CONFIDENCE`, job input
+   `confidence`): keeps turned, blurred and shadowed faces the old bar dropped.
+   More junk clears it too, which the 18px floor and duplicate check catch.
+
+All three apply to both engines. The 32px small-face strength split (Wan) is
+unchanged.

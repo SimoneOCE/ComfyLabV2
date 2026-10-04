@@ -177,6 +177,27 @@
       <option value="0.6" selected>0.6 - default</option>
     </select>
   </label>
+  <label>Face sizes refined (testing)
+    <select id="refineFaceRange">
+      <option value="60-90" selected>Full up to 60px, untouched from 90px - default</option>
+      <option value="45-60">Full up to 45px, untouched from 60px - old</option>
+      <option value="75-120">Full up to 75px, untouched from 120px</option>
+    </select>
+  </label>
+  <label>Crop around each face (testing)
+    <select id="refineCropFactor">
+      <option value="2" selected>2x face - default, more detail on the face</option>
+      <option value="2.5">2.5x face</option>
+      <option value="3">3x face - old, more context</option>
+    </select>
+  </label>
+  <label>Face detector bar (testing)
+    <select id="refineConfidence">
+      <option value="0.25" selected>0.25 - default, catches turned/blurry faces</option>
+      <option value="0.35">0.35 - old</option>
+      <option value="0.2">0.2</option>
+    </select>
+  </label>
   <label>Face crop size (resolution each face is redrawn at - not the number of people)
     <select id="refineCanvas">
       <option value="auto" selected>Standard - site default (redrawn at up to 512px)</option>
@@ -233,7 +254,7 @@ const PERSISTED_FIELDS = [
   'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
-  'refineVideoKey', 'refineEngine', 'refineSplit', 'refineH3Steps', 'refineSubjects', 'refineDenoise', 'refineSmallDenoise', 'refineCanvas', 'refineSteps',
+  'refineVideoKey', 'refineEngine', 'refineSplit', 'refineH3Steps', 'refineSubjects', 'refineDenoise', 'refineSmallDenoise', 'refineFaceRange', 'refineCropFactor', 'refineConfidence', 'refineCanvas', 'refineSteps',
 ];
 
 // Show/hide toggle for the key fields. Defaults to shown; the choice is
@@ -730,6 +751,10 @@ async function runRefine() {
     canvas: document.getElementById('refineCanvas').value,
     steps: Number(document.getElementById('refineSteps').value),
     engine: document.getElementById('refineEngine').value,
+    face_px_small: Number(document.getElementById('refineFaceRange').value.split('-')[0]),
+    face_px_large: Number(document.getElementById('refineFaceRange').value.split('-')[1]),
+    crop_factor: Number(document.getElementById('refineCropFactor').value),
+    confidence: Number(document.getElementById('refineConfidence').value),
   };
   if (refineInput.engine === 'h3') {
     refineInput.split_shots = document.getElementById('refineSplit').value === 'per_shot';
