@@ -177,8 +177,16 @@
   </label>
   <label id="refineSplitLabel">H3 clips (testing)
     <select id="refineSplit">
-      <option value="per_shot" selected>Per shot - default (never across a cut)</option>
-      <option value="per_person">One per person - old behaviour (whole track, across cuts)</option>
+      <option value="per_person" selected>One per person - default (whole track)</option>
+      <option value="per_shot">Per shot (never across a cut) - looked worse in testing</option>
+    </select>
+  </label>
+  <label id="refineH3StepsLabel">H3 steps (turbo LoRA)
+    <select id="refineH3Steps">
+      <option value="8" selected>8 - 8-step turbo LoRA (default)</option>
+      <option value="4">4 - 4-step turbo LoRA</option>
+      <option value="3">3 - 4-step turbo LoRA</option>
+      <option value="2">2 - 4-step turbo LoRA</option>
     </select>
   </label>
   <label id="refineStepsLabel">Redraw steps
@@ -216,7 +224,7 @@ const PERSISTED_FIELDS = [
   'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
-  'refineVideoKey', 'refineEngine', 'refineSplit', 'refineSubjects', 'refineDenoise', 'refineCanvas', 'refineSteps',
+  'refineVideoKey', 'refineEngine', 'refineSplit', 'refineH3Steps', 'refineSubjects', 'refineDenoise', 'refineCanvas', 'refineSteps',
 ];
 
 // Show/hide toggle for the key fields. Defaults to shown; the choice is
@@ -671,12 +679,13 @@ async function runJob() {
   statusEl.textContent = 'No active GPU session - click "Run GPU" first. This endpoint no longer accepts jobs without one.';
 }
 
-// H3 engine: always 8 steps (turbo LoRA) and starts at the pack's 0.4
+// H3 engine: its own steps (8 = 8-step turbo LoRA, 4/3/2 = 4-step) and the pack's 0.4
 // strength (Wan's default is 0.6). Both engines use a generic face prompt.
 function refineEngineChanged(fromUser = true) {
   const h3 = document.getElementById('refineEngine').value === 'h3';
   document.getElementById('refineStepsLabel').style.display = h3 ? 'none' : '';
   document.getElementById('refineSplitLabel').style.display = h3 ? '' : 'none';
+  document.getElementById('refineH3StepsLabel').style.display = h3 ? '' : 'none';
   if (fromUser) {
     const denoise = document.getElementById('refineDenoise');
     denoise.value = h3 ? '0.4' : '0.6';
@@ -713,7 +722,8 @@ async function runRefine() {
     engine: document.getElementById('refineEngine').value,
   };
   if (refineInput.engine === 'h3') {
-    refineInput.split_shots = document.getElementById('refineSplit').value !== 'per_person';
+    refineInput.split_shots = document.getElementById('refineSplit').value === 'per_shot';
+    refineInput.steps = Number(document.getElementById('refineH3Steps').value);
   }
   const seedRaw = document.getElementById('seed').value.trim();
   if (seedRaw !== '') {

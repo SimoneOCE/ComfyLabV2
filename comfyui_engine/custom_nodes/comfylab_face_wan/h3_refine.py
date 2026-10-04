@@ -222,10 +222,12 @@ def h3_grid(n):
 class ComfyLabH3FaceRedraw:
     """The H3 engine's redraw, built like ComfyLabWanFaceRedraw:
 
-    - one clip per person per SHOT (H3 never sees a hard cut - a person's
-      crops can string several shots together, and H3 redrawing them as one
-      video carried one shot's face into the next: job 848f54fc put the
-      shot-3 builder's face on the shot-4 mother);
+    - one clip per person over their whole track by default; split_shots
+      gives one clip per person per shot instead. Per shot was built after
+      job 848f54fc put the shot-3 builder's face on the shot-4 mother, but
+      testing showed the whole-scene prompt caused that (the generic prompt
+      fixed it with one clip per person) and per-shot clips made the faces
+      clearly worse (3b749775 vs 36c1d9a7), so it is off;
     - each clip covers the person's whole tracked stretch of that shot
       (padded to H3's 17k+5 grid), including frames where their face is big
       enough to be left alone: those are held unchanged (zero strength) but
@@ -279,9 +281,10 @@ class ComfyLabH3FaceRedraw:
             },
             "optional": {
                 **optional,
-                # Off: one clip per person over their whole track, across cuts -
-                # the pack's (and the first H3 engine's) behaviour. For testing.
-                "split_shots": ("BOOLEAN", {"default": True}),
+                # On: one clip per person per shot. Off (default): one clip per
+                # person over their whole track, across cuts - per-shot clips
+                # made the faces clearly worse in testing.
+                "split_shots": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -293,7 +296,7 @@ class ComfyLabH3FaceRedraw:
 
     def redraw(self, model, clip, vae, audio_vae, audio, fps, prompt, denoise, steps, seed, sampler_name,
                denoise_multiplier_small_face, denoise_multiplier_large_face, face_px_small, face_px_large,
-               gamma, smooth_frames, split_shots=True, **subjects):
+               gamma, smooth_frames, split_shots=False, **subjects):
         import time
         start = time.time()
         curve = dict(denoise_multiplier_small_face=denoise_multiplier_small_face,

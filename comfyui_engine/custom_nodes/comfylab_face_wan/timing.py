@@ -44,6 +44,13 @@ def _time_face_select_loaders():
         pack = sys.modules.get(cls.__module__) if cls is not None else None
         if pack is None:
             return
+        # Not logging: the detector's input size (face_detector.py). Installed
+        # first so the timer below wraps it and times the whole load.
+        try:
+            from . import face_detector
+            face_detector.install(pack)
+        except Exception as e:
+            logging.warning(f"[ComfyLabFaceDetector] not installed, detecting at the default size: {e}")
         load_video = getattr(pack, "_load_video_components", None)
         load_detector = getattr(pack, "_load_detector", None)
         if load_video is not None:

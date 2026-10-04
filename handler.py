@@ -871,7 +871,11 @@ WAN_REFINE_DEFAULT_DENOISE = 0.6   # the "Fix faces" setting (chosen on test 96c
 WAN_REFINE_STEPS = 3               # the "Fix faces" setting (chosen on test 96cb3da1); the lightx2v LoRA is distilled for 4
 WAN_REFINE_SHIFT = 5.0
 H3_REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base denoise; H3PerFrameDenoise scales it per frame
-H3_REFINE_STEPS = 8               # the 8-step turbo LoRA (LORA_CHOICES["turbo"])
+H3_REFINE_STEPS = 8               # default: the 8-step turbo LoRA (LORA_CHOICES["turbo"])
+# H3 refine steps -> turbo LoRA. 8 uses Comfy-Org's 8-step LoRA; 4/3/2 use its
+# 4-step 768p LoRA (LORA_CHOICES["fast"]; crops are redrawn at <=512px). Both
+# are already on the volume (engine script).
+H3_REFINE_STEP_LORAS = {8: "turbo", 4: "fast", 3: "fast", 2: "fast"}
 REFINE_CANVAS_SIZES = {384, 512, 640, 768}  # job "canvas"; default "auto" (tracker picks, capped at 768)
 WAN_REFINE_FILES = {
     "unet": ({"filename": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
@@ -1114,7 +1118,7 @@ def h3_refine_tracker(source, pick, canvas, i):
 
 
 def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None,
-                            split_shots=True):
+                            split_shots=False, steps=H3_REFINE_STEPS):
     """Step 1 of 2 of the H3 engine: track each person, then one
     ComfyLabH3FaceRedraw node redraws everyone - built like the Wan engine's
     node: one clip per person per shot (never across a cut; the whole shot,
@@ -1132,7 +1136,7 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
     source = ["r_select", 0]
     # The generation graph's own node ids and inputs (workflow_template.json),
     # so ComfyUI's cache hands back the models a generation already loaded.
-    base_lora = LORA_CHOICES["turbo"]
+    base_lora = LORA_CHOICES[H3_REFINE_STEP_LORAS[steps]]
     wf["105:6"] = {"class_type": "UNETLoader", "inputs": {
         "unet_name": MODEL_CHOICES["base"]["filename"], "weight_dtype": "default"}}
     wf["105:13"] = {"class_type": "CLIPLoader", "inputs": {
@@ -1147,7 +1151,7 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
     redraw_inputs = {
         "model": ["h_check", 0], "clip": ["105:13", 0], "vae": ["105:11", 0], "audio_vae": ["105:24", 0],
         "audio": ["r_select", 1], "fps": ["r_select", 6],
-        "prompt": prompt or "", "denoise": denoise, "steps": H3_REFINE_STEPS, "seed": seed,
+        "prompt": prompt or "", "denoise": denoise, "steps": steps, "seed": seed,
         "sampler_name": "er_sde",
         # H3PerFrameDenoise's ramp, ending at zero: faces at or above 120px
         # are left exactly as they are.
@@ -1296,11 +1300,19 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     # multi-shot prompt. With it, H3 redrew a shot-4 woman against a prompt
     # mostly about the men in shots 1-3 (job 848f54fc).
     prompt = (job_input.get("prompt") or "").strip()
-    # H3 only, for testing: false = one clip per person across cuts (the first
-    # H3 engine's behaviour) instead of one per person per shot.
-    split_shots = job_input.get("split_shots", True) is not False
+    # H3 only, for testing: true = one clip per person per shot instead of one
+    # per person across cuts. Off by default: per-shot clips made the faces
+    # clearly worse (job 3b749775 vs 36c1d9a7, 0.4, cba2f8ef), and the man's
+    # face on the mother came from the whole-scene prompt, not the cut (0.6
+    # with one clip per person and the generic prompt: no man's face).
+    split_shots = job_input.get("split_shots", False) is True
     if engine == "h3":
-        steps = H3_REFINE_STEPS
+        try:
+            steps = int(job_input.get("steps", H3_REFINE_STEPS))
+        except (TypeError, ValueError):
+            raise ValueError(f"steps must be a whole number, got {job_input.get('steps')!r}")
+        if steps not in H3_REFINE_STEP_LORAS:
+            raise ValueError(f"H3 steps must be one of {sorted(H3_REFINE_STEP_LORAS)}, got {steps}")
     stages = {}
     node_rows = []
     t = time.time()
@@ -1360,7 +1372,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
             t = time.time()
             redraw = submit_and_wait(
                 build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas,
-                                        split_shots),
+                                        split_shots, steps),
                 should_cancel=should_cancel, should_force_kill=should_force_kill)
             stages["comfy_h3_redraw"] = time.time() - t
             if redraw.get("force_killed") or redraw.get("cancelled"):
