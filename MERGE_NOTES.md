@@ -431,3 +431,21 @@ Signed off after the park (813cdb5d), Alpha Timber (cba2f8ef) and family clip
 - Picking: in-range faces only, in order, no two people on one face
 - Detection gaps of up to 8 frames inside a shot are bridged
 - Duplicate check on; generic face prompt; button-only, never automatic
+
+## Start/end frames and reference images (2026-10-04)
+
+Start/end frames: wired on the test page (`startFrame`/`endFrame`), using
+the worker's existing `start_frame`/`end_frame` job fields on
+`MiniMaxH3ImageToVideo` (the current fl2va model supports both). The page
+centre-crops each image to the generation's aspect and sizes it to exact
+width x height before sending: H3 stretches the first frame to the canvas, so
+an uncropped image would come out distorted. A job with a reference image AND
+start/end frames is now refused (user: one or the other per generation).
+Untested on a real generation yet.
+
+Reference images (user: up to 9, `<Picture N>` in the prompt): NOT built yet.
+They need H3's separate ref2va checkpoint (`minimax_h3_ref2va_pruned_int8_convrot`)
+and its own turbo LoRA (`minimax_h3_ref2v_turbo_4step_v0.1`). The installed
+fl2va model only does text and start/end frames. Pending the user's call on
+download, load and RAM. The worker's existing single `ref_image` path would
+run reference conditioning on the fl2va model, which isn't what it's for.

@@ -440,8 +440,11 @@ def build_prompt_payload(job_input, upscale_method="none"):
     #     ref_images go through the prompt via <Picture i> tags rather than
     #     anchoring a specific frame. The two aren't composable without
     #     chaining MiniMaxH3AddGuide on top (not implemented here yet) - a
-    #     ref_image request takes the ReferenceToVideo path and ignores any
-    #     start/end frame given alongside it in this first pass.
+    #     ref_image request takes the ReferenceToVideo path. Mixing the two
+    #     is refused rather than silently dropping the frames (user,
+    #     2026-10-04: one or the other per generation).
+    if ref_image and (start_frame or end_frame):
+        raise ValueError("Use reference images OR start/end frames in one generation, not both")
     if ref_image:
         ref_filename = save_input_image(ref_image, "ref")
         workflow["_ref_image_load"] = {

@@ -66,6 +66,18 @@
   </div>
   <label>Duration (seconds) <input id="duration" type="number" value="7.29" step="0.01" /></label>
   <label>Steps <input id="steps" type="number" value="20" /></label>
+  <fieldset id="frameImages" style="margin:10px 0; padding:8px 10px; border:1px solid #444;">
+    <legend>Start / end frame (optional)</legend>
+    <div style="font-size:0.8rem; color:#aaa; margin-bottom:6px;">
+      Pin the video's first and/or last frame to an image. Each image is centre-cropped to the
+      generation's aspect ratio and sized to it before sending, so nothing gets stretched.
+    </div>
+    <label>Start frame <input id="startFrame" type="file" accept="image/*" /></label>
+    <div id="startFramePreview" class="framePreview"></div>
+    <label>End frame <input id="endFrame" type="file" accept="image/*" /></label>
+    <div id="endFramePreview" class="framePreview"></div>
+    <button type="button" id="clearFrames">Clear frames</button>
+  </fieldset>
   <label>Seed (blank = random; the seed actually used is shown in the result)
     <input id="seed" type="text" inputmode="numeric" placeholder="random" />
   </label>
@@ -671,6 +683,18 @@ async function runJob() {
     genInput.upscale_scale = Number(document.getElementById('upscaleScale').value);
   }
 
+  // Start/end frames: centre-cropped and sized to the generation here, so
+  // H3's first_frame (which stretches to the canvas) never distorts it.
+  try {
+    for (const [id, key] of [['startFrame', 'start_frame'], ['endFrame', 'end_frame']]) {
+      const file = document.getElementById(id).files[0];
+      if (file) genInput[key] = await frameImageBase64(file, genInput.width, genInput.height);
+    }
+  } catch (err) {
+    statusEl.textContent = `Could not read a frame image: ${err.message}`;
+    return;
+  }
+
   // Session mode: a held-open worker is ready, so route through the job
   // queue instead of RunPod's own /run (which would spin up/reuse-by-luck
   // a SEPARATE worker rather than reach the one already held open for
@@ -725,6 +749,46 @@ function refineEngineChanged(fromUser = true) {
     denoise.dispatchEvent(new Event('input'));  // so the remembered value follows
   }
 }
+
+// Reads an image file, centre-crops it to width:height (cover) and draws it
+// at exactly width x height. Returns bare base64 JPEG (no data: prefix), as
+// the worker's save_input_image expects.
+function frameImageBase64(file, width, height) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.max(width / img.naturalWidth, height / img.naturalHeight);
+      const sw = width / scale, sh = height / scale;
+      const sx = (img.naturalWidth - sw) / 2, sy = (img.naturalHeight - sh) / 2;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', 0.95).split(',')[1]);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error(`${file.name} is not an image the browser can open`)); };
+    img.src = url;
+  });
+}
+
+function showFramePreview(inputId, previewId) {
+  const file = document.getElementById(inputId).files[0];
+  const box = document.getElementById(previewId);
+  box.innerHTML = '';
+  if (!file) return;
+  const img = document.createElement('img');
+  img.src = URL.createObjectURL(file);
+  img.style.cssText = 'max-width:160px; max-height:90px; margin:4px 0; border:1px solid #555;';
+  box.appendChild(img);
+}
+document.getElementById('startFrame').addEventListener('change', () => showFramePreview('startFrame', 'startFramePreview'));
+document.getElementById('endFrame').addEventListener('change', () => showFramePreview('endFrame', 'endFramePreview'));
+document.getElementById('clearFrames').addEventListener('click', () => {
+  for (const id of ['startFrame', 'endFrame']) document.getElementById(id).value = '';
+  for (const id of ['startFramePreview', 'endFramePreview']) document.getElementById(id).innerHTML = '';
+});
 
 async function runRefine() {
   const btn = document.getElementById('refineBtn');
