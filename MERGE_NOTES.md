@@ -172,6 +172,20 @@ agrees it's a property of head-size-in-frame, not output resolution
   the prompt enhancer outputs a fixed style label (photoreal / animated)
   stored with each generation; fallback for videos without one: a quick
   image check (CLIP) on a few frames, hiding the button when unsure.
+  **"Repair faces" button - site UX requirements (user, 2026-10-04; not
+  built):**
+  - Obvious right after a generation is served, so a user who sees broken
+    faces immediately knows a fix exists rather than being put off.
+  - Also a clear option in the site's built-in CapCut-style editor.
+  - In the editor it must be obvious from how it's integrated (not from
+    explanatory text) that it applies per clip, not to the whole edit -
+    e.g. attached to the selected clip on the timeline.
+  - A question-mark icon next to it with: "Minimax H3 may struggle on
+    smaller faces, notice glitched faces? Repair using this tool 2-5 mins".
+  - Pressing it shows a dropdown of styles to pick before it runs; the
+    chosen style is inserted into the generic face prompt. Realistic is the
+    default. (Ties in with the style-gating note above: a style label saved
+    at generation could preselect the dropdown.)
   **To do (noted 2026-10-04, not built): Stop GPU must kill instantly -
   force kill, whatever is running.** Today a job in progress is force-killed
   on Stop (should_force_kill), but the worker's own warmup generations are
