@@ -369,3 +369,16 @@ her max of 63 (the paste is full up to ~64px).
 Possible default change (user, 2026-10-04, not decided): Wan strength 0.4
 instead of 0.3 for faces 32px and up. 0.3 and 0.4 both looked good on the park
 video once the faces were inside the range. Small faces stay at 0.6.
+
+## Bug: the Alpha Timber daughter was skipped after the pick fix (fixed 2026-10-04)
+
+The pick fix above also locked everyone in a shot on the frame with the most
+in-range faces. On Alpha Timber (jobs c56dbedf / a3f12049 / efca951f) that
+was frame 329, near the end of the family shot, where a stray 4th small face
+appears. Tracked back from there, the father's tracker lost him after frame 330
+and the daughter's slot sat on a face detected on only 13 frames, so she was
+effectively never fixed. Before the fix (d48baabc) the lock was frame 264, the
+shot's start, and she was tracked on 94 frames. Now each person locks on the
+first frame of the shot holding that many in-range faces (the pack's own
+rule), still ranked over in-range faces only, so the park fix holds.
+If two people land on one face, the duplicate check drops the later one.

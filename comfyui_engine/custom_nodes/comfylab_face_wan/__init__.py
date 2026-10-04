@@ -473,21 +473,25 @@ class ComfyLabSmallFaceCount:
 
 def _small_face_lock(boxes, a, b, index, face_px_large, face_px_min=0.0):
     """(frame, box) for person `index` in shot [a, b): the index-th largest
-    face from face_px_min up to under face_px_large, on the shot's frame with
-    the most such faces (the earliest, if tied). Every person in the shot
-    locks on that same frame, so no two of them start on the same face.
-    (-1, -1) if no frame holds that many."""
-    best_frame, best = -1, []
+    face from face_px_min up to under face_px_large, on the FIRST frame of the
+    shot holding that many such faces (the pack's own lock rule, ranked over
+    in-range faces only). (-1, -1) if no frame holds that many.
+
+    Not "the frame with the most faces": tried that so all people shared a
+    lock frame, but on Alpha Timber (cba2f8ef) that frame was 329, near the
+    end of the family shot where a stray 4th face shows up - tracked back
+    from there the father was lost and the daughter's slot sat on a face
+    seen on 13 frames, so she wasn't fixed. Locked at the shot's start (264)
+    she was tracked on 94 frames. Two people landing on one face is what the
+    duplicate check is for."""
     for f in range(int(a), min(int(b), len(boxes))):
         inside = [(float(q[3]) - float(q[1]), j) for j, q in enumerate(boxes[f])
                   if face_px_min <= float(q[3]) - float(q[1]) < face_px_large]
-        if len(inside) > len(best):
-            best_frame, best = f, inside
-    if index >= len(best):
-        return -1, -1
-    # Largest first; ties left to right so ranks don't swap.
-    best.sort(key=lambda hj: (-hj[0], float(boxes[best_frame][hj[1]][0])))
-    return best_frame, best[index][1]
+        if len(inside) > index:
+            # Largest first; ties left to right so ranks don't swap.
+            inside.sort(key=lambda hj: (-hj[0], float(boxes[f][hj[1]][0])))
+            return f, inside[index][1]
+    return -1, -1
 
 
 class ComfyLabFacePickIndex:
@@ -525,13 +529,12 @@ class ComfyLabFacePickIndex:
         width, height = face_pick["src_size"]
         rank = pack._review_select("largest_face")
         if skip_large:
-            # Rank among the in-range faces only, all people locked on one frame
-            # per shot. The old way ranked among ALL faces, skipping the shot's
+            # Rank among the in-range faces only. The old way ranked among ALL faces, skipping the shot's
             # large-face count - but that count is the most large faces on screen
             # at once, not on the lock frame. With faces hovering at the
             # face_px_large line, the skip overshot onto 16px background people
             # (813cdb5d shot 2: persons 2 and 3 both landed on a 16px face, and a
-            # 56-58px friend went unfixed).
+            # 56-58px friend went unfixed). See _small_face_lock for the frame.
             counts = shot_face_counts(face_pick, face_px_large, face_px_min)
             picks, present = [], []
             for k, (a, b) in enumerate(segs):
