@@ -417,6 +417,21 @@ def shot_face_counts(face_pick, face_px_large, face_px_min=0.0):
     return out
 
 
+def _large_face_ranges(face_pick, k, face_px_large):
+    """Logging only: for shot k, the size range (smallest-largest px) of each
+    face skipped as too big, largest first - the k-th largest such face per
+    frame - so the face_px_large line can be tuned from real faces."""
+    boxes = face_pick["boxes"]
+    a, b = (int(v) for v in face_pick["segments"][k])
+    ranks = {}
+    for f in range(a, min(b, len(boxes))):
+        heights = sorted((float(q[3]) - float(q[1]) for q in boxes[f]), reverse=True)
+        for r, h in enumerate(h for h in heights if h >= face_px_large):
+            ranks.setdefault(r, []).append(h)
+    need = max(3, int(np.ceil(0.05 * max(1, b - a))))
+    return [f"{round(min(v))}-{round(max(v))}px" for r, v in sorted(ranks.items()) if len(v) >= need]
+
+
 class ComfyLabSmallFaceCount:
     """How many people the refine should redraw: the most faces under
     face_px_large tall on screen together in any one shot, capped at
@@ -444,7 +459,9 @@ class ComfyLabSmallFaceCount:
         lines = [f"small_face_people={people} found={found}"]
         for k, (sm, lg) in enumerate(counts):
             px = f" - repairable faces ~{', '.join(f'{h}px' for h in sizes[k])}" if k < len(sizes) and sizes[k] else ""
-            lines.append(f"shot {k + 1}: {sm} small face(s), {lg} large{px}")
+            big = _large_face_ranges(face_pick, k, face_px_large)
+            big = f" - too big, left alone: {', '.join(big)}" if big else ""
+            lines.append(f"shot {k + 1}: {sm} small face(s), {lg} large{px}{big}")
         if face_px_min > 0:
             lines.append(f"faces under {face_px_min:.0f}px or from {face_px_large:.0f}px up are left alone")
         if found > people:
