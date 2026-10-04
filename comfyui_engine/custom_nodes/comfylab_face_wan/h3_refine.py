@@ -207,7 +207,6 @@ class ComfyLabH3StepCheck:
 
 
 KEEP_BELOW = 0.02   # strength under which a frame keeps its original crop (as the Wan engine)
-RANGE_MARGIN = 4    # frames of context kept either side of a small-face stretch (as the Wan engine)
 REDRAW_MAX = 512    # crops bigger than this are redrawn at this size (as the Wan engine)
 H3_MULTIPLE = 32    # H3 canvases are multiples of 32 (comfy_extras/nodes_minimax_h3.py CANVAS_MULTIPLE)
 
@@ -227,8 +226,13 @@ class ComfyLabH3FaceRedraw:
       crops can string several shots together, and H3 redrawing them as one
       video carried one shot's face into the next: job 848f54fc put the
       shot-3 builder's face on the shot-4 mother);
-    - each clip covers only the stretch where the face is small, plus
-      RANGE_MARGIN frames either side, padded to H3's 17k+5 grid;
+    - each clip covers the person's whole tracked stretch of that shot
+      (padded to H3's 17k+5 grid), including frames where their face is big
+      enough to be left alone: those are held unchanged (zero strength) but
+      stay in the clip so H3 sees the person's clear face while redrawing
+      the small-face frames - the identity anchor for someone walking toward
+      the camera. A shot where none of the person's frames need redrawing is
+      skipped;
     - redrawn at no more than REDRAW_MAX, resized back after;
     - the prompt is encoded once for every clip;
     - each clip goes through the pack's H3PerFrameDenoise (its slice of the
@@ -307,18 +311,16 @@ class ComfyLabH3FaceRedraw:
             report.append(line)
             work.append((i, crops, strength, transform))
 
-        # One clip per person per shot, only where the face is small (+ margin).
+        # One clip per person per shot - the whole shot, so the frames where
+        # their face is big stay in as (unchanged) context. Shots with nothing
+        # to redraw are skipped.
         clips = []
         for i, crops, strength, transform in work:
             n = len(strength)
             for a, b in (transform.get("segments") or [(0, n)]):
                 a, b = max(0, int(a)), min(n, int(b))
-                idx = np.flatnonzero(strength[a:b] >= KEEP_BELOW)
-                if idx.size == 0:
-                    continue
-                clip_start = max(a, a + int(idx[0]) - RANGE_MARGIN)
-                clip_end = min(b, a + int(idx[-1]) + 1 + RANGE_MARGIN)
-                clips.append((i, clip_start, clip_end))
+                if b > a and (strength[a:b] >= KEEP_BELOW).any():
+                    clips.append((i, a, b))
 
         outputs = {i: crops for i, crops, _, _ in work}
         redrawn = {i: np.zeros(len(st), dtype=bool) for i, _, st, _ in work}

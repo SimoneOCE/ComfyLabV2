@@ -1116,9 +1116,9 @@ def h3_refine_tracker(source, pick, canvas, i):
 def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None):
     """Step 1 of 2 of the H3 engine: track each person, then one
     ComfyLabH3FaceRedraw node redraws everyone - built like the Wan engine's
-    node: one clip per person per shot (never across a cut), only the
-    small-face stretch of each shot, at no more than 512px, prompt encoded
-    once. Each clip's per-frame strength comes from the pack's
+    node: one clip per person per shot (never across a cut; the whole shot,
+    so frames where the face is big enough to leave alone stay in as
+    unchanged context), at no more than 512px, prompt encoded once. Each clip's per-frame strength comes from the pack's
     H3PerFrameDenoise (full on faces <= 30px, zero at >= 120px, zero where
     the face is lost); its latent is used, not its patched model (see
     comfylab_face_wan/h3_refine.py). The redrawn crops and their stitch
