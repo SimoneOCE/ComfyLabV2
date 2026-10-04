@@ -514,3 +514,10 @@ human); 3) two people (e.g. a rap video, rappers -> hippo + lion).
   each queued by hand; frames are taken 1:1 from the source (30fps source ->
   2.7s per segment). Estimate (unmeasured): ~70-90s per segment on a 5090.
 - Record "Prompt executed in" for every run; replace the estimates above.
+- Also look at GeekatplayStudio/wan-scail2-gap: custom nodes that fill the
+  stock SCAIL-2 template's gaps (auto chunking of any-length video with
+  stitching, up to 6 characters each bound to a tracked person, per-chunk
+  prompts, scene-cut detection, checkpointing). Small project (15 stars, 10
+  commits, no visible license) - read its code before installing. Its notes:
+  non-human characters may need turbo off and lower pose strength (slower);
+  4-6 characters work best in quality mode.
