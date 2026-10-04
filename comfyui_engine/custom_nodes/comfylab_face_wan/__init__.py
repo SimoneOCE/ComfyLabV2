@@ -38,6 +38,7 @@ import comfy.model_management as mm
 import nodes
 
 from . import duplicates
+from . import gaps
 from comfy_extras.nodes_model_advanced import ModelSamplingSD3
 
 TAG = "[ComfyLabWanFace]"
@@ -160,12 +161,14 @@ class ComfyLabWanFaceRedraw:
             transform = subjects.get(f"transform_{i}")
             if crops is None or transform is None:
                 continue
+            transform, bridged = gaps.bridge(transform)
             n = crops.shape[0]
             strength, face = face_strength_curve(transform, n, face_px_small, face_px_large, smooth_frames,
                                                  subjects.get("face_px_min") or 0.0)
             line = (f"subject {i}: {n} frames, face {face.min():.0f}-{face.max():.0f}px, "
                     f"strength max {strength.max():.2f} mean {strength.mean():.2f}, "
-                    f"kept as-is {int((strength < KEEP_BELOW).sum())}/{n} frames")
+                    f"kept as-is {int((strength < KEEP_BELOW).sum())}/{n} frames"
+                    + (f", {bridged} missed-detection frame(s) bridged" if bridged else ""))
             _log(line)
             report.append(line)
             work.append((i, crops, strength, transform))

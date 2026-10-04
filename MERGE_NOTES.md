@@ -382,3 +382,16 @@ shot's start, and she was tracked on 94 frames. Now each person locks on the
 first frame of the shot holding that many in-range faces (the pack's own
 rule), still ranked over in-range faces only, so the park fix holds.
 If two people land on one face, the duplicate check drops the later one.
+
+## Ghosting on the family shot: bridging short detection misses (2026-10-04)
+
+The Alpha Timber family shot (job 5103637e) was good on some frames and
+ghosted on others. The paste weight is the tracker's "face detected this
+frame", smoothed, so each frame the detector misses on a small face dips the
+paste to ~40-80% for a few frames. That blends the redrawn face with the
+original melted one, which shows as a pulsing ghost. The daughter missed
+frames 268, 311-312 and 314. `gaps.py` now treats gaps of up to 8 frames
+(1/3 s) inside a shot, with a detection on both sides, as detected. Weights
+are only raised, so real dropouts (face turned away, left the shot) and shot
+edges fade exactly as before. Both engines; the subject line in the report
+says how many frames were bridged.

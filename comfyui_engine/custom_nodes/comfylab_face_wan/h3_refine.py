@@ -316,12 +316,15 @@ class ComfyLabH3FaceRedraw:
             crops, transform = subjects.get(f"crops_{i}"), subjects.get(f"transform_{i}")
             if crops is None or transform is None:
                 continue
+            from . import gaps
+            transform, bridged = gaps.bridge(transform)
             n = min(crops.shape[0], len(transform["boxes"]))
             strength, face = pfd_strength(transform, **curve, face_px_min=subjects.get("face_px_min") or 0.0)
             strength = strength[:n]
             line = (f"subject {i}: {n} frames, face {face.min():.0f}-{face.max():.0f}px, "
                     f"strength max {strength.max():.2f} mean {strength.mean():.2f}, "
-                    f"kept as-is {int((strength < KEEP_BELOW).sum())}/{n} frames")
+                    f"kept as-is {int((strength < KEEP_BELOW).sum())}/{n} frames"
+                    + (f", {bridged} missed-detection frame(s) bridged" if bridged else ""))
             _log(line)
             report.append(line)
             work.append((i, crops, strength, transform))
