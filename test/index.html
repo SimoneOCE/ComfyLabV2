@@ -142,7 +142,8 @@
     session above. The first refine on a volume downloads the Wan models (~22.5GB, once). Upscaled
     sources are refined at native size and upscaled back.
   </p>
-  <label>Video key to refine (fills in with your latest result)
+  <label>Video key to refine (fills in with your latest GENERATION - never with a refine result, so a
+    refine is never run on an already-refined video by accident)
     <input id="refineVideoKey" type="text" placeholder="938602e6-1f35-45bb-afb2-578061b00562.mp4" />
   </label>
   <label>Engine
@@ -645,7 +646,7 @@ async function runJob() {
     statusEl.textContent = 'Queuing job on held-open session worker...';
     try {
       const videoKey = await runSessionJob(genInput, statusEl);
-      if (videoKey) await handleVideoKey(videoKey);
+      if (videoKey) await handleVideoKey(videoKey, { fillRefineBox: true });
     } catch (err) {
       statusEl.textContent = `Error: ${err.message}`;
     } finally {
@@ -727,13 +728,16 @@ async function runRefine() {
   }
 }
 
-async function handleVideoKey(videoKey) {
+// fillRefineBox: only a new generation fills the refine box. A refine result
+// (or a resolved key) used to fill it too, so the next refine silently ran on
+// the previous refine's output - 0.6 -> 0.5 -> 0.4 stacked on one video.
+async function handleVideoKey(videoKey, { fillRefineBox = false } = {}) {
   const statusEl = document.getElementById('status');
   const videoEl = document.getElementById('resultVideo');
   const downloadWrap = document.getElementById('downloadLinkWrap');
   try {
     statusEl.textContent += `\n\nResolving a presigned Wasabi URL (valid 1hr)...`;
-    document.getElementById('refineVideoKey').value = videoKey;
+    if (fillRefineBox) document.getElementById('refineVideoKey').value = videoKey;
     const url = await resolveVideoUrl(videoKey);
     statusEl.textContent += `\n\nResolved - see below.`;
     videoEl.src = url;
