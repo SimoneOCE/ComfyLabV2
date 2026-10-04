@@ -116,7 +116,7 @@ class ComfyLabH3AudioLock:
 
 
 def pfd_strength(transform, denoise_multiplier_small_face, denoise_multiplier_large_face,
-                 face_px_small, face_px_large, gamma, smooth_frames):
+                 face_px_small, face_px_large, gamma, smooth_frames, face_px_min=0.0):
     """Per-frame strength exactly as H3PerFrameDenoise.run computes it
     (absolute_px), plus each frame's face height."""
     from . import _pack_module
@@ -134,6 +134,10 @@ def pfd_strength(transform, denoise_multiplier_small_face, denoise_multiplier_la
     absent = transform.get("absent")
     if absent and len(absent) == len(strength):
         strength[np.array(absent, dtype=bool)] = 0.0
+    # Faces under face_px_min: nothing pasted (H3PerFrameDenoise doesn't know
+    # this floor, so those frames may be redrawn but are never used).
+    if face_px_min > 0:
+        strength[face < float(face_px_min)] = 0.0
     return np.clip(strength, 0.0, 1.0), face
 
 
@@ -287,6 +291,7 @@ class ComfyLabH3FaceRedraw:
                 "split_shots": ("BOOLEAN", {"default": False}),
                 # The detector's own face boxes, for the duplicate-person check.
                 "face_pick": ("H3FACEPICK",),
+                "face_px_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0}),
             },
         }
 
@@ -312,7 +317,7 @@ class ComfyLabH3FaceRedraw:
             if crops is None or transform is None:
                 continue
             n = min(crops.shape[0], len(transform["boxes"]))
-            strength, face = pfd_strength(transform, **curve)
+            strength, face = pfd_strength(transform, **curve, face_px_min=subjects.get("face_px_min") or 0.0)
             strength = strength[:n]
             line = (f"subject {i}: {n} frames, face {face.min():.0f}-{face.max():.0f}px, "
                     f"strength max {strength.max():.2f} mean {strength.mean():.2f}, "

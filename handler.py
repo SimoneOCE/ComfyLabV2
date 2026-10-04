@@ -865,7 +865,15 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 REFINE_MODE = "face_refine"
 REFINE_ENGINES = {"wan", "h3"}
 REFINE_MAX_SUBJECTS = 4            # most people refined per shot (the largest small faces win)
-REFINE_FACE_PX_LARGE = 120.0       # faces this tall or more are left as they are
+# Face heights (source px, detector face box) the refine works on - set by the
+# user 2026-10-04 from real videos: the Alpha Timber mother and daughter
+# (23-31px, melted) are the smallest worth fixing; on the faces test video
+# (813cdb5d) three friends at ~57-64px looked fine and one at ~52-58px didn't.
+# Only a few px separate those, so this edge is tight - tune from the per-shot
+# sizes the face count now logs.
+REFINE_FACE_PX_MIN = 22.0          # smaller faces are ignored: not counted, tracked or pasted
+REFINE_FACE_PX_SMALL = 45.0        # full strength at or below this
+REFINE_FACE_PX_LARGE = 60.0        # none at or above this (was 120)
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
 WAN_REFINE_DEFAULT_DENOISE = 0.6   # the "Fix faces" setting (chosen on test 96cb3da1); starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
 WAN_REFINE_STEPS = 4               # default (user, 2026-10-04); 3 and 2 are test-page options (2 saved ~20s of redraw on cba2f8ef). The lightx2v LoRA is distilled for 4
@@ -1017,6 +1025,7 @@ def build_people_count_payload(source_filename):
         "r_select": refine_select_node(source_filename),
         "r_count": {"class_type": "ComfyLabSmallFaceCount", "inputs": {
             "face_pick": ["r_select", 2], "face_px_large": REFINE_FACE_PX_LARGE,
+            "face_px_min": REFINE_FACE_PX_MIN,
             "max_people": REFINE_MAX_SUBJECTS}},
         "r_count_report": {"class_type": "PreviewAny", "inputs": {"source": ["r_count", 1]}},
     }
@@ -1043,7 +1052,8 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         "shift": WAN_REFINE_SHIFT, "seed": seed,
         # The pack's H3PerFrameDenoise ramp, ending at zero: faces at or
         # above 120px are left exactly as they are.
-        "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE, "smooth_frames": 9,
+        "face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE, "smooth_frames": 9,
+        "face_px_min": REFINE_FACE_PX_MIN,
         "sage_attention": True,
         # The detector's own face boxes, for the duplicate-person check.
         "face_pick": ["r_select", 2],
@@ -1054,7 +1064,8 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         # big enough are skipped, since the refine leaves them alone anyway.
         wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
             "face_pick": ["r_select", 2], "index": i,
-            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE}}
+            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE,
+            "face_px_min": REFINE_FACE_PX_MIN}}
         wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
             "images": source, "face_pick": [p + "pick", 0],
             # detector/confidence/cut settings are inert with a face_pick wired
@@ -1158,7 +1169,8 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         # H3PerFrameDenoise's ramp, ending at zero: faces at or above 120px
         # are left exactly as they are.
         "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
-        "face_px_small": 30.0, "face_px_large": REFINE_FACE_PX_LARGE, "gamma": 1.0, "smooth_frames": 9,
+        "face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE, "gamma": 1.0,
+        "smooth_frames": 9, "face_px_min": REFINE_FACE_PX_MIN,
         "split_shots": bool(split_shots),
         # The detector's own face boxes, for the duplicate-person check.
         "face_pick": ["r_select", 2],
@@ -1168,7 +1180,8 @@ def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, ha
         p = f"r{i}_"
         wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
             "face_pick": ["r_select", 2], "index": i,
-            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE}}
+            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE,
+            "face_px_min": REFINE_FACE_PX_MIN}}
         wf[p + "pick_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pick", 1]}}
         wf[p + "track"] = h3_refine_tracker(source, [p + "pick", 0], canvas, i)
         wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}

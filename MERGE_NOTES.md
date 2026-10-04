@@ -145,6 +145,15 @@ agrees it's a property of head-size-in-frame, not output resolution
   - H3 steps: 8 (8-step turbo LoRA, default), or 4/3/2 with the 4-step
     768p turbo LoRA - to be compared (roadmap step 1).
   - Decision: if H3 is chosen, the Wan engine gets removed.
+  - **Face-size range retuned (user, 2026-10-04):** ignore faces under 22px
+    (not counted, tracked or pasted - the faces test video's aerial shot
+    had 5-10px "faces" redrawn at full strength); full strength up to 45px,
+    none from 60px (was 30 -> 120). Calibrated on: Alpha Timber mother and
+    daughter 23-31px (fix, smallest worth fixing); faces test video
+    (813cdb5d) friends ~57-64px (fine, don't touch) vs the middle one
+    ~52-58px (fix). Those last two are only a few px apart, so this edge is
+    fragile; the face count now logs each shot's repairable face sizes
+    ("repairable faces ~59px, 55px, ...") to tune it.
   **Decision (user, 2026-10-04): no automatic face fixing - "Fix faces"
   stays a button the user presses after generation.** Face size is not a
   reliable sign that a face is broken: on the Shrek video (51245f65, job

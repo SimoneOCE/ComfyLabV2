@@ -69,7 +69,7 @@ def _vram_gb():
     return f"VRAM used {(total - free) / 1e9:.1f}/{total / 1e9:.1f} GB"
 
 
-def face_strength_curve(transform, n, face_px_small, face_px_large, smooth_frames):
+def face_strength_curve(transform, n, face_px_small, face_px_large, smooth_frames, face_px_min=0.0):
     """Per-frame strength 0..1 from the tracker's boxes - same inputs and ramp
     as the pack's H3PerFrameDenoise, ending at 0 for large faces."""
     boxes = transform["boxes"]
@@ -99,6 +99,10 @@ def face_strength_curve(transform, n, face_px_small, face_px_large, smooth_frame
     absent = transform.get("absent")
     if absent is not None and len(absent) == n:
         strength[np.array(absent, dtype=bool)] = 0.0
+    # Faces under face_px_min are too small to repair (and are where false
+    # detections come from): left exactly as they are.
+    if face_px_min > 0:
+        strength[face < float(face_px_min)] = 0.0
     return np.clip(strength, 0.0, 1.0), face
 
 
@@ -111,6 +115,7 @@ class ComfyLabWanFaceRedraw:
             optional[f"transform_{i}"] = ("H3FACEXFORM",)
         # The detector's own face boxes, for the duplicate-person check.
         optional["face_pick"] = ("H3FACEPICK",)
+        optional["face_px_min"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0})
         return {
             "required": {
                 "crops_0": ("IMAGE",),
@@ -151,7 +156,8 @@ class ComfyLabWanFaceRedraw:
             if crops is None or transform is None:
                 continue
             n = crops.shape[0]
-            strength, face = face_strength_curve(transform, n, face_px_small, face_px_large, smooth_frames)
+            strength, face = face_strength_curve(transform, n, face_px_small, face_px_large, smooth_frames,
+                                                 subjects.get("face_px_min") or 0.0)
             line = (f"subject {i}: {n} frames, face {face.min():.0f}-{face.max():.0f}px, "
                     f"strength max {strength.max():.2f} mean {strength.mean():.2f}, "
                     f"kept as-is {int((strength < KEEP_BELOW).sum())}/{n} frames")
@@ -346,10 +352,29 @@ def _pack_module():
     return sys.modules[select_cls.__module__]
 
 
-def shot_face_counts(face_pick, face_px_large):
-    """Per shot: (small, large) - how many faces under / at-or-over
-    face_px_large tall are on screen together. Robust to stray detections:
-    a count only counts if at least max(3, 5% of the shot's) frames reach it."""
+def shot_face_sizes(face_pick, face_px_large, face_px_min=0.0):
+    """Per shot: median height of each repairable face, largest first - the
+    k-th largest face per frame, medianed over the frames that have one.
+    Logging only (tuning face_px_min / face_px_large)."""
+    boxes = face_pick["boxes"]
+    out = []
+    for a, b in face_pick["segments"]:
+        ranks = {}
+        for f in range(int(a), min(int(b), len(boxes))):
+            heights = sorted((float(q[3]) - float(q[1]) for q in boxes[f]), reverse=True)
+            for k, h in enumerate(h for h in heights if face_px_min <= h < face_px_large):
+                ranks.setdefault(k, []).append(h)
+        out.append([round(float(np.median(v))) for k, v in sorted(ranks.items())
+                    if len(v) >= max(3, int(np.ceil(0.05 * max(1, int(b) - int(a)))))])
+    return out
+
+
+def shot_face_counts(face_pick, face_px_large, face_px_min=0.0):
+    """Per shot: (small, large) - how many faces from face_px_min up to under
+    face_px_large tall, and at-or-over face_px_large, are on screen together.
+    Faces under face_px_min aren't counted at all. Robust to stray
+    detections: a count only counts if at least max(3, 5% of the shot's)
+    frames reach it."""
     boxes = face_pick["boxes"]
     out = []
     for a, b in face_pick["segments"]:
@@ -357,7 +382,7 @@ def shot_face_counts(face_pick, face_px_large):
         small, large = [], []
         for f in range(a, min(b, len(boxes))):
             heights = [float(q[3]) - float(q[1]) for q in boxes[f]]
-            small.append(sum(h < face_px_large for h in heights))
+            small.append(sum(face_px_min <= h < face_px_large for h in heights))
             large.append(sum(h >= face_px_large for h in heights))
         need = max(3, int(np.ceil(0.05 * max(1, len(small)))))
 
@@ -380,20 +405,25 @@ class ComfyLabSmallFaceCount:
     def INPUT_TYPES(cls):
         return {"required": {"face_pick": ("H3FACEPICK",),
                              "face_px_large": ("FLOAT", {"default": 120.0, "min": 2.0, "max": 2000.0}),
-                             "max_people": ("INT", {"default": 4, "min": 1, "max": 4})}}
+                             "max_people": ("INT", {"default": 4, "min": 1, "max": 4})},
+                "optional": {"face_px_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0})}}
 
     RETURN_TYPES = ("INT", "STRING")
     RETURN_NAMES = ("people", "report")
     FUNCTION = "run"
     CATEGORY = "ComfyLab"
 
-    def run(self, face_pick, face_px_large, max_people):
-        counts = shot_face_counts(face_pick, face_px_large)
+    def run(self, face_pick, face_px_large, max_people, face_px_min=0.0):
+        counts = shot_face_counts(face_pick, face_px_large, face_px_min)
+        sizes = shot_face_sizes(face_pick, face_px_large, face_px_min)
         found = max((sm for sm, _ in counts), default=0)
         people = min(found, int(max_people))
         lines = [f"small_face_people={people} found={found}"]
         for k, (sm, lg) in enumerate(counts):
-            lines.append(f"shot {k + 1}: {sm} small face(s), {lg} large")
+            px = f" - repairable faces ~{', '.join(f'{h}px' for h in sizes[k])}" if k < len(sizes) and sizes[k] else ""
+            lines.append(f"shot {k + 1}: {sm} small face(s), {lg} large{px}")
+        if face_px_min > 0:
+            lines.append(f"faces under {face_px_min:.0f}px or from {face_px_large:.0f}px up are left alone")
         if found > people:
             lines.append(f"{found} small faces in one shot - the {people} largest of them are refined")
         report = "\n".join(lines)
@@ -421,14 +451,15 @@ class ComfyLabFacePickIndex:
                     # face under face_px_large in each shot, skipping the faces
                     # that are already big (the refine leaves those alone anyway).
                     "skip_large": ("BOOLEAN", {"default": False}),
-                    "face_px_large": ("FLOAT", {"default": 120.0, "min": 2.0, "max": 2000.0})}}
+                    "face_px_large": ("FLOAT", {"default": 120.0, "min": 2.0, "max": 2000.0}),
+                    "face_px_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0})}}
 
     RETURN_TYPES = ("H3FACEPICK", "STRING")
     RETURN_NAMES = ("face_pick", "report")
     FUNCTION = "run"
     CATEGORY = "ComfyLab"
 
-    def run(self, face_pick, index, skip_large=False, face_px_large=120.0):
+    def run(self, face_pick, index, skip_large=False, face_px_large=120.0, face_px_min=0.0):
         pack = _pack_module()
         boxes, confs = face_pick["boxes"], face_pick["confs"]
         segs = [(int(a), int(b)) for a, b in face_pick["segments"]]
@@ -436,7 +467,7 @@ class ComfyLabFacePickIndex:
         rank = pack._review_select("largest_face")
         if skip_large:
             # Per shot, rank among ALL faces = the shot's large faces + index.
-            counts = shot_face_counts(face_pick, face_px_large)
+            counts = shot_face_counts(face_pick, face_px_large, face_px_min)
             picks, present = [], []
             for k, (a, b) in enumerate(segs):
                 small, large = counts[k]
