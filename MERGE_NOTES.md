@@ -116,6 +116,25 @@ agrees it's a property of head-size-in-frame, not output resolution
   unchanged context, the identity anchor for someone walking toward the
   camera. Ruled out (user, 2026-10-04): giving H3 a reference photo of the
   person's face.
+  **Test results and decisions (2026-10-04, all on cba2f8ef, seed 424242):**
+  - Strength: 0.4 for H3 (0.5/0.6 look bad). The pack ships 0.4; on H3's
+    shift-12 schedule 0.4 already redraws ~89%, 0.6 ~95%.
+  - Clips: one per person (whole track) is the default. Per-shot clips made
+    faces clearly worse (3b749775 per shot vs 36c1d9a7 per person, 0.4);
+    why is still open. Kept as a test option (job split_shots: true).
+  - Prompt: the generic face prompt stays. The man's face on the mother came
+    from the whole-scene prompt, not the cut: 0.6 with one clip per person
+    and the generic prompt showed no man's face.
+  - Side effect to fix later: with the generic prompt the shot-3 builder's
+    lips follow the off-screen narration (too fast, jaggy). The scene prompt
+    said the narrator is off-screen; no easy fix (each option adds a layer).
+  - The girl's face (smallest, 23-29px) flickers back to melted near the end:
+    the detector misses it on a few frames (308, 353-356, 360). Detector now
+    runs at 960px instead of 640 (face_detector.py) - a 23px face reached it
+    at ~11px, now ~16px. Adds ~5-10s to face finding. Both engines.
+  - H3 steps: 8 (8-step turbo LoRA, default), or 4/3/2 with the 4-step
+    768p turbo LoRA - to be compared (roadmap step 1).
+  - Decision: if H3 is chosen, the Wan engine gets removed.
   **To do (noted 2026-10-04, not built): Stop GPU must kill instantly -
   force kill, whatever is running.** Today a job in progress is force-killed
   on Stop (should_force_kill), but the worker's own warmup generations are
