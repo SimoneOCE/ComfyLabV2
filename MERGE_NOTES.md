@@ -83,6 +83,11 @@ agrees it's a property of head-size-in-frame, not output resolution
   loaded is reused (no second copy); session start unchanged. Settings: base
   denoise 0.4 (pack default), 8 steps er_sde, turbo LoRA, source prompt.
   Untested on a GPU yet.
+  Later (asked 2026-10-04, not built): a 4-step option using Comfy-Org's
+  4-step turbo LoRA (minimax_h3_fl2v_turbo_4step_v1.0_768p, LORA_CHOICES
+  "fast" - already on the volume, nothing to download). Roughly halves the
+  H3 redraw time; trained for 768p, and crops are capped at 768. Build only
+  after the 8-step H3 refine is confirmed working, then compare same seed.
 - **"Fix faces" button settings (chosen 2026-10-03, test job 96cb3da1 on
   cba2f8ef):** strength (denoise) 0.6, 3 steps, Standard crop size (tracker
   canvas, redrawn at up to 512px), people counted automatically (up to 4
