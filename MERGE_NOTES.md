@@ -477,3 +477,15 @@ Fun ControlNet Union template (motion transfer, Higgsfield Genjutsu-style) is
 under way and will inform it. The DaSiWa session option stays on the test page
 for now. Not built yet: the idle-timer fix (idle clock should start after the
 warmup, not before a first-time download) and the reference-image UI.
+
+## To test later: Ref2VA for plain text-to-video (2026-10-04)
+
+Nobody has published a head-to-head of Ref2VA with no references against FL2VA
+for text-only generation. All guidance says "use FL2VA for text", but no tests
+back it either way. Comfy-Org's own Fun ControlNet template runs Ref2VA with
+empty reference slots and calls that text-to-video, so it works. If Ref2VA's
+text-only output matches base, one model could cover text AND references with
+no swapping (start/end frames would be the one gap: Ref2VA's node has no
+first/last-frame slots). Test on the RunPod pod: Flash/Dora prompt, seed
+424242, 1280x720, 15s, 20 steps, no references, ControlNet bypassed, compared
+against the user's favourite base run a9f8afdc.
