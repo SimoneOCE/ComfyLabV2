@@ -163,10 +163,18 @@
   </label>
   <label>Strength
     <select id="refineDenoise">
-      <option value="0.3">0.3 - gentle</option>
+      <option value="0.3" selected>0.3 - Wan default</option>
       <option value="0.4">0.4</option>
       <option value="0.5">0.5</option>
-      <option value="0.6" selected>0.6 - site default (strongest)</option>
+      <option value="0.6">0.6 - strongest</option>
+    </select>
+  </label>
+  <label id="refineSmallLabel">Strength for small faces (Wan: faces under 32px, e.g. the Alpha Timber mother and daughter)
+    <select id="refineSmallDenoise">
+      <option value="0.3">0.3 - same as everyone</option>
+      <option value="0.4">0.4</option>
+      <option value="0.5">0.5</option>
+      <option value="0.6" selected>0.6 - default</option>
     </select>
   </label>
   <label>Face crop size (resolution each face is redrawn at - not the number of people)
@@ -225,7 +233,7 @@ const PERSISTED_FIELDS = [
   'endpointId', 'apiKey', 'prompt', 'ratio', 'quality', 'width', 'height', 'duration', 'steps', 'seed', 'attention', 'lora', 'upscaleMethod', 'upscaleScale',
   's3Endpoint', 's3Bucket', 's3AccessKey', 's3SecretKey',
   'supabaseUrl', 'supabaseAnonKey',
-  'refineVideoKey', 'refineEngine', 'refineSplit', 'refineH3Steps', 'refineSubjects', 'refineDenoise', 'refineCanvas', 'refineSteps',
+  'refineVideoKey', 'refineEngine', 'refineSplit', 'refineH3Steps', 'refineSubjects', 'refineDenoise', 'refineSmallDenoise', 'refineCanvas', 'refineSteps',
 ];
 
 // Show/hide toggle for the key fields. Defaults to shown; the choice is
@@ -681,15 +689,16 @@ async function runJob() {
 }
 
 // H3 engine: its own steps (8 = 8-step turbo LoRA, 4/3/2 = 4-step) and the pack's 0.4
-// strength (Wan's default is 0.6). Both engines use a generic face prompt.
+// strength (Wan's default is 0.3, 0.6 for faces under 32px). Both engines use a generic face prompt.
 function refineEngineChanged(fromUser = true) {
   const h3 = document.getElementById('refineEngine').value === 'h3';
   document.getElementById('refineStepsLabel').style.display = h3 ? 'none' : '';
   document.getElementById('refineSplitLabel').style.display = h3 ? '' : 'none';
   document.getElementById('refineH3StepsLabel').style.display = h3 ? '' : 'none';
+  document.getElementById('refineSmallLabel').style.display = h3 ? 'none' : '';
   if (fromUser) {
     const denoise = document.getElementById('refineDenoise');
-    denoise.value = h3 ? '0.4' : '0.6';
+    denoise.value = h3 ? '0.4' : '0.3';
     denoise.dispatchEvent(new Event('input'));  // so the remembered value follows
   }
 }
@@ -725,6 +734,8 @@ async function runRefine() {
   if (refineInput.engine === 'h3') {
     refineInput.split_shots = document.getElementById('refineSplit').value === 'per_shot';
     refineInput.steps = Number(document.getElementById('refineH3Steps').value);
+  } else {
+    refineInput.small_denoise = Number(document.getElementById('refineSmallDenoise').value);
   }
   const seedRaw = document.getElementById('seed').value.trim();
   if (seedRaw !== '') {

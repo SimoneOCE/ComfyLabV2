@@ -851,7 +851,8 @@ def run_generation(job_input, should_cancel=None, should_force_kill=None, upload
 # Job shape (comfylab_gpu_session_jobs.input):
 #   {"mode": "face_refine", "source_video_key": "<key>.mp4",
 #    "subjects": optional 1-4 (default: counted - the most small faces in
-#                any one shot, capped at 4), "denoise": 0.05-1.0 (default 0.6), "seed": ...,
+#                any one shot, capped at 4), "denoise": 0.05-1.0 (Wan default 0.3, H3 0.4), "seed": ...,
+#    "small_denoise": 0.05-1.0 (Wan only, default 0.6) - strength for faces under REFINE_FACE_PX_TINY,
 #    "prompt": optional face prompt (blank = the node's generic one),
 #    "canvas": "auto" (default) | 384 | 512 | 640 | 768,
 #    "steps": 2-8 (default 3; the H3 engine always runs 8),
@@ -871,11 +872,19 @@ REFINE_MAX_SUBJECTS = 4            # most people refined per shot (the largest s
 # (813cdb5d) three friends at ~57-64px looked fine and one at ~52-58px didn't.
 # Only a few px separate those, so this edge is tight - tune from the per-shot
 # sizes the face count now logs.
-REFINE_FACE_PX_MIN = 22.0          # smaller faces are ignored: not counted, tracked or pasted
+# 2026-10-04: floor 22 -> 18 - on Alpha Timber the daughter measured 20-24px,
+# so 22 skipped her on part of the shot.
+REFINE_FACE_PX_MIN = 18.0          # smaller faces are ignored: not counted, tracked or pasted
+# Wan: a clip (person x shot) whose face is typically under this gets the
+# small-face strength instead. 0.3 looked best on most faces but was too gentle
+# on the Alpha Timber mother (23-30px) and daughter (20-24px), where 0.6 was
+# much better; the father (~27-45px, mostly in the upper 30s) and up stay on 0.3.
+REFINE_FACE_PX_TINY = 32.0
 REFINE_FACE_PX_SMALL = 45.0        # full strength at or below this
 REFINE_FACE_PX_LARGE = 60.0        # none at or above this (was 120)
 FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
-WAN_REFINE_DEFAULT_DENOISE = 0.6   # the "Fix faces" setting (chosen on test 96cb3da1); starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
+WAN_REFINE_DEFAULT_DENOISE = 0.3   # faces REFINE_FACE_PX_TINY and up (user, 2026-10-04: 0.3 best on most faces; was 0.6)
+WAN_REFINE_SMALL_FACE_DENOISE = 0.6  # faces under REFINE_FACE_PX_TINY; starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
 WAN_REFINE_STEPS = 4               # default (user, 2026-10-04); 3 and 2 are test-page options (2 saved ~20s of redraw on cba2f8ef). The lightx2v LoRA is distilled for 4
 WAN_REFINE_SHIFT = 5.0
 H3_REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base denoise; H3PerFrameDenoise scales it per frame
@@ -1032,7 +1041,7 @@ def build_people_count_payload(source_filename):
 
 
 def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt, canvas=None,
-                         steps=WAN_REFINE_STEPS):
+                         steps=WAN_REFINE_STEPS, small_denoise=WAN_REFINE_SMALL_FACE_DENOISE):
     """The pack's H3FaceSelect loads the video and detects every face and cut
     ONCE; ComfyLabFacePickIndex re-picks that for each person, so each
     tracker reuses the boxes instead of detecting again. All crops are
@@ -1054,6 +1063,9 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
         # above 120px are left exactly as they are.
         "face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE, "smooth_frames": 9,
         "face_px_min": REFINE_FACE_PX_MIN,
+        # Per clip: small_denoise when the face is typically under
+        # REFINE_FACE_PX_TINY, denoise otherwise.
+        "small_denoise": small_denoise, "small_face_px": REFINE_FACE_PX_TINY,
         "sage_attention": True,
         # The detector's own face boxes, for the duplicate-person check.
         "face_pick": ["r_select", 2],
@@ -1295,6 +1307,12 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         raise ValueError(f"denoise must be a number, got {job_input.get('denoise')!r}")
     if not 0.05 <= denoise <= 1.0:
         raise ValueError(f"denoise must be between 0.05 and 1.0, got {denoise}")
+    try:
+        small_denoise = float(job_input.get("small_denoise", WAN_REFINE_SMALL_FACE_DENOISE))
+    except (TypeError, ValueError):
+        raise ValueError(f"small_denoise must be a number, got {job_input.get('small_denoise')!r}")
+    if not 0.05 <= small_denoise <= 1.0:
+        raise ValueError(f"small_denoise must be between 0.05 and 1.0, got {small_denoise}")
     seed = resolve_seed(job_input.get("seed"))
     canvas = job_input.get("canvas")
     if canvas in (None, "", "auto"):
@@ -1414,7 +1432,7 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
                         result["outputs"].setdefault(k, v)
         else:
             workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
-                                            canvas, steps)
+                                            canvas, steps, small_denoise)
             t = time.time()
             result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
             stages["comfy_refine"] = time.time() - t
@@ -1472,6 +1490,8 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         "subjects": subjects,
         "subjects_counted": count_report is not None,
         "denoise": denoise,
+        "small_denoise": small_denoise if engine == "wan" else None,
+        "small_face_px": REFINE_FACE_PX_TINY if engine == "wan" else None,
         "seed": seed,
         "upscaled_back": upscale_scale,
         "timings": timings,

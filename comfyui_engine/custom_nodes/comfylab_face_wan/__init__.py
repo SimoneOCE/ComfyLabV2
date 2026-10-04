@@ -116,6 +116,10 @@ class ComfyLabWanFaceRedraw:
         # The detector's own face boxes, for the duplicate-person check.
         optional["face_pick"] = ("H3FACEPICK",)
         optional["face_px_min"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0})
+        # Clips whose face is typically under small_face_px run at small_denoise
+        # instead of denoise (0 = off).
+        optional["small_denoise"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0})
+        optional["small_face_px"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0})
         return {
             "required": {
                 "crops_0": ("IMAGE",),
@@ -150,6 +154,7 @@ class ComfyLabWanFaceRedraw:
         _log(f"start: {_ram_gb()}, {_vram_gb()}")
 
         work = []
+        faces_by = {}
         for i in range(MAX_SUBJECTS):
             crops = subjects.get(f"crops_{i}")
             transform = subjects.get(f"transform_{i}")
@@ -164,6 +169,7 @@ class ComfyLabWanFaceRedraw:
             _log(line)
             report.append(line)
             work.append((i, crops, strength, transform))
+            faces_by[i] = face
 
         # Two trackers on one face (an extra "person" from a stray detection)
         # would redraw and paste it twice - see duplicates.py.
@@ -244,6 +250,21 @@ class ComfyLabWanFaceRedraw:
             # a person's canvas for their LARGEST face (a close-up can push it to
             # 768), but those frames are never redrawn. Redrawn faces are under
             # face_px_large, so their crops fit REDRAW_MAX with room to spare.
+            # Per clip (person x shot), the strength: small_denoise when the
+            # face is typically under small_face_px (the tiny, usually melted
+            # faces - 0.3 was too gentle for them), denoise otherwise. Typical
+            # = median over the frames the clip actually redraws.
+            small_denoise = float(subjects.get("small_denoise") or 0.0)
+            small_face_px = float(subjects.get("small_face_px") or 0.0)
+
+            def clip_denoise(i, a, b):
+                if small_denoise <= 0 or small_face_px <= 0:
+                    return float(denoise)
+                face = faces_by[i][a:b]
+                used = face[strength_by[i][a:b] >= KEEP_BELOW]
+                typical = float(np.median(used if used.size else face))
+                return small_denoise if typical < small_face_px else float(denoise)
+
             groups = {}
             for i, clip_start, clip_end in clips:
                 h, w = crops_by[i].shape[1:3]
@@ -251,13 +272,14 @@ class ComfyLabWanFaceRedraw:
                 rh, rw = (max(16, int(round(h * scale / 16)) * 16), max(16, int(round(w * scale / 16)) * 16))
                 span = clip_end - clip_start
                 span_pad = ((span - 1 + 3) // 4) * 4 + 1  # Wan's VAE takes 4k+1 frames
-                groups.setdefault((span_pad, rh, rw), []).append((i, clip_start, clip_end))
-            for (span_pad, rh, rw), group in groups.items():
+                d = clip_denoise(i, clip_start, clip_end)
+                groups.setdefault((span_pad, rh, rw, d), []).append((i, clip_start, clip_end))
+            for (span_pad, rh, rw, clip_strength), group in groups.items():
                 t1 = time.time()
                 try:
                     self._redraw_clips(model, vae, positive, negative, group, crops_by, strength_by, results,
-                                       span_pad, rh, rw, denoise, steps, seed)
-                    report.append(self._clip_line(group, rh, rw, time.time() - t1))
+                                       span_pad, rh, rw, clip_strength, steps, seed)
+                    report.append(self._clip_line(group, rh, rw, time.time() - t1, clip_strength))
                 except mm.OOM_EXCEPTION:
                     if len(group) == 1:
                         raise
@@ -267,8 +289,8 @@ class ComfyLabWanFaceRedraw:
                     for clip_ in group:
                         t2 = time.time()
                         self._redraw_clips(model, vae, positive, negative, [clip_], crops_by, strength_by, results,
-                                           span_pad, rh, rw, denoise, steps, seed)
-                        report.append(self._clip_line([clip_], rh, rw, time.time() - t2))
+                                           span_pad, rh, rw, clip_strength, steps, seed)
+                        report.append(self._clip_line([clip_], rh, rw, time.time() - t2, clip_strength))
                         _log(report[-1])
                     continue
                 _log(report[-1])
@@ -288,9 +310,10 @@ class ComfyLabWanFaceRedraw:
         return self._result(outputs, transforms, subjects, report)
 
     @staticmethod
-    def _clip_line(group, rh, rw, seconds):
+    def _clip_line(group, rh, rw, seconds, strength=None):
         clips = ", ".join(f"person {i} frames {a}-{b - 1}" for i, a, b in group)
-        return f"{clips} - redrawn at {rw}x{rh}{' (batched)' if len(group) > 1 else ''}, {seconds:.1f}s"
+        at = f" at strength {strength:g}" if strength is not None else ""
+        return f"{clips} - redrawn at {rw}x{rh}{at}{' (batched)' if len(group) > 1 else ''}, {seconds:.1f}s"
 
     @staticmethod
     def _redraw_clips(model, vae, positive, negative, group, crops_by, strength_by, results,

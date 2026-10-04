@@ -298,3 +298,22 @@ agrees it's a property of head-size-in-frame, not output resolution
   Business can never actually exceed 30. Decide whether `cleanup.js` should
   respect each tier's cap. Either way, `minimax-h3-website/CLAUDE.md`'s
   "Library caps" section is out of date and needs correcting.
+
+## Wan strength by face size (2026-10-04)
+
+The user's call: 0.3 looked best on most faces, but it was too gentle on the
+Alpha Timber mother (23-30px) and daughter (20-24px), where 0.6 was much
+better. So each Wan clip (one person in one shot) now gets one strength,
+picked from that person's typical (median) face height in that shot:
+
+- under 32px (`REFINE_FACE_PX_TINY`): 0.6 (`WAN_REFINE_SMALL_FACE_DENOISE`, job input `small_denoise`)
+- 32px and up: 0.3 (`WAN_REFINE_DEFAULT_DENOISE`, job input `denoise`), still fading to nothing at 60px
+
+The boundary sits under the father (~27-45px, mostly upper 30s) and above the
+mother and daughter. It's a real 0.3 or 0.6 pass per clip, not a blend. Clips
+with different strengths are never batched together. Each clip's report line
+shows its strength.
+
+The floor dropped from 22px to 18px (`REFINE_FACE_PX_MIN`, shared by both
+engines) because the daughter measured 20-24px, so 22px missed her on part of
+the shot. H3's strength is unchanged (0.4, its own per-frame curve).
