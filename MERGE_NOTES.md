@@ -489,3 +489,28 @@ no swapping (start/end frames would be the one gap: Ref2VA's node has no
 first/last-frame slots). Test on the RunPod pod: Flash/Dora prompt, seed
 424242, 1280x720, 15s, 20 steps, no references, ControlNet bypassed, compared
 against the user's favourite base run a9f8afdc.
+
+## To try tomorrow on the RunPod pod: Viggle-Animate and SCAIL-2 (2026-10-04)
+
+Character swap / motion transfer (Higgsfield Genjutsu-style), for music-video
+recreations. Same clips through both, timed and judged blind:
+1) one dancer, 5s; 2) a character bigger than the person (panda/hippo over a
+human); 3) two people (e.g. a rap video, rappers -> hippo + lion).
+
+- Viggle-Animate: Viggle's open H3 Ref2VA finetune. Inputs: driving video +
+  one frame of it repainted with the new character(s). No mask, skeleton or
+  prompt. ComfyUI: Saganaki22/ComfyUI-Viggle-Animate-H3 (install from the
+  original repo, not the goofyrodent mirror), weights from
+  drbaph/Viggle-Animate-ComfyUI: pruned int8 (21GB), dmd LoRA r64 (0.94GB),
+  precomputed text embed (no 15GB text encoder), video VAE. 4-8 steps, cfg 1.
+  Measured elsewhere: ~33s per 5s on a 5090. Multi-person "feasible, not
+  robust"; weak lip-sync in close-ups.
+- SCAIL-2 (zai-org, Wan 2.1 14B): official template
+  video_wan21_scail2_character_replacement. All nodes are already in pinned
+  ComfyUI fb2315f, no custom packs. Inputs: driving video + any character
+  image; SAM3 finds people by text ("human"), multi-person assigned left to
+  right. Use the int8 model (16.7GB), not the template's fp16 (32.8GB). 6 steps
+  + lightx2v 0.8 + DPO LoRA, 896x512, 81-frame segments (76 new + 5 overlap),
+  each queued by hand; frames are taken 1:1 from the source (30fps source ->
+  2.7s per segment). Estimate (unmeasured): ~70-90s per segment on a 5090.
+- Record "Prompt executed in" for every run; replace the estimates above.
