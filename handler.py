@@ -1398,7 +1398,8 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
         if engine == "h3":
             # Two prompts with H3 unloaded in between - see build_h3_redraw_payload.
             handoff = f"h3refine_{uuid.uuid4().hex[:12]}"
-            handoff_path = os.path.join(COMFYUI_OUTPUT_DIR, "refine_handoff", f"{handoff}.pt")
+            # ComfyUI's temp dir (container disk) - see h3_refine._handoff_path.
+            handoff_path = os.path.join(COMFYUI_DIR, "temp", "refine_handoff", f"{handoff}.pt")
             t = time.time()
             redraw = submit_and_wait(
                 build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas),

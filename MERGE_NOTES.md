@@ -88,7 +88,8 @@ agrees it's a property of head-size-in-frame, not output resolution
   (~35GB) still loaded. Fixed (option A, chosen 2026-10-04): the H3 refine
   is now two ComfyUI prompts - redraw, then POST /free (unload every model,
   clear the cache), then stitch + upscale + encode, the crops handed over
-  through a file on the volume (ComfyLabSave/LoadRefineCrops). Right after
+  through a file on the container's own disk - ComfyUI's temp dir, faster
+  than the volume (ComfyLabSave/LoadRefineCrops; deleted after each refine). Right after
   the result is delivered the session reloads H3 + text encoder (the same
   1-step warmup as session start, ~40-55s) so the next generation doesn't
   pay for it. Same run also exposed an audio-lock bug, fixed: each person's

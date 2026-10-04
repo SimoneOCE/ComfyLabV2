@@ -203,10 +203,11 @@ class ComfyLabH3StepCheck:
 def _handoff_path(name):
     if not name or "/" in name or "\\" in name or name.startswith("."):
         raise ValueError(f"bad hand-off name {name!r}")
-    # On the volume (the output dir): up to ~2.5GB for 4 people at 768 on a
-    # 15s clip, more than the container's own small disk can spare. The
-    # worker deletes it once the refine finishes.
-    return f"{folder_paths.get_output_directory()}/refine_handoff/{name}.pt"
+    # ComfyUI's temp dir, on the container's own disk (faster than the
+    # volume). Usually under 0.5GB; up to ~2.5GB for 4 people at 768 on a
+    # 15s clip. The worker deletes it once the refine finishes, and ComfyUI
+    # empties its temp dir on every start.
+    return f"{folder_paths.get_temp_directory()}/refine_handoff/{name}.pt"
 
 
 class ComfyLabSaveRefineCrops:
