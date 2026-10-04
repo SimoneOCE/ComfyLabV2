@@ -167,7 +167,7 @@ agrees it's a property of head-size-in-frame, not output resolution
   H3 redraw time; trained for 768p, and crops are capped at 768. Build only
   after the 8-step H3 refine is confirmed working, then compare same seed.
 - **"Fix faces" button settings (chosen 2026-10-03, test job 96cb3da1 on
-  cba2f8ef):** strength (denoise) 0.6, 3 steps, Standard crop size (tracker
+  cba2f8ef; steps changed 3 -> 4 on 2026-10-04):** strength (denoise) 0.6, 4 steps, Standard crop size (tracker
   canvas, redrawn at up to 512px), people counted automatically (up to 4
   per shot). All are the worker's defaults, so the site only needs to send
   `mode` and `source_video_key`.
