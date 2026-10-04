@@ -328,9 +328,14 @@ on 52 frames, and the refine fades out wherever there's no detection. The user
 asked for all three fixes; each is a job input / test-page option with the old
 value one click away:
 
-1. Size range: full strength up to 60px, untouched from 90px (was 45/60).
+1. Size range: full strength up to 60px, untouched from 62px (was 45/60).
+   First set to 60/90, but the Wan paste is full once the fade's strength
+   reaches 0.2 (`WEIGHT_RAMP`), so 60/90 really redrew everything up to ~84px
+   and would have changed good faces. 60/62 keeps the old 60px line: the three
+   friends at 56-59px get the full pass, and the furthest-right one (60px+),
+   who looked fine, stays untouched. Watch for faces hovering at 60-62px
+   switching between redrawn and not.
    `REFINE_FACE_PX_SMALL`/`_LARGE`, job inputs `face_px_small`/`face_px_large`.
-   This reverses the earlier "the 57-64px friends are fine, leave them" call.
 2. Crop: 2x the face instead of 3x (`REFINE_CROP_FACTOR`, job input
    `crop_factor`). The face fills half the crop, about 1.5x the pixels to
    redraw, with less context around it. The stitch's soft edge scales with it
