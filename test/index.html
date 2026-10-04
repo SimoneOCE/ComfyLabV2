@@ -141,12 +141,20 @@
   <label>Supabase Anon Key
     <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
   </label>
-  <label>H3 model for this session (picked at Run GPU; the warmup and every generation use it)
+  <label>H3 model for this session - blind (picked at Run GPU; the warmup and every generation use it)
     <select id="sessionModel">
-      <option value="base" selected>Base - MiniMax official (current default)</option>
-      <option value="dasiwa_v3">DaSiWa Hybrid V3 - community fine-tune, text + start/end + reference (first session downloads ~21GB)</option>
+      <option id="sessionModelA" selected>Model A</option>
+      <option id="sessionModelB">Model B</option>
     </select>
   </label>
+  <div style="font-size:0.8rem; color:#aaa; margin:2px 0 8px;">
+    A and B are the base model and DaSiWa Hybrid V3 in an order this browser drew with a
+    cryptographic coin flip on first load and keeps until you re-draw. Job results here show
+    "Model A"/"Model B", never the real name.
+    <button type="button" onclick="blindReveal()">Reveal which is which</button>
+    <button type="button" onclick="blindRedraw()">Re-draw</button>
+    <span id="blindRevealText"></span>
+  </div>
   <button id="gpuSessionBtn" onclick="toggleGpuSession()">Run GPU</button>
   <div id="gpuSessionStatus" style="margin-top:8px; font-size:0.85rem; color:#9c9;">No session.</div>
 
@@ -249,40 +257,6 @@
     <textarea id="refinePrompt" placeholder="(generic face prompt)"></textarea>
   </label>
   <button id="refineBtn" onclick="runRefine()">Refine faces</button>
-
-  <h2>Blind A/B test</h2>
-  <p style="color:#888; font-size:0.85rem;">
-    Paste two video keys in any order. They're shuffled with the browser's cryptographic random
-    generator (a fair coin flip, not Math.random) and shown as A and B. Vote first; the page then
-    reveals which model made each, read from the job's own record. Use the same prompt and seed on
-    both for a fair look test.
-  </p>
-  <label>Video key 1 <input id="abKey1" type="text" placeholder="ee8d7362-545c-458e-b4be-274471e9d6c3.mp4" /></label>
-  <label>Video key 2 <input id="abKey2" type="text" placeholder="....mp4" /></label>
-  <button type="button" onclick="abLoad()">Shuffle and load</button>
-  <div id="abStatus" style="margin:6px 0; font-size:0.9rem;"></div>
-  <div id="abArea" style="display:none;">
-    <div style="display:flex; flex-wrap:wrap; gap:12px;">
-      <div style="flex:1 1 320px; min-width:0;">
-        <h3 style="margin:4px 0;">A</h3>
-        <video id="abVideoA" controls playsinline style="width:100%;"></video>
-        <div id="abRevealA" style="font-size:0.85rem; color:#9c9;"></div>
-      </div>
-      <div style="flex:1 1 320px; min-width:0;">
-        <h3 style="margin:4px 0;">B</h3>
-        <video id="abVideoB" controls playsinline style="width:100%;"></video>
-        <div id="abRevealB" style="font-size:0.85rem; color:#9c9;"></div>
-      </div>
-    </div>
-    <button type="button" onclick="abPlayBoth()">Play both from the start (B muted)</button>
-    <div id="abVoteRow" style="margin-top:8px;">
-      Which looks better?
-      <button type="button" onclick="abVote('A')">A</button>
-      <button type="button" onclick="abVote('B')">B</button>
-      <button type="button" onclick="abVote('tie')">Tie</button>
-    </div>
-    <div id="abTally" style="margin-top:8px; font-size:0.85rem; color:#aaa;"></div>
-  </div>
 
   <h2>Resolve an existing video key</h2>
   <p style="color:#888; font-size:0.85rem;">
@@ -638,11 +612,11 @@ async function runSessionJob(payload, statusEl) {
     }
 
     if (row.status === 'completed') {
-      statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(row.output, null, 2)}`;
+      statusEl.textContent += `\n\nDone in ${elapsed}s.\n${JSON.stringify(blindMask(row.output), null, 2)}`;
       return row.output && row.output.videoKey;
     }
     if (row.status === 'failed' || row.status === 'cancelled') {
-      statusEl.textContent += `\n\n${JSON.stringify(row.output, null, 2)}`;
+      statusEl.textContent += `\n\n${JSON.stringify(blindMask(row.output), null, 2)}`;
       return null;
     }
   }
@@ -688,89 +662,47 @@ async function resolveVideoUrl(videoKey) {
   });
 }
 
-// ---- Blind A/B test ----
-let abPair = null;  // { A: key, B: key, voted: false }
-
-function abCoinFlip() {
-  // One unbiased bit from the platform CSPRNG (no modulo bias: a single bit
-  // of a uniform 32-bit value is exactly 50/50).
-  return (crypto.getRandomValues(new Uint32Array(1))[0] & 1) === 1;
+// ---- Blind model labels ----
+// A/B -> real model, drawn once per browser with an unbiased CSPRNG bit and
+// kept in localStorage so every session and result uses the same mapping.
+const BLIND_MODELS = ['base', 'dasiwa_v3'];
+function blindDraw() {
+  const flip = (crypto.getRandomValues(new Uint32Array(1))[0] & 1) === 1;
+  return flip ? { A: BLIND_MODELS[1], B: BLIND_MODELS[0] } : { A: BLIND_MODELS[0], B: BLIND_MODELS[1] };
 }
-
-async function abLoad() {
-  const status = document.getElementById('abStatus');
-  const k1 = document.getElementById('abKey1').value.trim();
-  const k2 = document.getElementById('abKey2').value.trim();
-  if (!k1 || !k2) { status.textContent = 'Paste both video keys.'; return; }
-  if (k1 === k2) { status.textContent = 'Those are the same key.'; return; }
-  const swap = abCoinFlip();
-  abPair = { A: swap ? k2 : k1, B: swap ? k1 : k2, voted: false };
-  // Clear the inputs so the order they were pasted in can't give it away.
-  document.getElementById('abKey1').value = '';
-  document.getElementById('abKey2').value = '';
-  for (const id of ['abRevealA', 'abRevealB']) document.getElementById(id).textContent = '';
-  document.getElementById('abVoteRow').style.display = '';
-  try {
-    document.getElementById('abVideoA').src = await resolveVideoUrl(abPair.A);
-    document.getElementById('abVideoB').src = await resolveVideoUrl(abPair.B);
-    document.getElementById('abArea').style.display = '';
-    status.textContent = 'Shuffled. Watch both, then vote.';
-  } catch (err) {
-    status.textContent = `Could not load the videos: ${err.message}`;
-  }
-  abShowTally();
+let blindMap = null;
+try { blindMap = JSON.parse(localStorage.getItem('comfylab_blindModels') || 'null'); } catch (e) {}
+if (!blindMap || !BLIND_MODELS.includes(blindMap.A) || !BLIND_MODELS.includes(blindMap.B) || blindMap.A === blindMap.B) {
+  blindMap = blindDraw();
+  try { localStorage.setItem('comfylab_blindModels', JSON.stringify(blindMap)); } catch (e) {}
 }
-
-function abPlayBoth() {
-  const a = document.getElementById('abVideoA'), b = document.getElementById('abVideoB');
-  b.muted = true;
-  a.currentTime = 0; b.currentTime = 0;
-  a.play(); b.play();
+function blindApply() {
+  document.getElementById('sessionModelA').value = blindMap.A;
+  document.getElementById('sessionModelB').value = blindMap.B;
 }
-
-async function abModelFor(key) {
-  try {
-    const rows = await sbRequest('GET', 'comfylab_gpu_session_jobs', {
-      params: { select: 'output,input', 'output->>videoKey': `eq.${key}`, limit: '1' },
-    });
-    const row = rows && rows[0];
-    if (!row) return 'unknown (no job record)';
-    return (row.output && row.output.model) || (row.input && row.input.model) || 'base (recorded before models were logged)';
-  } catch (err) {
-    return `unknown (${err.message})`;
-  }
+blindApply();
+function blindLabel(model) {
+  if (model === blindMap.A) return 'Model A';
+  if (model === blindMap.B) return 'Model B';
+  return model;
 }
-
-async function abVote(choice) {
-  if (!abPair || abPair.voted) return;
-  abPair.voted = true;
-  document.getElementById('abVoteRow').style.display = 'none';
-  const [modelA, modelB] = await Promise.all([abModelFor(abPair.A), abModelFor(abPair.B)]);
-  document.getElementById('abRevealA').textContent = `A was ${modelA} - ${abPair.A}`;
-  document.getElementById('abRevealB').textContent = `B was ${modelB} - ${abPair.B}`;
-  const winner = choice === 'A' ? modelA : choice === 'B' ? modelB : 'tie';
-  document.getElementById('abStatus').textContent =
-    choice === 'tie' ? 'You called it a tie.' : `You picked ${choice}: ${winner}.`;
-  try {
-    const tally = JSON.parse(localStorage.getItem('comfylab_abTally') || '{}');
-    tally[winner] = (tally[winner] || 0) + 1;
-    localStorage.setItem('comfylab_abTally', JSON.stringify(tally));
-  } catch (e) {}
-  abShowTally();
+function blindMask(output) {
+  // A copy of a job's output with the model name swapped for its A/B label.
+  if (!output || typeof output !== 'object' || !('model' in output)) return output;
+  return { ...output, model: blindLabel(output.model) };
 }
-
-function abShowTally() {
-  let tally = {};
-  try { tally = JSON.parse(localStorage.getItem('comfylab_abTally') || '{}'); } catch (e) {}
-  const parts = Object.entries(tally).map(([k, v]) => `${k}: ${v}`);
-  document.getElementById('abTally').innerHTML = parts.length
-    ? `Running tally (this browser): ${parts.join(', ')} <button type="button" onclick="abResetTally()">Reset</button>`
-    : '';
+function blindReveal() {
+  if (!confirm('Reveal which model is A and which is B? That ends the blind test.')) return;
+  document.getElementById('blindRevealText').textContent =
+    ` A = ${blindMap.A === 'base' ? 'base (MiniMax official)' : 'DaSiWa Hybrid V3'}, ` +
+    `B = ${blindMap.B === 'base' ? 'base (MiniMax official)' : 'DaSiWa Hybrid V3'}`;
 }
-
-function abResetTally() {
-  try { localStorage.removeItem('comfylab_abTally'); } catch (e) {}
-  abShowTally();
+function blindRedraw() {
+  if (!confirm('Draw a new random A/B order? Videos already made keep the order they were made under.')) return;
+  blindMap = blindDraw();
+  try { localStorage.setItem('comfylab_blindModels', JSON.stringify(blindMap)); } catch (e) {}
+  blindApply();
+  document.getElementById('blindRevealText').textContent = ' Re-drawn.';
 }
 
 async function runJob() {

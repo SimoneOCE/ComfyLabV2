@@ -1754,7 +1754,7 @@ def run_session(session_id, model="base"):
     last_activity = time.time()
     last_heartbeat = 0.0
     jobs_processed = 0
-    print(f"Session {session_id}: held-open loop starting (model: {model}).")
+    print(f"Session {session_id}: held-open loop starting.")
 
     try:
         ensure_comfyui_engine()
@@ -1762,7 +1762,7 @@ def run_session(session_id, model="base"):
         t = time.time()
         ensure_model_file(MODEL_CHOICES[model], "diffusion_models")  # no-op once on the volume
         if time.time() - t > 5:
-            print(f"Session {session_id}: downloaded the {model} model in {round(time.time() - t)}s.")
+            print(f"Session {session_id}: downloaded this session's H3 model in {round(time.time() - t)}s.")
         start_comfyui_if_needed()
     except Exception as e:
         print(f"Session {session_id}: ComfyUI failed to start ({e}) - ending session.")
@@ -1792,7 +1792,7 @@ def run_session(session_id, model="base"):
             "model": model,
         }, upload=False)
         warmup_seconds = round(time.time() - warmup_start, 1)
-        print(f"Session {session_id}: warmup generation done ({warmup_seconds}s, model {model}).")
+        print(f"Session {session_id}: warmup generation done ({warmup_seconds}s).")
     except Exception as e:
         print(f"Session {session_id}: warmup generation failed, continuing anyway ({e}).")
 
@@ -1805,7 +1805,6 @@ def run_session(session_id, model="base"):
             "session_id": session_id,
             "jobs_processed": jobs_processed,
             "warmup_seconds": warmup_seconds,
-            "model": model,
             "session_duration_seconds": round(time.time() - session_start, 1),
         }
         summary.update(extra)
