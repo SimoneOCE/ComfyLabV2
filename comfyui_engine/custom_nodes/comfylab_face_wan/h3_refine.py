@@ -319,6 +319,13 @@ class ComfyLabH3FaceRedraw:
             report.append(line)
             work.append((i, crops, strength, transform))
 
+        # Two trackers on one face would redraw and paste it twice.
+        from . import duplicates
+        work, silenced, dup_report = duplicates.apply(work)
+        for line in dup_report:
+            _log(line)
+            report.append(line)
+
         # One clip per person per shot - the whole shot, so the frames where
         # their face is big stay in as (unchanged) context. Shots with nothing
         # to redraw are skipped.
@@ -332,6 +339,7 @@ class ComfyLabH3FaceRedraw:
                     clips.append((i, a, b))
 
         outputs = {i: crops for i, crops, _, _ in work}
+        outputs.update({i: subjects[f"crops_{i}"] for i in silenced})
         redrawn = {i: np.zeros(len(st), dtype=bool) for i, _, st, _ in work}
         if clips:
             text = prompt.strip() or ("close-up of a real person's face, natural realistic facial features, "
@@ -371,6 +379,7 @@ class ComfyLabH3FaceRedraw:
             ramp = np.clip(strength / WEIGHT_RAMP, 0.0, 1.0) * redrawn[i]
             t["weights"] = [float(w) * float(r) for w, r in zip(base, ramp)] + base[len(ramp):]
             transforms[i] = t
+        transforms.update(silenced)
         report.append(f"node total {time.time() - start:.1f}s")
         _log(report[-1])
 

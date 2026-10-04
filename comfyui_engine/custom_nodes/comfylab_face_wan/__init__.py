@@ -36,6 +36,8 @@ import torch
 
 import comfy.model_management as mm
 import nodes
+
+from . import duplicates
 from comfy_extras.nodes_model_advanced import ModelSamplingSD3
 
 TAG = "[ComfyLabWanFace]"
@@ -155,7 +157,15 @@ class ComfyLabWanFaceRedraw:
             report.append(line)
             work.append((i, crops, strength, transform))
 
+        # Two trackers on one face (an extra "person" from a stray detection)
+        # would redraw and paste it twice - see duplicates.py.
+        work, silenced, dup_report = duplicates.apply(work)
+        for line in dup_report:
+            _log(line)
+            report.append(line)
+
         outputs = {i: crops for i, crops, _, _ in work}
+        outputs.update({i: subjects[f"crops_{i}"] for i in silenced})
         # Frames this refine doesn't redraw must keep the video's own pixels.
         # Otherwise H3FaceStitch still pastes the tracker's crop back - and a
         # big face's crop has been squeezed into the canvas and blown back up,
@@ -170,6 +180,7 @@ class ComfyLabWanFaceRedraw:
             ramp = np.clip(strength / WEIGHT_RAMP, 0.0, 1.0)
             t["weights"] = [float(w) * float(r) for w, r in zip(base, ramp)]
             transforms[i] = t
+        transforms.update(silenced)
 
         # One redraw clip per person per SHOT: a person's crops can span hard
         # cuts (the tracker strings their shots together), and Wan generating

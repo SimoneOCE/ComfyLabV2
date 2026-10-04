@@ -157,7 +157,12 @@ agrees it's a property of head-size-in-frame, not output resolution
   redrawn and pasted twice. The duplicate-tracker check (drop a person whose
   face centre sits on an earlier person's for >half the shot) was declined
   when this only showed on a refine-of-a-refine; this was an original video.
-  Not built - user to decide.
+  Built (user go-ahead, 2026-10-04): comfylab_face_wan/duplicates.py, used
+  by both redraw nodes. On source frames where both trackers detected a
+  face, same face = centres closer than half a face height; same face on
+  >50% of those frames -> the later person is dropped (not redrawn, zero
+  paste weight); less -> kept, nothing pasted on the overlapping frames.
+  Reports say "person N follows person M's face ... duplicate".
   Stylised/cartoon videos: the generic face prompt asks for a realistic face.
   Before production, gate the button on the video's style - most reliable:
   the prompt enhancer outputs a fixed style label (photoreal / animated)
