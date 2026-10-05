@@ -561,3 +561,15 @@ Peter, woman -> Marge), Ref2VA template `video_minimax_h3_r2v`, turbo LoRA
 - **Later**: port the swap to the serverless worker / test site (Ref2VA
   model, video + audio inputs, Sage already there, RTX VSR needs the memory
   fix above for long clips).
+
+### 720p reference run gave pure noise (2026-10-05, not yet diagnosed)
+
+Same swap with a 720p 24fps reference instead of 480p: the audio was fine but
+the video was pure noise. Suspects, in order:
+1. Sage at the longer sequence (~204k tokens vs ~153k): a numeric overflow
+   giving NaNs looks exactly like this. Test: same run with the Sage node
+   bypassed (or `sage_attention` disabled).
+2. Leftover state from the RTX upscaler run just before it (ComfyUI not
+   restarted in between). Test: restart ComfyUI, then run.
+3. The 720p file itself (frame rate, length, odd size). Check with ffprobe.
+Next session: grab the log of that run (any NaN / warning lines) first.
