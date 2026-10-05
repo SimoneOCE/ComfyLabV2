@@ -873,20 +873,25 @@ function frameImageBase64(file, width, height) {
   });
 }
 
-// Reference picture: scaled down to 1536px on the long edge at most (the
-// node caps them at 2048 anyway), kept as PNG. Bare base64, no data: prefix.
+// Reference picture: scaled down to 1024px on the long edge at most and sent
+// as JPEG (transparent areas become white). Full-size PNGs made the job row
+// too big - the Supabase insert hit its statement timeout. Bare base64, no
+// data: prefix.
 function refImageBase64(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, 1536 / Math.max(img.naturalWidth, img.naturalHeight));
+      const scale = Math.min(1, 1024 / Math.max(img.naturalWidth, img.naturalHeight));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(img.naturalWidth * scale);
       canvas.height = Math.round(img.naturalHeight * scale);
-      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       URL.revokeObjectURL(url);
-      resolve(canvas.toDataURL('image/png').split(',')[1]);
+      resolve(canvas.toDataURL('image/jpeg', 0.92).split(',')[1]);
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error(`${file.name} is not an image the browser can open`)); };
     img.src = url;
