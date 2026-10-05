@@ -573,3 +573,17 @@ the video was pure noise. Suspects, in order:
    restarted in between). Test: restart ComfyUI, then run.
 3. The 720p file itself (frame rate, length, odd size). Check with ffprobe.
 Next session: grab the log of that run (any NaN / warning lines) first.
+
+## Plan: Ref2VA as the main model, base only for first/last frames (user, 2026-10-05)
+
+Conditional on the Ref2VA text-only test (above) matching base. If it does:
+- Ref2VA is the model every session starts with. It covers text-to-video,
+  reference images, and motion/character swap (reference video), all through
+  MiniMaxH3ReferenceToVideo.
+- Base (FL2VA) becomes secondary, loaded only when a job adds a first/last
+  frame (Ref2VA's node has no frame slots). That is the one case that swaps
+  models (~21GB each, only one fits in RAM), so expect a swap delay on those
+  jobs.
+If Ref2VA's text-only output loses to base, fall back to a per-session
+Standard (base) / Reference (Ref2VA) choice at Start GPU.
+Not built yet.
