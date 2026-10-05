@@ -521,3 +521,43 @@ human); 3) two people (e.g. a rap video, rappers -> hippo + lion).
   commits, no visible license) - read its code before installing. Its notes:
   non-human characters may need turbo off and lower pose strength (slower);
   4-6 characters work best in quality mode.
+
+## Native H3 character swap on a RunPod pod (2026-10-05)
+
+Test: 15s rap clip, three characters across cuts (Kanye -> Homer, Lil Pump ->
+Peter, woman -> Marge), Ref2VA template `video_minimax_h3_r2v`, turbo LoRA
+(4 steps), 480p 24fps reference video, 1376x768 output.
+
+- **Sage on the pod**: SageAttention 2.2.0 built at the worker's commit
+  (`d1a57a5`) against the pod's torch 2.10/cu130. The build needs CPATH
+  pointed at `/usr/local/lib/python3.12/dist-packages/nvidia/*/include`
+  (same fix as `ensure_comfyui_engine.sh`). Applied with KJNodes' Patch Sage
+  Attention (auto) between the model switch and BasicGuider.
+- **Timing**: 806s -> **400s** end to end (cold start) with Sage. Sampling
+  4 steps = 297s (74s/step).
+- **RTX VSR crashes on a 15s clip** when in the same graph as H3: process
+  killed after VAE decode, no traceback. 2x = 2752x1536 x 362 frames. Same
+  VRAM issue as on the test site. Standalone 4x (5504x3072) also crashed,
+  even with H3 unloaded. 2x standalone not yet confirmed. Fix to try: free
+  VRAM before it (KJNodes VRAM Debug, unload_all_models), else upscale in
+  frame batches. Matters for the worker too if long clips get upscaled.
+- **Prompt lessons** (official video-editing format: `<Video 1>` scene,
+  `<Picture N>` characters, `<Audio 1>` soundtrack via `ref_video_audio_0`):
+  - "no new speech or sounds" froze every mouth; name `<Audio 1>` and say
+    who raps instead.
+  - Characters reverted to the originals near the end until each shot line
+    restated the character's appearance and the prompt said the originals
+    never appear.
+  - "rapping" after two names made both rap; say "mouth closed, not rapping"
+    for the one who doesn't.
+  - Identifying people by outfit kept the outfits (bulky costumes carried
+    over); say the costumes are removed and give the character's own clothes.
+- **Quality**: Peter's lip-sync is weak. A 480p reference makes the mouth a
+  few pixels; next test is a 720p reference (~1.5x time), then turbo off.
+  The 480p reference also blurs the background.
+- **Pod gotchas**: the `pgrep ... || start` restart can leave ComfyUI dead
+  after a crash; use `pkill -9 -f main.py` then start it. Paste in small
+  chunks with `set +e`.
+- **Later**: port the swap to the serverless worker / test site (Ref2VA
+  model, video + audio inputs, Sage already there, RTX VSR needs the memory
+  fix above for long clips).
