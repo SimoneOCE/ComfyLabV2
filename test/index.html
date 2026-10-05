@@ -141,13 +141,16 @@
   <label>Supabase Anon Key
     <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
   </label>
-  <label>H3 model for this session - blind (picked at Run GPU; the warmup and every generation use it)
+  <label>H3 model for this session (picked at Run GPU; the warmup and every generation use it)
     <select id="sessionModel">
       <option id="sessionModelA" selected>Model A</option>
       <option id="sessionModelB">Model B</option>
+      <option value="ref2va">Ref2VA (official reference model, not blind)</option>
     </select>
   </label>
   <div style="font-size:0.8rem; color:#aaa; margin:2px 0 8px;">
+    Ref2VA: the first session downloads it (~21GB, once). No turbo LoRA and no start/end frames on
+    it (the worker refuses both); use the Wan refine engine, not H3.
     A and B are the base model and DaSiWa Hybrid V3 in an order this browser drew with a
     cryptographic coin flip on first load and keeps until you re-draw. Job results here show
     "Model A"/"Model B", never the real name.

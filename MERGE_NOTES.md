@@ -587,3 +587,17 @@ Conditional on the Ref2VA text-only test (above) matching base. If it does:
 If Ref2VA's text-only output loses to base, fall back to a per-session
 Standard (base) / Reference (Ref2VA) choice at Start GPU.
 Not built yet.
+
+## Built: Ref2VA as a session model, for the text-only test (2026-10-05)
+
+`MODEL_CHOICES["ref2va"]` (Comfy-Org's pruned int8, public, downloaded to
+the volume by the first session that picks it). Its jobs always go through
+MiniMaxH3ReferenceToVideo; with no reference image that's plain
+text-to-video (no ref inputs, as in Comfy-Org's Fun ControlNet template).
+Refused on it: start/end frames (no frame slots), the turbo LoRAs (they're
+FL2VA LoRAs), and the H3 refine engine (redraws with base's turbo LoRA). Base
+and DaSiWa sessions are unchanged. Test page: "Ref2VA" in the session model
+dropdown (not part of the blind A/B).
+Known: the first Ref2VA session downloads ~21GB inside the 10-minute idle
+window (idle-timer bug noted earlier, not fixed), so it may end right after
+its warmup; the next session starts normally.

@@ -387,6 +387,19 @@ MODEL_CHOICES = {
         "repo": "darksidewalker/MiniMaxH3",
         "repo_path": "model/DasiwaMinimaxH3_dasiwaHybridV3_3263052-INT8 ConvRot.safetensors",
     },
+    # Official reference model (user, 2026-10-05): on trial as the main
+    # session model - text-to-video now, reference images/video later. Its
+    # jobs go through MiniMaxH3ReferenceToVideo (see build_prompt_payload),
+    # with no references for plain text-to-video, the way Comfy-Org's Fun
+    # ControlNet template runs it. That node has no first/last-frame slots,
+    # and the turbo LoRAs here are FL2VA's, so both are refused on it.
+    # Public repo, same pruned int8 layout and size as base.
+    "ref2va": {
+        "filename": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "repo": "Comfy-Org/MiniMax-H3",
+        "repo_path": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "reference_node": True,
+    },
 }
 
 
@@ -458,12 +471,18 @@ def build_prompt_payload(job_input, upscale_method="none"):
     #     2026-10-04: one or the other per generation).
     if ref_image and (start_frame or end_frame):
         raise ValueError("Use reference images OR start/end frames in one generation, not both")
-    if ref_image:
-        ref_filename = save_input_image(ref_image, "ref")
-        workflow["_ref_image_load"] = {
-            "inputs": {"image": ref_filename},
-            "class_type": "LoadImage",
-        }
+    reference_node = MODEL_CHOICES[job_input.get("model", "base")].get("reference_node", False)
+    if reference_node and (start_frame or end_frame):
+        raise ValueError("Start/end frames need a base session - Ref2VA has no first/last-frame inputs")
+    if reference_node and job_input.get("lora"):
+        raise ValueError("The turbo LoRAs are base-model LoRAs - run Ref2VA without turbo")
+    if ref_image or reference_node:
+        if ref_image:
+            ref_filename = save_input_image(ref_image, "ref")
+            workflow["_ref_image_load"] = {
+                "inputs": {"image": ref_filename},
+                "class_type": "LoadImage",
+            }
         workflow[NODE_IDS["prompt_and_dims"]] = {
             "inputs": {
                 "clip": [NODE_IDS["clip_loader"], 0],
@@ -473,16 +492,17 @@ def build_prompt_payload(job_input, upscale_method="none"):
                 "height": height,
                 "length": ["105:107", 1],
                 "ref_image_size": "match",
-                # Autogrow API key is "<input id>.<template name>": the
-                # pinned commit's comfy_api/latest/_io.py builds expected
-                # ids with finalize_prefix(["ref_images"], "ref_image_0").
-                # The old bare "ref_image_0" key matched nothing, so the
-                # reference image was silently dropped. Still untested on a
-                # real run.
-                "ref_images.ref_image_0": ["_ref_image_load", 0],
             },
             "class_type": "MiniMaxH3ReferenceToVideo",
         }
+        if ref_image:
+            # Autogrow API key is "<input id>.<template name>": the
+            # pinned commit's comfy_api/latest/_io.py builds expected
+            # ids with finalize_prefix(["ref_images"], "ref_image_0").
+            # The old bare "ref_image_0" key matched nothing, so the
+            # reference image was silently dropped. Still untested on a
+            # real run.
+            workflow[NODE_IDS["prompt_and_dims"]]["inputs"]["ref_images.ref_image_0"] = ["_ref_image_load", 0]
     else:
         prompt_node = workflow[NODE_IDS["prompt_and_dims"]]["inputs"]
         prompt_node["prompt"] = prompt_text
@@ -1398,6 +1418,9 @@ def run_face_refine(job_input, should_cancel=None, should_force_kill=None, repor
     h3_model = job_input.get("model") or "base"
     if h3_model not in MODEL_CHOICES:
         raise ValueError(f"Unknown model {h3_model!r}")
+    if engine == "h3" and MODEL_CHOICES[h3_model].get("reference_node"):
+        # The H3 engine redraws with base's turbo LoRA - not Ref2VA's.
+        raise ValueError("The H3 refine engine needs a base session - use the Wan engine with Ref2VA")
     seed = resolve_seed(job_input.get("seed"))
     canvas = job_input.get("canvas")
     if canvas in (None, "", "auto"):
