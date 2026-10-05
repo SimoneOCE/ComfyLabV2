@@ -601,3 +601,14 @@ dropdown (not part of the blind A/B).
 Known: the first Ref2VA session downloads ~21GB inside the 10-minute idle
 window (idle-timer bug noted earlier, not fixed), so it may end right after
 its warmup; the next session starts normally.
+
+## Result + decision: Ref2VA is for motion only (user, 2026-10-05)
+
+Ref2VA text-only Flash test on the worker (seed 424242, 1280x720, 15s, 20
+steps, Sage, RTX 2x) vs base a9f8afdc: the user judged Ref2VA clearly not good
+enough for main production. Decision: base stays the main model (text,
+start/end frames); Ref2VA is loaded only for motion / character swap
+(reference video). Three models total, swapping when a job needs another;
+~40s per swap accepted. Which model runs reference-image jobs is still open.
+Ref2VA session start measured: download 94s (once), warmup 52.1s (base
+46-64s). Supersedes "Plan: Ref2VA as the main model" above. Not built.
