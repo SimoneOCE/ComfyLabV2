@@ -128,6 +128,19 @@ LORA_CHOICES = {
         "multiplier": 1.0,
         "default_steps": 4,
     },
+    # Ref2VA's own 4-step turbo (the "Lightning" switch in Comfy-Org's r2v
+    # template; used for the pod motion swaps). Only valid on a Ref2VA
+    # session, the two above only on base/DaSiWa. Downloaded to the volume
+    # by the first Ref2VA session (run_session), not at engine setup, so
+    # base sessions never wait on it.
+    "ref2v_turbo": {
+        "filename": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "repo": "Comfy-Org/MiniMax-H3",
+        "repo_path": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "multiplier": 1.0,
+        "default_steps": 4,
+        "reference_node": True,
+    },
 }
 
 # NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI) -
@@ -438,6 +451,40 @@ def ensure_model_file(spec, subdir):
     print(f"Downloaded {spec['filename']} in {round(time.time() - start)}s.")
 
 
+MAX_REF_IMAGES = 9          # MiniMaxH3ReferenceToVideo's <Picture 1..9>
+REF_VIDEO_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+\.(mp4|mov|webm|mkv)$")
+REF_VIDEO_MAX_SECONDS = 15.5  # H3's trained range tops out at 15s
+
+
+def prepare_ref_video(video_key):
+    """Downloads inputs/<video_key> (uploaded by the test page) into
+    ComfyUI's input/ dir. Returns (input_filename, has_audio). Refuses a
+    video that isn't ~24fps (the node takes frames 1:1 at 24fps, so any other
+    rate plays at the wrong speed) or is longer than 15s (its soundtrack is
+    also the finished video's, and would run past the generated frames)."""
+    if not REF_VIDEO_KEY_RE.match(video_key or ""):
+        raise ValueError(f"Bad reference video key {video_key!r}")
+    import av
+    input_dir = os.path.join(COMFYUI_DIR, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    filename = f"refvideo_{video_key}"
+    path = os.path.join(input_dir, filename)
+    s3_client.download_file(S3_BUCKET, f"inputs/{video_key}", path)
+    with av.open(path) as c:
+        if not c.streams.video:
+            raise ValueError("The reference video has no video stream")
+        v = c.streams.video[0]
+        fps = float(v.average_rate or 0)
+        seconds = float(c.duration / av.time_base) if c.duration else 0.0
+        has_audio = bool(c.streams.audio)
+    if not 23.5 <= fps <= 24.5:
+        raise ValueError(f"The reference video is {fps:.2f}fps - export it at 24fps")
+    if seconds > REF_VIDEO_MAX_SECONDS:
+        raise ValueError(f"The reference video is {seconds:.1f}s - trim it to 15s or less")
+    print(f"Reference video {video_key}: {seconds:.1f}s, {fps:.2f}fps, audio={'yes' if has_audio else 'no'}.")
+    return filename, has_audio
+
+
 def build_prompt_payload(job_input, upscale_method="none"):
     """Builds the full workflow graph for one generation. upscale_method
     "nvidia_vsr" splices RTX VSR into the SAME submission
@@ -453,7 +500,10 @@ def build_prompt_payload(job_input, upscale_method="none"):
     duration = job_input.get("duration", 7.29)
     steps = job_input.get("steps", 20)
     seed = job_input.get("seed", uuid.uuid4().int & 0xFFFFFFFF)
-    ref_image = job_input.get("ref_image")
+    ref_images = list(job_input.get("ref_images") or [])
+    if job_input.get("ref_image"):
+        ref_images.insert(0, job_input["ref_image"])
+    ref_video_key = job_input.get("ref_video_key")
     start_frame = job_input.get("start_frame")
     end_frame = job_input.get("end_frame")
 
@@ -469,20 +519,45 @@ def build_prompt_payload(job_input, upscale_method="none"):
     #     ref_image request takes the ReferenceToVideo path. Mixing the two
     #     is refused rather than silently dropping the frames (user,
     #     2026-10-04: one or the other per generation).
-    if ref_image and (start_frame or end_frame):
-        raise ValueError("Use reference images OR start/end frames in one generation, not both")
+    if (ref_images or ref_video_key) and (start_frame or end_frame):
+        raise ValueError("Use references OR start/end frames in one generation, not both")
+    if len(ref_images) > MAX_REF_IMAGES:
+        raise ValueError(f"At most {MAX_REF_IMAGES} reference images, got {len(ref_images)}")
     reference_node = MODEL_CHOICES[job_input.get("model", "base")].get("reference_node", False)
     if reference_node and (start_frame or end_frame):
         raise ValueError("Start/end frames need a base session - Ref2VA has no first/last-frame inputs")
-    if reference_node and job_input.get("lora"):
-        raise ValueError("The turbo LoRAs are base-model LoRAs - run Ref2VA without turbo")
-    if ref_image or reference_node:
-        if ref_image:
-            ref_filename = save_input_image(ref_image, "ref")
-            workflow["_ref_image_load"] = {
-                "inputs": {"image": ref_filename},
+    if ref_video_key and not reference_node:
+        raise ValueError("A reference video (motion swap) needs a Ref2VA session")
+    lora_key = job_input.get("lora")
+    if lora_key and lora_key in LORA_CHOICES and LORA_CHOICES[lora_key].get("reference_node", False) != reference_node:
+        raise ValueError("That turbo LoRA is for the other model - Ref2VA uses ref2v_turbo, base/DaSiWa use turbo/fast")
+    if ref_images or ref_video_key or reference_node:
+        ref_inputs = {}
+        for i, img in enumerate(ref_images):
+            workflow[f"_ref_image_load_{i}"] = {
+                "inputs": {"image": save_input_image(img, "ref")},
                 "class_type": "LoadImage",
             }
+            # Autogrow API key is "<input id>.<template name>": the
+            # pinned commit's comfy_api/latest/_io.py builds expected
+            # ids with finalize_prefix(["ref_images"], "ref_image_0").
+            # The old bare "ref_image_0" key matched nothing, so the
+            # reference image was silently dropped.
+            ref_inputs[f"ref_images.ref_image_{i}"] = [f"_ref_image_load_{i}", 0]
+        if ref_video_key:
+            video_filename, has_audio = prepare_ref_video(ref_video_key)
+            workflow["_ref_video_load"] = {"inputs": {"file": video_filename}, "class_type": "LoadVideo"}
+            workflow["_ref_video_parts"] = {"inputs": {"video": ["_ref_video_load", 0]},
+                                            "class_type": "GetVideoComponents"}
+            # <Video 1> in the prompt; frames are taken 1:1 at 24fps and
+            # trimmed to the output length by the node itself.
+            ref_inputs["ref_videos.ref_video_0"] = ["_ref_video_parts", 0]
+            if has_audio:
+                # <Audio 1>: the video's soundtrack. The finished video keeps
+                # that original soundtrack too, as on the pod swaps - H3's own
+                # re-generated audio of a song is noticeably worse.
+                ref_inputs["ref_video_audios.ref_video_audio_0"] = ["_ref_video_parts", 1]
+                workflow["105:91"]["inputs"]["audio"] = ["_ref_video_parts", 1]
         workflow[NODE_IDS["prompt_and_dims"]] = {
             "inputs": {
                 "clip": [NODE_IDS["clip_loader"], 0],
@@ -492,17 +567,14 @@ def build_prompt_payload(job_input, upscale_method="none"):
                 "height": height,
                 "length": ["105:107", 1],
                 "ref_image_size": "match",
+                # Encodes the reference video's soundtrack into the model's
+                # audio stream; without it <Audio 1> only reaches the text
+                # encoder (node tooltip).
+                "audio_vae": ["105:24", 0],
+                **ref_inputs,
             },
             "class_type": "MiniMaxH3ReferenceToVideo",
         }
-        if ref_image:
-            # Autogrow API key is "<input id>.<template name>": the
-            # pinned commit's comfy_api/latest/_io.py builds expected
-            # ids with finalize_prefix(["ref_images"], "ref_image_0").
-            # The old bare "ref_image_0" key matched nothing, so the
-            # reference image was silently dropped. Still untested on a
-            # real run.
-            workflow[NODE_IDS["prompt_and_dims"]]["inputs"]["ref_images.ref_image_0"] = ["_ref_image_load", 0]
     else:
         prompt_node = workflow[NODE_IDS["prompt_and_dims"]]["inputs"]
         prompt_node["prompt"] = prompt_text
@@ -542,7 +614,6 @@ def build_prompt_payload(job_input, upscale_method="none"):
 
     # LoRA chain: UNETLoader -> [turbo LoRA] -> Sage/guider.
     model_src = [NODE_IDS["unet_loader"], 0]
-    lora_key = job_input.get("lora")
     if lora_key and lora_key in LORA_CHOICES:
         preset = LORA_CHOICES[lora_key]
         workflow["_lora"] = {
@@ -1784,6 +1855,8 @@ def run_session(session_id, model="base"):
         symlink_models_to_volume()
         t = time.time()
         ensure_model_file(MODEL_CHOICES[model], "diffusion_models")  # no-op once on the volume
+        if MODEL_CHOICES[model].get("reference_node"):
+            ensure_model_file(LORA_CHOICES["ref2v_turbo"], "loras")
         if time.time() - t > 5:
             print(f"Session {session_id}: downloaded this session's H3 model in {round(time.time() - t)}s.")
         start_comfyui_if_needed()

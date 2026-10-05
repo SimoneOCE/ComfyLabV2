@@ -612,3 +612,15 @@ start/end frames); Ref2VA is loaded only for motion / character swap
 ~40s per swap accepted. Which model runs reference-image jobs is still open.
 Ref2VA session start measured: download 94s (once), warmup 52.1s (base
 46-64s). Supersedes "Plan: Ref2VA as the main model" above. Not built.
+
+## Built: motion swap on the worker + test page (2026-10-05)
+
+Ref2VA sessions take a reference video (`ref_video_key`: the test page
+uploads it to Wasabi `inputs/`, the worker downloads it, refuses non-24fps
+or >15.5s) and up to 9 pictures (`ref_images`, the page offers 3), all on
+MiniMaxH3ReferenceToVideo with the audio VAE connected. The video's
+soundtrack is `<Audio 1>` and also the finished video's audio (as on the pod).
+New LoRA `ref2v_turbo` (Ref2VA's 4-step turbo, downloaded by the first Ref2VA
+session); LoRAs are refused on the wrong model. A reference video in a base
+session is refused. Not yet run on a GPU. Open: RTX 2x on a 15s swap crashed
+the pod (see above) and the worker splices it into the same graph.

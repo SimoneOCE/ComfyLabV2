@@ -78,6 +78,25 @@
     <div id="endFramePreview" class="framePreview"></div>
     <button type="button" id="clearFrames">Clear frames</button>
   </fieldset>
+  <fieldset id="motionSwap" style="margin:10px 0; padding:8px 10px; border:1px solid #444;">
+    <legend>Motion swap (Ref2VA session only, optional)</legend>
+    <div style="font-size:0.8rem; color:#aaa; margin-bottom:6px;">
+      Reference video: 24fps, 15s or shorter (the worker refuses anything else). Duration is set to
+      its length. In the prompt it's &lt;Video 1&gt; and its soundtrack &lt;Audio 1&gt;; the finished
+      video keeps the original soundtrack. Pictures are &lt;Picture 1&gt;-&lt;Picture 3&gt;, one character
+      each. For the fast version pick LoRA "Turbo (Ref2VA, 4-step)" and set Steps to 4. Upscale: start with None -
+      RTX 2x crashed a 15s swap on the pod.
+    </div>
+    <label>Reference video <input id="refVideo" type="file" accept="video/*" /></label>
+    <div id="refVideoInfo" style="font-size:0.8rem; color:#9c9;"></div>
+    <label>Picture 1 <input id="refImage1" type="file" accept="image/*" /></label>
+    <div id="refImage1Preview" class="framePreview"></div>
+    <label>Picture 2 <input id="refImage2" type="file" accept="image/*" /></label>
+    <div id="refImage2Preview" class="framePreview"></div>
+    <label>Picture 3 <input id="refImage3" type="file" accept="image/*" /></label>
+    <div id="refImage3Preview" class="framePreview"></div>
+    <button type="button" id="clearMotionSwap">Clear motion swap</button>
+  </fieldset>
   <label>Seed (blank = random; the seed actually used is shown in the result)
     <input id="seed" type="text" inputmode="numeric" placeholder="random" />
   </label>
@@ -86,6 +105,7 @@
       <option value="">None</option>
       <option value="turbo">Turbo</option>
       <option value="fast">Fast</option>
+      <option value="ref2v_turbo">Turbo (Ref2VA, 4-step)</option>
     </select>
   </label>
   <label>Attention
@@ -755,6 +775,26 @@ async function runJob() {
     return;
   }
 
+  // Motion swap: pictures go in the job (resized, PNG so transparency
+  // survives); the video is too big for that, so it goes to Wasabi
+  // inputs/ and the worker downloads it by key.
+  try {
+    const refImages = [];
+    for (const id of ['refImage1', 'refImage2', 'refImage3']) {
+      const file = document.getElementById(id).files[0];
+      if (file) refImages.push(await refImageBase64(file));
+    }
+    if (refImages.length) genInput.ref_images = refImages;
+    const refVideo = document.getElementById('refVideo').files[0];
+    if (refVideo) {
+      statusEl.textContent = 'Uploading the reference video...';
+      genInput.ref_video_key = await uploadRefVideo(refVideo);
+    }
+  } catch (err) {
+    statusEl.textContent = `Could not prepare the motion swap: ${err.message}`;
+    return;
+  }
+
   // Session mode: a held-open worker is ready, so route through the job
   // queue instead of RunPod's own /run (which would spin up/reuse-by-luck
   // a SEPARATE worker rather than reach the one already held open for
@@ -833,6 +873,39 @@ function frameImageBase64(file, width, height) {
   });
 }
 
+// Reference picture: scaled down to 1536px on the long edge at most (the
+// node caps them at 2048 anyway), kept as PNG. Bare base64, no data: prefix.
+function refImageBase64(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 1536 / Math.max(img.naturalWidth, img.naturalHeight));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.naturalWidth * scale);
+      canvas.height = Math.round(img.naturalHeight * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/png').split(',')[1]);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error(`${file.name} is not an image the browser can open`)); };
+    img.src = url;
+  });
+}
+
+async function uploadRefVideo(file) {
+  const bucket = document.getElementById('s3Bucket').value.trim();
+  if (!bucket || !document.getElementById('s3AccessKey').value.trim() || !document.getElementById('s3SecretKey').value.trim()) {
+    throw new Error('fill in the S3 bucket and keys first - the video is uploaded there');
+  }
+  const ext = (file.name.match(/\.(mp4|mov|webm|mkv)$/i) || [, 'mp4'])[1].toLowerCase();
+  const key = `${crypto.randomUUID()}.${ext}`;
+  await getS3Client().putObject({
+    Bucket: bucket, Key: `inputs/${key}`, Body: file, ContentType: file.type || 'video/mp4',
+  }).promise();
+  return key;
+}
+
 function showFramePreview(inputId, previewId) {
   const file = document.getElementById(inputId).files[0];
   const box = document.getElementById(previewId);
@@ -845,6 +918,35 @@ function showFramePreview(inputId, previewId) {
 }
 document.getElementById('startFrame').addEventListener('change', () => showFramePreview('startFrame', 'startFramePreview'));
 document.getElementById('endFrame').addEventListener('change', () => showFramePreview('endFrame', 'endFramePreview'));
+for (const n of [1, 2, 3]) {
+  document.getElementById(`refImage${n}`).addEventListener('change', () => showFramePreview(`refImage${n}`, `refImage${n}Preview`));
+}
+document.getElementById('refVideo').addEventListener('change', () => {
+  const file = document.getElementById('refVideo').files[0];
+  const info = document.getElementById('refVideoInfo');
+  info.textContent = '';
+  if (!file) return;
+  const v = document.createElement('video');
+  v.preload = 'metadata';
+  v.onloadedmetadata = () => {
+    const secs = v.duration;
+    URL.revokeObjectURL(v.src);
+    if (secs > 15.5) {
+      info.style.color = '#e88';
+      info.textContent = `${secs.toFixed(2)}s - too long, trim it to 15s or less.`;
+      return;
+    }
+    document.getElementById('duration').value = secs.toFixed(2);
+    info.style.color = '#9c9';
+    info.textContent = `${secs.toFixed(2)}s - duration set to match. Make sure it's 24fps.`;
+  };
+  v.onerror = () => { info.textContent = 'The browser could not read this video (it can still be uploaded).'; };
+  v.src = URL.createObjectURL(file);
+});
+document.getElementById('clearMotionSwap').addEventListener('click', () => {
+  for (const id of ['refVideo', 'refImage1', 'refImage2', 'refImage3']) document.getElementById(id).value = '';
+  for (const id of ['refVideoInfo', 'refImage1Preview', 'refImage2Preview', 'refImage3Preview']) document.getElementById(id).innerHTML = '';
+});
 document.getElementById('clearFrames').addEventListener('click', () => {
   for (const id of ['startFrame', 'endFrame']) document.getElementById(id).value = '';
   for (const id of ['startFramePreview', 'endFramePreview']) document.getElementById(id).innerHTML = '';
