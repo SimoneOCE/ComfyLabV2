@@ -30,7 +30,9 @@ below:
 - Prompt enhancer rules (PROMPT_FRAMING_RULES.md incl. the motion-swap
   section) -> `enhanceSystemPrompt` in server.js.
 - Uploads: presigned PUT to `inputs/<user_id>/` (no keys in the browser).
-- Billing (user Q9): starts at ready, as before; swap time is billed.
+- Billing (user, 2026-10-06): everything RunPod counts as execution time is
+  billed, from the moment a worker picks up the session job (worker startup,
+  model loads, warmup and swaps included); only queue time is free.
 
 **Rejected / not ported**
 - Standalone upscale job and the upscale-only session job (no billing path).

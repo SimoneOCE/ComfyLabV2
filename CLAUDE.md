@@ -18,10 +18,11 @@ session must exist in `gpu_sessions` (not ended); its `user_id` is the owner.
 
 1. Startup (heartbeat running): `ensure_comfyui_engine.sh` (SageAttention
    wheel from the volume cache, base model files), model symlinks, ComfyUI,
-   a 1-step warmup on the base model. Then `worker_started_at` is set — the
-   UI's "ready" and the moment billing starts. `warmup_seconds` in the final
-   summary = everything from job start to ready; the website's
-   reconciliation subtracts it.
+   a 1-step warmup on the base model. Billing starts at the very beginning
+   of the job (`execution_started_at`, stamped first thing): only RunPod
+   queue time is free; startup, model load and warmup are billed, matching
+   RunPod's execution time. `worker_started_at` then marks "ready" (the UI
+   lets the user generate). `warmup_seconds` in the summary is informational.
 2. Loop: heartbeat (`active_gpu_sessions.last_activity_at`, 20s), session
    still active? (`gpu_sessions.ended_at` null AND claim row present), claim
    the oldest queued `gpu_session_jobs` row, run it, write `progress` /

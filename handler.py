@@ -1299,9 +1299,20 @@ def touch_session_heartbeat(session_id):
         print(f"Could not write heartbeat for session {session_id}: {e}")
 
 
+def mark_session_execution_started(session_id):
+    """Sets execution_started_at the moment this RunPod job starts executing:
+    billing starts here (server.js meterActiveSessions). Only queue time,
+    before a worker picked the job up, is free; worker startup, model load
+    and warmup are billed, matching RunPod's own execution time."""
+    try:
+        sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"execution_started_at": utc_now_iso()})
+    except Exception as e:
+        print(f"Could not mark execution started for session {session_id}: {e}")
+
+
 def mark_session_worker_started(session_id):
-    """Sets worker_started_at: the UI's "ready" signal AND the moment the
-    billing meter starts charging (server.js meterActiveSessions)."""
+    """Sets worker_started_at: the UI's "ready" signal (generating is allowed
+    from here)."""
     try:
         sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"worker_started_at": utc_now_iso()})
     except Exception as e:
@@ -1402,8 +1413,8 @@ def run_session(session_id):
             "jobs_processed": jobs_processed,
             "comfy_restarts": comfy_restarts,
             # Everything from this job's start to "ready" (engine setup,
-            # ComfyUI start, model load, warmup). server.js's reconciliation
-            # bills execution time minus this: the user pays from ready on.
+            # ComfyUI start, model load, warmup). Informational only: the
+            # whole execution time is billed.
             "warmup_seconds": warmup_seconds,
             "session_duration_seconds": round(time.time() - session_start, 1),
         }
@@ -1422,6 +1433,7 @@ def run_session(session_id):
         print(f"Session {session_id}: not an active session - refusing.")
         return ended("not_active")
     owner_id = owner["user_id"]
+    mark_session_execution_started(session_id)
 
     # Heartbeat through startup too: a first boot on a fresh volume (Sage
     # build, model downloads) can take longer than the reaper's 5-minute
