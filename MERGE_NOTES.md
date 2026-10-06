@@ -3,6 +3,54 @@
 Decisions and to-dos to carry over when this worker replaces production's
 koboldcpp worker (`minimax-h3-worker`) behind `minimax-h3-website`.
 
+## Ported to production (2026-10-06)
+
+This repo is now the production worker (see CLAUDE.md). Status of every item
+below:
+
+**Ported**
+- Base FL2VA for text, start/end frames, reference pictures (up to 9,
+  `<Picture N>`), and pictures + frames (MiniMaxH3AddGuide). Ref2VA only for
+  motion swap, swapped in automatically and back (never both loaded).
+- Motion swap: reference video (24fps, <=15s, checked by the website AND the
+  worker) + 1-3 pictures, original soundtrack kept, length = the video's.
+  Default: Ref2VA 8-step 768p turbo (user Q5); "Faster": the 4-step.
+- Normal generations default to no turbo (20 steps, user Q5); "Turbo" = the
+  fl2v 8-step LoRA.
+- Sage attention always; int8 models; presets 1344x768 / 768x1344 / 992x992;
+  duration 1-15s (17n+5 frames, max 362).
+- RTX VSR 2x on by default for normal generations; off for motion swaps for
+  now (user Q7, with a visible note on the site). 4x not offered.
+- Face refine: button only, Wan engine, the official settings below; hidden on
+  reference-picture and motion-swap videos (user Q6).
+- Heartbeat and worker_started_at -> production `active_gpu_sessions` (by
+  session_id) — the "Must do at merge" item.
+- 45-minute idle timeout, counted from ready (after warmup) — the idle-clock
+  bug is fixed. The site explains sessions that end on their own.
+- Prompt enhancer rules (PROMPT_FRAMING_RULES.md incl. the motion-swap
+  section) -> `enhanceSystemPrompt` in server.js.
+- Uploads: presigned PUT to `inputs/<user_id>/` (no keys in the browser).
+- Billing (user Q9): starts at ready, as before; swap time is billed.
+
+**Rejected / not ported**
+- Standalone upscale job and the upscale-only session job (no billing path).
+- All test-page pickers: model, engine, attention, blind A/B, LoRA list, H3
+  refine engine, refine tuning, 4x, upscale-only section; dev keys in the
+  browser. DaSiWa. The base 4-step "fast" LoRA (no longer downloaded).
+
+**Deferred / open (not merge-blocking)**
+- Reference videos that aren't 24fps are refused (phones record 30fps):
+  resampling to 24fps on the worker would remove that hurdle.
+- Fix faces from the Library (today: on the Generator's result card).
+- 720p-reference noise on swaps (undiagnosed, see below); RTX VSR on 15s
+  swaps (crashed on the pod) - why upscale stays off for swaps.
+- nvidia-vfx still built at every worker boot (~part of cold start).
+- The enhancer's server-side "person + wide shot" safety check.
+- Identity-aware face refine (a refine once gave one person another's face).
+- cleanup.js still deletes videos older than 15 days and caps every library
+  at 30 (conflicts with the Creator/Business caps; owner's decision pending).
+- The comfylab_* tables can be dropped once their history isn't needed.
+
 ## Decided
 
 - **Upscaler: NVIDIA RTX VSR 2x only.** Folded into the same ComfyUI submission

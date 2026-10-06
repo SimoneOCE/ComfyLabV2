@@ -207,7 +207,11 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/va
 # layers at all). Filenames here match LORA_CHOICES exactly, since these
 # are already named sensibly upstream - no renaming needed this time.
 download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
-download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS_DIR/loras"
+# (The 4-step 768p "fast" base LoRA is no longer used in production - the
+# site's Turbo speed is the 8-step above. Not downloaded any more; an existing
+# copy on the volume is harmless. Ref2VA, its two turbo LoRAs and the Wan
+# face-refine models are downloaded by handler.py on first use instead, so
+# session start never waits on them.)
 
 # Face detector for the refine pass (ComfyUI-H3-FaceRefine's H3FaceTrackCrop).
 # It looks in models/ultralytics/bbox, symlinked to the volume by handler.py.

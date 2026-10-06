@@ -1,7 +1,29 @@
+"""Bizzle.ai production GPU worker (ComfyUI + MiniMax H3).
+
+One RunPod job = one held-open GPU session for one user (see run_session).
+The website (minimax-h3-website/server.js) starts the session, validates
+every job, and queues it in Supabase's gpu_session_jobs; this worker polls
+that queue, re-validates everything (it is the last line of defence: the
+gpu_session_jobs table, the RunPod API key or the website could all be
+misused or buggy), runs the job on ComfyUI and writes the result back.
+
+Models (only one MiniMax H3 is ever resident - ~21GB each, 89GB of RAM):
+  - base (FL2VA): loaded at session start. Text-to-video, start/end frames,
+    reference pictures, and pictures + frames (MiniMaxH3AddGuide).
+  - Ref2VA: motion swap only. Swapped in automatically when a job with a
+    reference video arrives (~23-28s), swapped back by the next base job.
+The user never picks a model, LoRA, attention mode or engine: the worker
+derives all of it from the job's mode and "speed".
+
+History: this file started as the ComfyLabV2 test worker. Test-only paths
+(the standalone upscale job, the upscale-only session job, the model/LoRA/
+attention/refine-engine pickers, DaSiWa, the comfylab_* tables) are gone -
+see MERGE_NOTES.md "Ported to production".
+"""
+
 import runpod
 import subprocess
 import threading
-import datetime
 import time
 import requests
 import os
@@ -10,17 +32,16 @@ import re
 import shutil
 import urllib.parse
 import uuid
-import base64
 import boto3
 from botocore.client import Config
 
 COMFYUI_URL = "http://127.0.0.1:8188"
+COMFYUI_WS_URL = "ws://127.0.0.1:8188/ws"
 VOLUME_DIR = "/runpod-volume"
 
-# ComfyUI + KJNodes are baked into the image (see Dockerfile) - unlike
-# speedlabv2's koboldcpp_engine, there's no extraction/build step for these,
-# they're just already there when the container starts.
+# ComfyUI + KJNodes + H3-FaceRefine are baked into the image (see Dockerfile).
 COMFYUI_DIR = "/opt/comfylab/ComfyUI"
+COMFYUI_INPUT_DIR = os.path.join(COMFYUI_DIR, "input")
 ENGINE_SCRIPT = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "comfyui_engine", "ensure_comfyui_engine.sh"
 )
@@ -28,33 +49,21 @@ WORKFLOW_TEMPLATE_PATH = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "comfyui_engine", "workflow_template.json"
 )
 
-# SageAttention + the MiniMax H3 model weights live on the persistent volume
-# (see ensure_comfyui_engine.sh - marker-gated, built/downloaded once per
-# volume, every later worker boot just reuses them). Model weights
-# specifically go under VOLUME_DIR/models rather than COMFYUI_DIR/models
-# because COMFYUI_DIR is inside this worker's own container filesystem,
-# which doesn't survive past its lifetime - symlink_models_to_volume() below
-# points ComfyUI's normal model lookup paths at the volume copies instead of
-# re-downloading ~40GB on every cold boot.
+# SageAttention's wheel and every model file live on the persistent volume
+# (ensure_comfyui_engine.sh, marker-gated); symlink_models_to_volume() points
+# ComfyUI's model folders at them.
 VOLUME_MODELS_DIR = os.path.join(VOLUME_DIR, "models")
-
 OUTPUT_DIR = os.path.join(VOLUME_DIR, "outputs")
-
-# Where ComfyUI itself writes generated videos - NOT the ComfyLabV2-facing
-# OUTPUT_DIR above (that's our own re-encoded copy on its way to Wasabi).
-# See start_comfyui_if_needed()'s --output-directory comment for why this
-# has to be redirected off the container's own small disk at all.
+# ComfyUI's own output dir, redirected off the small container disk; each file
+# is deleted once uploaded (fetch_output_video).
 COMFYUI_OUTPUT_DIR = os.path.join(VOLUME_DIR, "comfyui_output")
 
-# Wasabi (third-party S3-compatible storage), NOT RunPod's own S3-compatible
-# volume storage - that only exists in 15 specific datacenters (see RunPod's
-# docs), and EUR-IS-2 (the one datacenter with real RTX 5090 + CUDA 13.0
-# availability) isn't one of them, confirmed the hard way with a real
-# EndpointConnectionError against a guessed s3api-eur-is-2.runpod.io hostname
-# that doesn't even resolve. Wasabi decouples storage from whichever
-# datacenter the GPU worker happens to land in - the bucket lives in Wasabi's
-# own eu-west-1 (UK), picked as the shortest real network path from Iceland
-# (FARICE-1 submarine cable runs Iceland -> Scotland, backhauled to London).
+# --- Storage: Wasabi (S3-compatible) -------------------------------------
+# outputs/<uuid>.mp4  - finished videos (served to the owner by server.js's
+#                       GET /api/video/:key after an ownership check)
+# inputs/<user_id>/<uuid>.<ext> - the user's uploads (pictures, frames,
+#                       reference videos), written through presigned PUT URLs
+#                       that server.js issues for that user's own prefix only.
 S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY")
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://s3.eu-west-1.wasabisys.com")
@@ -70,137 +79,115 @@ s3_client = boto3.client(
     config=Config(signature_version="s3v4"),
 )
 
-# Node IDs from the real API-format export (video_minimax_h3_t2v_3.json,
-# captured off the proven RunPod CUDA 13.0 pod), extended with node classes
-# verified directly against comfyanonymous/ComfyUI's own source
-# (comfy_extras/nodes_minimax_h3.py) rather than guessed - see the
-# ComfyLabV2 migration plan for the research trail.
+# Node ids from workflow_template.json (the API export of the proven graph).
 NODE_IDS = {
-    "prompt_and_dims": "105:104",  # MiniMaxH3ImageToVideo (or MiniMaxH3ReferenceToVideo when a ref image is given) - prompt/width/height/length/first_frame/last_frame inputs
-    "duration_seconds": "105:111", # PrimitiveFloat feeding ComfyMathExpression's 17n+5 frame-count snap
-    "seed": "105:15",              # RandomNoise - noise_seed
-    "steps": "105:9",              # BasicScheduler - steps
-    "unet_loader": "105:6",        # UNETLoader - base diffusion model, LoRA's "model" input source
+    "prompt_and_dims": "105:104",  # MiniMaxH3ImageToVideo, or MiniMaxH3ReferenceToVideo with references
+    "duration_seconds": "105:111", # PrimitiveFloat feeding the 17n+5 frame snap (ComfyMathExpression 105:107)
+    "seed": "105:15",              # RandomNoise
+    "steps": "105:9",              # BasicScheduler
+    "unet_loader": "105:6",        # UNETLoader
     "clip_loader": "105:13",       # CLIPLoader
     "vae_loader": "105:11",        # VAELoader (video)
-    "sage_attention": "105:120",   # PathchSageAttentionKJ - "model" input rewired to the LoRA node's output when a LoRA is active
-    "guider": "105:16",            # BasicGuider - "model" input (the attention patch point)
-    "scheduler": "105:9",          # BasicScheduler - "model" input (only reads model_sampling)
-    "output": "92",                # SaveVideo - terminal output node
+    "audio_vae_loader": "105:24",  # VAELoader (audio)
+    "sage_attention": "105:120",   # PathchSageAttentionKJ (always on in production)
+    "guider": "105:16",            # BasicGuider
+    "sampler": "105:14",           # SamplerCustomAdvanced
+    "video_decode": "105:10",      # VAEDecode
+    "create_video": "105:91",      # CreateVideo
+    "output": "92",                # SaveVideo
 }
 
-# koboldcpp/stable-diffusion.cpp parsed a `<lora:filename:mult>` tag straight
-# out of the prompt string, hidden from the user by inserting it server-side.
-# ComfyUI has no equivalent - a LoRA is a real graph node (LoraLoaderModelOnly,
-# verified in comfyanonymous/ComfyUI's nodes.py), so "toggling" one here means
-# conditionally splicing that node into the workflow per job instead, done in
-# build_prompt_payload() below. default_sampler is deliberately NOT carried
-# over from production's LORA_CHOICES - koboldcpp's sampler names ("Euler",
-# "er_sde") aren't verified against ComfyUI's KSamplerSelect option list, and
-# guessing that mapping risks a silently-wrong sampler rather than an error.
+MODEL_CHOICES = {
+    "base": {"filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
+    # Motion swap only. Public repo; downloaded to the volume by the first
+    # swap job if it isn't there yet (never at session start).
+    "ref2va": {
+        "filename": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "repo": "Comfy-Org/MiniMax-H3",
+        "repo_path": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "reference_node": True,
+    },
+}
+
+# Fixed map - never chosen by the user directly (see plan_generation).
 LORA_CHOICES = {
-    # Comfy-Org's OWN turbo LoRAs, published in the same HF repo as our
-    # checkpoint - replaced the original production-ported picks after a
-    # real run confirmed those weren't actually compatible with this
-    # checkpoint at all (see the adaln_proj shape-mismatch investigation:
-    # a LoRA trained for adaln_proj.linear.in_features=2688 hit our
-    # checkpoint's actual in_features=8 on every single block). Verified
-    # before swapping in, not assumed: pulled these files' safetensors
-    # headers directly - they're already keyed "diffusion_model.*" (no
-    # naming-convention mismatch), they don't touch adaln_proj at all
-    # (sidesteps that exact incompatibility), and their embedded metadata
-    # states target_format "ComfyUI generic LoRA" and base_model
-    # "Comfy-Org/MiniMax-H3 minimax_h3_fl2va_bf16.safetensors" - a
-    # deliberate, documented conversion for this exact model family, not
-    # a random community LoRA.
+    # base: Comfy-Org's 8-step turbo ("Turbo" speed on the site).
     "turbo": {
         "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
         "multiplier": 1.0,
-        "default_steps": 8,
+        "steps": 8,
     },
-    "fast": {
-        # Filename says "768p" - possibly tuned for that resolution
-        # specifically rather than resolution-agnostic; worth confirming
-        # at other sizes rather than assuming it's fine everywhere.
-        "filename": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
-        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
-        "multiplier": 1.0,
-        "default_steps": 4,
-    },
-    # Ref2VA's own 4-step turbo (the "Lightning" switch in Comfy-Org's r2v
-    # template; used for the pod motion swaps). Only valid on a Ref2VA
-    # session, the two above only on base/DaSiWa. Downloaded to the volume
-    # by the first Ref2VA session (run_session), not at engine setup, so
-    # base sessions never wait on it.
+    # Ref2VA 4-step v0.1 (544p-trained): the motion swap's "Fast" option.
     "ref2v_turbo": {
         "filename": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
         "repo": "Comfy-Org/MiniMax-H3",
         "repo_path": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
         "multiplier": 1.0,
-        "default_steps": 4,
-        "reference_node": True,
+        "steps": 4,
     },
-    # lightx2v's (the turbo LoRAs' authors) newer Ref2VA turbo: 8 steps,
-    # v1.0, trained at 768p (1344x768) - the 4-step above is v0.1 trained at
-    # 544p. Same ComfyUI conversion and key layout as the 4-step (headers
-    # compared). Their 768p turbos are trained with flow shift 6 video / 3
-    # audio instead of H3's default 12/3 (Minimax-H3-Turbo README, model
-    # specs; this file isn't in that table yet, so 6/3 is by analogy), so a
-    # MiniMaxH3SigmaShift node is spliced in after the LoRA.
+    # Ref2VA 8-step v1.0 (768p-trained, lightx2v): the motion swap default.
+    # Trained at flow shift 6/3, so MiniMaxH3SigmaShift is spliced in.
     "ref2v_turbo_8": {
         "filename": "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
         "repo": "lightx2v/Minimax-h3-Turbo",
         "repo_path": "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
         "multiplier": 1.0,
-        "default_steps": 8,
-        "reference_node": True,
+        "steps": 8,
         "shift": (6.0, 3.0),
     },
 }
 
-# NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI) -
-# the one upscale option, chosen after a side-by-side test against ESRGAN 2x
-# and FlashVSR (both since removed). Spliced into the SAME submission as the
-# base generation - no /free, no second submission. It's a small per-frame
-# SR network, not a diffusion model, so it doesn't need MiniMax H3 evicted
-# to fit, and keeping it in one graph means the base model stays resident
-# in VRAM for the next job in the session (the whole point of a warm
-# session). Confirmed on a real run: clean 2x output, and a following
-# no-upscale job stayed at native resolution.
+STANDARD_STEPS = 20  # base without a turbo LoRA ("Standard" speed, the default)
+
+# H3's native ~1MP canvas (768p class). Generations use the three user-facing
+# presets; a motion swap picks the preset closest to its reference video's
+# shape (incl. 4:3 / 3:4, which the user can't pick).
+ASPECT_PRESETS = {"16:9": (1344, 768), "9:16": (768, 1344), "1:1": (992, 992)}
+MOTION_PRESETS = [(1344, 768), (768, 1344), (992, 992), (1024, 768), (768, 1024)]
+
+# RTX Video Super Resolution, 2x only. Spliced into the generation's own graph
+# (H3 stays resident). 2x of every preset stays inside 4K and H.264 level 5.x
+# (largest: 2688x1536 / 1984x1984), so the result plays on iPhone/Mac. 4x is
+# not offered: it produced level 6.0 files Apple devices can't decode.
 NVIDIA_VSR_SCALE = 2.0
 NVIDIA_VSR_QUALITY = "ULTRA"
-UPSCALE_METHODS = {"none", "nvidia_vsr"}
-# Attention A/B (see apply_attention_mode). ComfyUI's own H3 guide
-# (docs.comfy.org/tutorials/video/minimax/minimax-h3, "Quality degradation
-# with INT8 attention") says Sage's INT8 attention causes morphing late in a
-# clip on H3: its last blocks concentrate the key signal in a few channels
-# that per-row INT8 scaling loses. The official templates ship without Sage.
-#   "sage"   - PathchSageAttentionKJ, sage_attention=auto (the previous default)
-#   "off"    - no patch: ComfyUI's standard attention, exact
-#   "sparse" - no Sage; ComfyUI's built-in Model Sparse Attention
-#              (BlockSparseAttention) in sol-attn mode, the mode the docs say
-#              the base H3 weights use. Node defaults: tau 1.3, dense for the
-#              first 20% of steps, text/audio/ref rows kept exact.
-ATTENTION_MODES = {"sage", "off", "sparse"}
-# Allowed upscale_scale values. 4x holds the whole upscaled clip in system
-# RAM at once (the node writes to the decoded frames' device, which is
-# ComfyUI's intermediate_device() - system RAM - same mechanism that
-# OOM-killed ESRGAN 4x): ~31.6GB of float32 frames for a 1280x736, ~175
-# frame clip, before encoding. Fine at low base resolutions; risky at high.
-UPSCALE_SCALES = {2.0, 4.0}
+
+# --- Job limits (mirrors server.js's validateJobRequest) ------------------
+PROMPT_MAX_CHARS = 6000
+DURATION_MIN = 1.0
+DURATION_MAX = 15.0
+MAX_REF_IMAGES = 9            # <Picture 1..9>
+MOTION_MAX_PICTURES = 3
+MAX_FRAMES = 362              # H3's trained maximum (17n+5)
+SEED_MAX = 0xFFFFFFFF
+IMAGE_MAX_BYTES = 10 * 1024 * 1024
+IMAGE_MAX_SIDE = 8192
+IMAGE_MAX_PIXELS = 40_000_000
+REF_IMAGE_MAX_SIDE = 1536     # references are downscaled to this before use
+VIDEO_MAX_BYTES = 100 * 1024 * 1024
+VIDEO_MAX_SIDE = 4096
+REF_VIDEO_MAX_SECONDS = 15.5  # H3's trained range tops out at 15s
+UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+OUTPUT_KEY_RE = re.compile(rf"^{UUID_RE}\.mp4$")
+
+GENERATE_FIELDS = {"v", "mode", "prompt", "aspect", "duration", "speed", "seed", "upscale",
+                   "ref_images", "start_frame", "end_frame", "ref_video", "is_trial"}
+REFINE_FIELDS = {"v", "mode", "source_video_key", "seed", "is_trial"}
+JOB_VERSION = 2
 
 comfyui_process = None
 comfyui_process_lock = threading.Lock()
 
 
+class JobRejected(ValueError):
+    """A job that fails validation - reported to the user as is."""
+
+
 def force_kill_comfyui():
-    """Force Cancellation: kills ComfyUI outright rather than waiting for
-    /interrupt's step-boundary stop. Mirrors minimax-h3-worker's
-    force_kill_kobold() - the next generation on this worker pays a fresh
-    model-load cost since VRAM state is gone, which is why run_session()
-    restarts and re-warms right away rather than waiting for the next job
-    to discover the process is dead."""
+    """Kills ComfyUI outright (Force Cancellation, or the session ending mid
+    job): a graceful /interrupt only lands at a step boundary, which can be
+    minutes away. The session loop restarts and re-warms it if the session
+    is still running."""
     global comfyui_process
     with comfyui_process_lock:
         proc = comfyui_process
@@ -215,39 +202,21 @@ def force_kill_comfyui():
     except Exception as e:
         print(f"Error force-killing ComfyUI process: {e}")
 
-# --- Supabase (session mode only) ---------------------------------------
-# Mirrors minimax-h3-worker/handler.py's own session-mode Supabase block
-# exactly in mechanism (poll-based REST, service-role key, same held-open
-# loop shape) - but points at comfylab_gpu_sessions/comfylab_active_gpu_
-# sessions/comfylab_gpu_session_jobs, three tables added specifically for
-# this test tool rather than the production gpu_sessions/active_gpu_
-# sessions/gpu_session_jobs tables (which are coupled to real user auth
-# and billing/credits in that same Supabase project). No user_id at all
-# here - this is a single-tester local test tool, not a multi-tenant
-# product, so comfylab_active_gpu_sessions uses one fixed global claim
-# slot ('default') instead of one row per user.
+
+# --- Supabase (service role, production tables) ---------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 SESSION_POLL_INTERVAL_SECONDS = 3
-# See minimax-h3-worker/handler.py's own SESSION_IDLE_TIMEOUT_SECONDS
-# comment for the full reasoning (uniform regardless of whether the
-# session has ever had a job). Shorter than production's 15 minutes since
-# this is a manual test tool, not a paying session someone might step
-# away from mid-prompt - idling too long here just burns GPU-minutes on a
-# dev test with nobody watching.
-SESSION_IDLE_TIMEOUT_SECONDS = 10 * 60
+# 45 minutes with no job ends the session (user decision 2026-10-06; the test
+# worker's 10 minutes was too short for real users). The clock starts once
+# the worker is READY (after warmup), and restarts when each job finishes.
+SESSION_IDLE_TIMEOUT_SECONDS = 45 * 60
+# Self-return well before RunPod's suspected 24h job ceiling.
 SESSION_SAFETY_MAX_SECONDS = 23 * 60 * 60
 HEARTBEAT_INTERVAL_SECONDS = 20
-
-# Deliberately NOT replicating minimax-h3-worker's keep-warm ping
-# (KEEPWARM_INTERVAL_SECONDS / warmup_kobold's "keep-warm" mode): that
-# mechanism exists because a real investigation found koboldcpp/CUDA
-# specifically loses first-inference warmup benefit after sitting idle a
-# while. No equivalent investigation has been done for ComfyUI/PyTorch on
-# this stack - adding an unverified periodic throwaway generation here
-# would be copying a fix without copying the evidence that motivated it.
-# Worth testing for real once this held-open pattern proves out.
+PROGRESS_WRITE_INTERVAL_SECONDS = 2
+COMFY_JOB_TIMEOUT_SECONDS = int(os.environ.get("COMFY_JOB_TIMEOUT_SECONDS", "3600"))
 
 
 def _sb_headers():
@@ -259,12 +228,7 @@ def _sb_headers():
 
 
 def sb_get(table, params, timeout=10):
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/{table}",
-        headers=_sb_headers(),
-        params=params,
-        timeout=timeout,
-    )
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers(), params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
@@ -272,57 +236,36 @@ def sb_get(table, params, timeout=10):
 def sb_patch(table, params, body, timeout=10):
     headers = _sb_headers()
     headers["Prefer"] = "return=representation"
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/{table}",
-        headers=headers,
-        params=params,
-        json=body,
-        timeout=timeout,
-    )
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, params=params, json=body,
+                       timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
 def sb_delete(table, params, timeout=10):
-    r = requests.delete(
-        f"{SUPABASE_URL}/rest/v1/{table}",
-        headers=_sb_headers(),
-        params=params,
-        timeout=timeout,
-    )
+    r = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers(), params=params, timeout=timeout)
     r.raise_for_status()
 
 
+def utc_now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# --- ComfyUI process -------------------------------------------------------
+
 def ensure_comfyui_engine():
-    """Runs ensure_comfyui_engine.sh (marker-gated on the volume - see that
-    script's own docstring for why SageAttention specifically has to be
-    installed here rather than baked into the Dockerfile). Safe to call on
-    every cold start; it no-ops past the GPU check once the marker exists.
-    """
+    """SageAttention wheel + base model files (marker-gated on the volume)."""
     print("Ensuring ComfyUI engine (SageAttention + model weights) is ready...")
-    subprocess.run(
-        ["bash", ENGINE_SCRIPT, VOLUME_DIR, COMFYUI_DIR],
-        check=True,
-    )
+    subprocess.run(["bash", ENGINE_SCRIPT, VOLUME_DIR, COMFYUI_DIR], check=True)
 
 
 def symlink_models_to_volume():
-    """Points ComfyUI's normal models/{diffusion_models,text_encoders,vae,
-    loras,ultralytics} lookup paths at the volume-backed copies ensure_comfyui_engine.sh
-    just downloaded, instead of ComfyUI looking in its own (ephemeral)
-    models/ dir baked into the image.
-    """
     for subdir in ("diffusion_models", "text_encoders", "vae", "loras", "ultralytics"):
         link_path = os.path.join(COMFYUI_DIR, "models", subdir)
         target_path = os.path.join(VOLUME_MODELS_DIR, subdir)
         if os.path.islink(link_path):
             continue
         if os.path.isdir(link_path):
-            # Not actually empty - ComfyUI ships a placeholder file in each
-            # of these (e.g. put_diffusion_model_files_here) to keep the
-            # directory tracked in git, so os.rmdir() (empty dirs only)
-            # fails with ENOTEMPTY. rmtree since it's being replaced by a
-            # symlink regardless of what's in it.
             shutil.rmtree(link_path)
         os.makedirs(os.path.dirname(link_path), exist_ok=True)
         os.symlink(target_path, link_path)
@@ -342,39 +285,15 @@ def start_comfyui_if_needed():
     with comfyui_process_lock:
         if is_comfyui_ready():
             return
-        if comfyui_process is not None and comfyui_process.poll() is None:
-            # Already starting, just not ready yet - fall through to the
-            # wait loop below instead of spawning a second instance.
-            pass
-        else:
+        if comfyui_process is None or comfyui_process.poll() is not None:
             print("Starting ComfyUI...")
             os.makedirs(COMFYUI_OUTPUT_DIR, exist_ok=True)
             comfyui_process = subprocess.Popen(
-                [
-                    "python3", "main.py",
-                    "--listen", "0.0.0.0",
-                    "--port", "8188",
-                    # Verified via comfy/cli_args.py - without this,
-                    # ComfyUI's default output dir is base_path/output
-                    # INSIDE the container's own small ephemeral disk
-                    # (folder_paths.py: output_directory = os.path.join
-                    # (base_path, "output")), never cleaned up between
-                    # jobs. Every video from every job in a real test
-                    # session - warmups, T2V runs, LoRA tests, and the
-                    # much larger 4x-upscaled file - piled up there
-                    # unnoticed, very likely what actually filled a
-                    # small container disk right around the upscale
-                    # test. Pointed at the volume instead, which is
-                    # sized for this; fetch_output_video() below also
-                    # deletes each file here once its bytes are safely
-                    # uploaded to Wasabi, so even the volume doesn't
-                    # grow unbounded.
-                    "--output-directory", COMFYUI_OUTPUT_DIR,
-                ],
+                ["python3", "main.py", "--listen", "127.0.0.1", "--port", "8188",
+                 "--output-directory", COMFYUI_OUTPUT_DIR],
                 cwd=COMFYUI_DIR,
             )
-
-    for _ in range(180):  # up to 3 minutes for the server itself to come up
+    for _ in range(180):
         if is_comfyui_ready():
             print("ComfyUI is ready.")
             return
@@ -382,69 +301,15 @@ def start_comfyui_if_needed():
     raise RuntimeError("ComfyUI did not become ready in time.")
 
 
-def save_input_image(b64_data, prefix):
-    """Writes a base64-encoded image to ComfyUI's input/ directory and
-    returns the bare filename. Verified against ComfyUI's own LoadImage
-    node (nodes.py): it resolves its "image" widget value as a plain
-    filename inside folder_paths.get_input_directory() - this is the
-    standard way any ComfyUI API workflow feeds in an uploaded image,
-    not a ComfyLabV2-specific convention."""
-    input_dir = os.path.join(COMFYUI_DIR, "input")
-    os.makedirs(input_dir, exist_ok=True)
-    filename = f"{prefix}_{uuid.uuid4()}.png"
-    with open(os.path.join(input_dir, filename), "wb") as f:
-        f.write(base64.b64decode(b64_data))
-    return filename
-
-
-# Diffusion model (job field "model"). Only Comfy-Org's official pruned
-# int8 remains: the fine-tune bake-off (DaSiWa V3, Singularity v1.3, fal
-# Realism People LoRA) is over - none of them changed the melted faces, which
-# are an H3 limit on small heads (see PROMPT_FRAMING_RULES.md).
-MODEL_CHOICES = {
-    "base": {"filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
-    # Back for a second look (user, 2026-10-04): an aesthetics A/B and, if it
-    # holds up, one model for text, start/end frames AND reference images -
-    # it's an FL2VA+Ref2VA hybrid, a community fine-tune (production's
-    # koboldcpp runs its V1). Same pruned int8 ConvRot layout and ~21GB as
-    # base (headers inspected in the bake-off), so speed and memory match.
-    # Chosen per session at Start GPU (job field "model" on the session
-    # start), downloaded to the volume on the first session that picks it.
-    # Gated repo: needs the endpoint's HF_TOKEN with its terms accepted.
-    "dasiwa_v3": {
-        "filename": "dasiwa_minimax_h3_hybrid_v3_int8_convrot.safetensors",
-        "repo": "darksidewalker/MiniMaxH3",
-        "repo_path": "model/DasiwaMinimaxH3_dasiwaHybridV3_3263052-INT8 ConvRot.safetensors",
-    },
-    # Official reference model (user, 2026-10-05): on trial as the main
-    # session model - text-to-video now, reference images/video later. Its
-    # jobs go through MiniMaxH3ReferenceToVideo (see build_prompt_payload),
-    # with no references for plain text-to-video, the way Comfy-Org's Fun
-    # ControlNet template runs it. That node has no first/last-frame slots,
-    # and the turbo LoRAs here are FL2VA's, so both are refused on it.
-    # Public repo, same pruned int8 layout and size as base.
-    "ref2va": {
-        "filename": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-        "repo": "Comfy-Org/MiniMax-H3",
-        "repo_path": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-        "reference_node": True,
-    },
-}
-
-
 def ensure_model_file(spec, subdir):
-    """Downloads a HuggingFace file to VOLUME_MODELS_DIR/subdir on first use
-    (skipped if already there). Streams to a .part file and renames only
-    once the download finishes, so a killed download leaves just the .part
-    (the next attempt starts over and overwrites it) rather than a file that
-    looks complete. HF_TOKEN (endpoint env var) is sent when set - required
-    for gated repos."""
+    """Downloads a HuggingFace file to the volume on first use (.part + rename,
+    so an interrupted download is never mistaken for a complete file)."""
     if "repo" not in spec:
-        return
+        return False
     dest_dir = os.path.join(VOLUME_MODELS_DIR, subdir)
     dest = os.path.join(dest_dir, spec["filename"])
     if os.path.exists(dest):
-        return
+        return False
     os.makedirs(dest_dir, exist_ok=True)
     url = f"https://huggingface.co/{spec['repo']}/resolve/main/{urllib.parse.quote(spec['repo_path'])}"
     headers = {}
@@ -454,234 +319,409 @@ def ensure_model_file(spec, subdir):
     print(f"Downloading {spec['repo']}/{spec['repo_path']} -> {dest}...")
     start = time.time()
     with requests.get(url, headers=headers, stream=True, timeout=60) as r:
-        if r.status_code in (401, 403):
-            raise RuntimeError(
-                f"HuggingFace refused {spec['repo']} ({r.status_code}) - gated repo: accept its terms "
-                f"on huggingface.co and set HF_TOKEN on the endpoint"
-            )
         r.raise_for_status()
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
                 f.write(chunk)
     os.replace(tmp, dest)
     print(f"Downloaded {spec['filename']} in {round(time.time() - start)}s.")
+    return True
 
 
-MAX_REF_IMAGES = 9          # MiniMaxH3ReferenceToVideo's <Picture 1..9>
-REF_VIDEO_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+\.(mp4|mov|webm|mkv)$")
-REF_VIDEO_MAX_SECONDS = 15.5  # H3's trained range tops out at 15s
+def model_files_present(model):
+    names = [(MODEL_CHOICES[model], "diffusion_models")]
+    if model == "ref2va":
+        names += [(LORA_CHOICES["ref2v_turbo"], "loras"), (LORA_CHOICES["ref2v_turbo_8"], "loras")]
+    return all(os.path.exists(os.path.join(VOLUME_MODELS_DIR, sub, spec["filename"])) for spec, sub in names)
 
 
-def download_input_video(video_key, prefix):
-    """Downloads inputs/<video_key> (uploaded by the test page) into
-    ComfyUI's input/ dir and probes it. Returns (input_filename, info) with
-    info = {width, height, fps, seconds, has_audio}."""
-    if not REF_VIDEO_KEY_RE.match(video_key or ""):
-        raise ValueError(f"Bad video key {video_key!r}")
+def ensure_model(model):
+    downloaded = ensure_model_file(MODEL_CHOICES[model], "diffusion_models")
+    if model == "ref2va":
+        downloaded |= ensure_model_file(LORA_CHOICES["ref2v_turbo"], "loras")
+        downloaded |= ensure_model_file(LORA_CHOICES["ref2v_turbo_8"], "loras")
+    return downloaded
+
+
+# --- Validation (the worker's own copy of every rule) ---------------------
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value \
+        and value not in (float("inf"), float("-inf"))
+
+
+def _input_key_re(owner_id, exts):
+    return re.compile(rf"^inputs/{re.escape(owner_id)}/{UUID_RE}\.({exts})$")
+
+
+def resolve_seed(raw):
+    if raw is None or raw == "":
+        return uuid.uuid4().int & SEED_MAX
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise JobRejected("seed must be a whole number")
+    if not 0 <= raw <= SEED_MAX:
+        raise JobRejected(f"seed must be between 0 and {SEED_MAX}")
+    return raw
+
+
+def validate_job(job_input, owner_id):
+    """Whitelists and normalises a gpu_session_jobs.input. server.js already
+    did all of this before inserting; repeated here because the table can be
+    written by other paths (a direct insert under RLS before the cutover
+    migration, a future bug in server.js). Anything unexpected is refused,
+    never silently "fixed" into something the user didn't ask for - except
+    numeric ranges, which are clamped."""
+    if not isinstance(job_input, dict):
+        raise JobRejected("Malformed job")
+    if not re.fullmatch(UUID_RE, owner_id or ""):
+        raise JobRejected("Session owner unknown")
+    if job_input.get("v") != JOB_VERSION:
+        raise JobRejected("This job was made for an older version of the site - refresh the page and try again")
+    if job_input.get("is_trial") not in (None, False):
+        raise JobRejected("Trial jobs are not supported")
+    mode = job_input.get("mode")
+
+    if mode == "face_refine":
+        unknown = set(job_input) - REFINE_FIELDS
+        if unknown:
+            raise JobRejected(f"Unknown fields: {', '.join(sorted(unknown))}")
+        key = job_input.get("source_video_key")
+        if not isinstance(key, str) or not OUTPUT_KEY_RE.match(key):
+            raise JobRejected("Invalid source video")
+        return {"mode": "face_refine", "source_video_key": key, "seed": resolve_seed(job_input.get("seed"))}
+
+    if mode != "generate":
+        raise JobRejected("Unknown job mode")
+    unknown = set(job_input) - GENERATE_FIELDS
+    if unknown:
+        raise JobRejected(f"Unknown fields: {', '.join(sorted(unknown))}")
+
+    prompt = job_input.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise JobRejected("A prompt is required")
+    prompt = prompt.strip()
+    if len(prompt) > PROMPT_MAX_CHARS:
+        raise JobRejected(f"The prompt is too long (max {PROMPT_MAX_CHARS} characters)")
+
+    aspect = job_input.get("aspect")
+    if aspect not in ASPECT_PRESETS:
+        raise JobRejected("Unknown aspect ratio")
+    duration = job_input.get("duration")
+    if not _is_number(duration):
+        raise JobRejected("Duration must be a number")
+    duration = round(min(DURATION_MAX, max(DURATION_MIN, float(duration))), 2)
+    speed = job_input.get("speed")
+    if speed not in ("standard", "fast"):
+        raise JobRejected("Unknown speed")
+    upscale = job_input.get("upscale")
+    if not isinstance(upscale, bool):
+        raise JobRejected("upscale must be true or false")
+
+    image_re = _input_key_re(owner_id, "jpg|png|webp")
+    video_re = _input_key_re(owner_id, "mp4|mov")
+    ref_images = job_input.get("ref_images") or []
+    if not isinstance(ref_images, list) or len(ref_images) > MAX_REF_IMAGES:
+        raise JobRejected(f"At most {MAX_REF_IMAGES} reference pictures")
+    for key in ref_images:
+        if not isinstance(key, str) or not image_re.match(key):
+            raise JobRejected("Invalid reference picture")
+    frames = {}
+    for name in ("start_frame", "end_frame"):
+        key = job_input.get(name)
+        if key is None:
+            continue
+        if not isinstance(key, str) or not image_re.match(key):
+            raise JobRejected(f"Invalid {name.replace('_', ' ')}")
+        frames[name] = key
+    ref_video = job_input.get("ref_video")
+    if ref_video is not None:
+        if not isinstance(ref_video, str) or not video_re.match(ref_video):
+            raise JobRejected("Invalid reference video")
+        if not 1 <= len(ref_images) <= MOTION_MAX_PICTURES:
+            raise JobRejected(f"A motion swap needs 1-{MOTION_MAX_PICTURES} pictures")
+        if frames:
+            raise JobRejected("Start/end frames can't be combined with a motion swap")
+        upscale = False  # off for motion swaps for now (user, 2026-10-06)
+
+    return {
+        "mode": "generate",
+        "prompt": prompt,
+        "aspect": aspect,
+        "duration": duration,
+        "speed": speed,
+        "seed": resolve_seed(job_input.get("seed")),
+        "upscale": upscale,
+        "ref_images": list(ref_images),
+        "start_frame": frames.get("start_frame"),
+        "end_frame": frames.get("end_frame"),
+        "ref_video": ref_video,
+    }
+
+
+def job_kind(job):
+    if job["mode"] == "face_refine":
+        return "refine"
+    if job.get("ref_video"):
+        return "motion"
+    if job.get("ref_images"):
+        return "reference"
+    return "generate"
+
+
+def refine_source_allowed(owner_id, key):
+    """A face refine may only read a video this user owns and that face
+    refine is offered on (not reference-picture or motion-swap videos): a
+    saved Library row on Wasabi, or one of the user's own completed jobs.
+    The key itself was already format-checked (OUTPUT_KEY_RE)."""
+    rows = sb_get("generations", {
+        "user_id": f"eq.{owner_id}",
+        "video_url": f"like.*/api/video/{key}",
+        "storage": "eq.wasabi",
+        "select": "kind",
+    })
+    if any(r.get("kind") in ("generate", "refine") for r in rows):
+        return True
+    jobs = sb_get("gpu_session_jobs", {
+        "user_id": f"eq.{owner_id}",
+        "status": "eq.completed",
+        "output->>videoKey": f"eq.{key}",
+        "select": "input,output",
+    })
+    for j in jobs:
+        out = j.get("output") or {}
+        if out.get("storage") == "wasabi" and out.get("kind") in ("generate", "refine"):
+            return True
+    return False
+
+
+# --- Inputs ----------------------------------------------------------------
+
+def _object_size(key):
+    try:
+        head = s3_client.head_object(Bucket=S3_BUCKET, Key=key)
+    except Exception:
+        raise JobRejected("An uploaded file is missing - upload it again")
+    return int(head.get("ContentLength") or 0)
+
+
+def load_input_image(key, target_size=None):
+    """Downloads one uploaded picture, decodes it fully (rejecting anything
+    that isn't a real image), and writes a clean PNG into ComfyUI's input dir.
+    target_size: (w, h) to centre-crop and resize to - start/end frames must
+    match the output canvas exactly, or H3 stretches them."""
+    from PIL import Image, ImageOps
+    size = _object_size(key)
+    if size <= 0 or size > IMAGE_MAX_BYTES:
+        raise JobRejected("A picture is too large (max 10MB)")
+    os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
+    tmp = os.path.join(COMFYUI_INPUT_DIR, f"dl_{uuid.uuid4().hex}")
+    try:
+        s3_client.download_file(S3_BUCKET, key, tmp)
+        if os.path.getsize(tmp) > IMAGE_MAX_BYTES:
+            raise JobRejected("A picture is too large (max 10MB)")
+        Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS
+        try:
+            with Image.open(tmp) as probe:
+                if probe.format not in ("JPEG", "PNG", "WEBP"):
+                    raise JobRejected("Pictures must be JPEG, PNG or WebP")
+                probe.verify()
+            with Image.open(tmp) as img:
+                w, h = img.size
+                if min(w, h) < 16 or max(w, h) > IMAGE_MAX_SIDE:
+                    raise JobRejected("A picture's size is out of range")
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                if target_size:
+                    img = ImageOps.fit(img, target_size, method=Image.LANCZOS)
+                elif max(img.size) > REF_IMAGE_MAX_SIDE:
+                    img.thumbnail((REF_IMAGE_MAX_SIDE, REF_IMAGE_MAX_SIDE), Image.LANCZOS)
+                filename = f"in_{uuid.uuid4().hex}.png"
+                img.save(os.path.join(COMFYUI_INPUT_DIR, filename), "PNG")
+                return filename
+        except JobRejected:
+            raise
+        except Exception as e:
+            raise JobRejected(f"A picture could not be read ({type(e).__name__})")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def probe_video(path):
     import av
-    input_dir = os.path.join(COMFYUI_DIR, "input")
-    os.makedirs(input_dir, exist_ok=True)
-    filename = f"{prefix}_{video_key}"
-    path = os.path.join(input_dir, filename)
-    s3_client.download_file(S3_BUCKET, f"inputs/{video_key}", path)
     with av.open(path) as c:
         if not c.streams.video:
-            raise ValueError("The uploaded video has no video stream")
+            raise JobRejected("The reference video has no picture")
         v = c.streams.video[0]
         fps = float(v.average_rate or 0)
-        # The picture's own length, not the container's (a soundtrack can
-        # run past the frames): frame count / fps, then the stream's own
-        # duration, then the container's as a last resort.
+        # The picture's own length (a soundtrack can run past the frames).
         if v.frames and fps:
             seconds = v.frames / fps
         elif v.duration and v.time_base:
             seconds = float(v.duration * v.time_base)
         else:
             seconds = float(c.duration / av.time_base) if c.duration else 0.0
-        info = {
+        return {
             "width": v.codec_context.width,
             "height": v.codec_context.height,
             "fps": fps,
             "seconds": seconds,
+            "frames": int(v.frames or round(seconds * fps)),
             "has_audio": bool(c.streams.audio),
         }
+
+
+def load_ref_video(key):
+    """Downloads the motion swap's reference video and checks it: 24fps (the
+    node takes frames 1:1 at 24fps), at most 15s, sane size. Returns
+    (input_filename, info)."""
+    size = _object_size(key)
+    if size <= 0 or size > VIDEO_MAX_BYTES:
+        raise JobRejected("The reference video is too large (max 100MB)")
+    os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
+    filename = f"refvideo_{uuid.uuid4().hex}{os.path.splitext(key)[1]}"
+    path = os.path.join(COMFYUI_INPUT_DIR, filename)
+    s3_client.download_file(S3_BUCKET, key, path)
+    try:
+        info = probe_video(path)
+    except JobRejected:
+        os.remove(path)
+        raise
+    except Exception as e:
+        os.remove(path)
+        raise JobRejected(f"The reference video could not be read ({type(e).__name__})")
+    if not 23.5 <= info["fps"] <= 24.5:
+        os.remove(path)
+        raise JobRejected(f"The reference video is {info['fps']:.2f}fps - export it at 24fps")
+    if info["seconds"] > REF_VIDEO_MAX_SECONDS:
+        os.remove(path)
+        raise JobRejected(f"The reference video is {info['seconds']:.1f}s - trim it to 15s or less")
+    if not info["width"] or not info["height"] or max(info["width"], info["height"]) > VIDEO_MAX_SIDE:
+        os.remove(path)
+        raise JobRejected("The reference video's size is out of range")
     return filename, info
 
 
-def prepare_ref_video(video_key):
-    """Downloads inputs/<video_key> (uploaded by the test page) into
-    ComfyUI's input/ dir. Returns (input_filename, has_audio). Refuses a
-    video that isn't ~24fps (the node takes frames 1:1 at 24fps, so any other
-    rate plays at the wrong speed) or is longer than 15s (its soundtrack is
-    also the finished video's, and would run past the generated frames)."""
-    filename, info = download_input_video(video_key, "refvideo")
-    fps, seconds, has_audio = info["fps"], info["seconds"], info["has_audio"]
-    if not 23.5 <= fps <= 24.5:
-        raise ValueError(f"The reference video is {fps:.2f}fps - export it at 24fps")
-    if seconds > REF_VIDEO_MAX_SECONDS:
-        raise ValueError(f"The reference video is {seconds:.1f}s - trim it to 15s or less")
-    print(f"Reference video {video_key}: {seconds:.1f}s, {fps:.2f}fps, audio={'yes' if has_audio else 'no'}.")
-    return filename, has_audio
+def motion_frames(seconds):
+    """17n+5 frame count for a swap of a `seconds`-long reference video, never
+    past 362. H3 needs 17n+5 frames; rounding up would ask for up to 16 frames
+    the video doesn't have, so it rounds up only when that's at most 2 frames
+    past the video (the tested 15s swaps: 361 frames available -> 362) and
+    otherwise down. The graph's own snap rounds UP, so the duration handed to
+    it is exactly frames/24."""
+    available = max(5, int(seconds * 24 + 1e-6))
+    down = ((available - 5) // 17) * 17 + 5
+    up = down if down == available else down + 17
+    frames = up if up - available <= 2 else down
+    return max(5, min(MAX_FRAMES, frames))
 
 
-def build_prompt_payload(job_input, upscale_method="none"):
-    """Builds the full workflow graph for one generation. upscale_method
-    "nvidia_vsr" splices RTX VSR into the SAME submission
-    as everything else (matching how production's koboldcpp path does upscale - one
-    request, not two).
-    """
+def motion_size(width, height):
+    import math
+    aspect = math.log(width / height)
+    return min(MOTION_PRESETS, key=lambda wh: abs(math.log(wh[0] / wh[1]) - aspect))
+
+
+# --- Graph building ----------------------------------------------------------
+
+def plan_generation(job):
+    """Model, LoRA and steps for a validated generate job - decided here,
+    never by the user."""
+    if job.get("ref_video"):
+        return "ref2va", ("ref2v_turbo" if job["speed"] == "fast" else "ref2v_turbo_8")
+    return "base", ("turbo" if job["speed"] == "fast" else None)
+
+
+def build_prompt_payload(job, model, lora_key, inputs, width, height, duration):
+    """inputs: {"ref_images": [filenames], "start_frame": filename|None,
+    "end_frame": filename|None, "ref_video": filename|None,
+    "ref_video_has_audio": bool}."""
     with open(WORKFLOW_TEMPLATE_PATH, "r") as f:
         workflow = json.load(f)
 
-    prompt_text = job_input["prompt"]
-    width = job_input.get("width", 1280)
-    height = job_input.get("height", 736)
-    duration = job_input.get("duration", 7.29)
-    steps = job_input.get("steps", 20)
-    seed = job_input.get("seed", uuid.uuid4().int & 0xFFFFFFFF)
-    ref_images = list(job_input.get("ref_images") or [])
-    if job_input.get("ref_image"):
-        ref_images.insert(0, job_input["ref_image"])
-    ref_video_key = job_input.get("ref_video_key")
-    start_frame = job_input.get("start_frame")
-    end_frame = job_input.get("end_frame")
+    ref_images = inputs.get("ref_images") or []
+    ref_video = inputs.get("ref_video")
+    reference_node = MODEL_CHOICES[model].get("reference_node", False)
 
-    # REF FRAME vs START/END FRAME are NOT the same mechanism on ComfyUI,
-    # unlike whatever unified handling koboldcpp had - verified against
-    # comfy_extras/nodes_minimax_h3.py:
-    #   - start_frame/end_frame -> MiniMaxH3ImageToVideo's first_frame/
-    #     last_frame optional Image inputs (same node as plain T2V).
-    #   - ref_image -> a DIFFERENT node, MiniMaxH3ReferenceToVideo, whose
-    #     ref_images go through the prompt via <Picture i> tags rather than
-    #     anchoring a specific frame. A request with references takes the
-    #     ReferenceToVideo path; if it also has start/end frames they're
-    #     pinned on top with MiniMaxH3AddGuide (see below).
-    if len(ref_images) > MAX_REF_IMAGES:
-        raise ValueError(f"At most {MAX_REF_IMAGES} reference images, got {len(ref_images)}")
-    reference_node = MODEL_CHOICES[job_input.get("model", "base")].get("reference_node", False)
-    if ref_video_key and not reference_node:
-        raise ValueError("A reference video (motion swap) needs a Ref2VA session")
-    lora_key = job_input.get("lora")
-    if lora_key and lora_key in LORA_CHOICES and LORA_CHOICES[lora_key].get("reference_node", False) != reference_node:
-        raise ValueError("That turbo LoRA is for the other model - Ref2VA uses ref2v_turbo/ref2v_turbo_8, base/DaSiWa use turbo/fast")
-    if ref_images or ref_video_key or reference_node:
+    # Reference pictures and the reference video go through
+    # MiniMaxH3ReferenceToVideo (<Picture N>, <Video 1>, <Audio 1>); start/end
+    # frames alone go through MiniMaxH3ImageToVideo's first/last frame slots;
+    # frames together with references are pinned with MiniMaxH3AddGuide.
+    if ref_images or ref_video or reference_node:
         ref_inputs = {}
-        for i, img in enumerate(ref_images):
-            workflow[f"_ref_image_load_{i}"] = {
-                "inputs": {"image": save_input_image(img, "ref")},
-                "class_type": "LoadImage",
-            }
-            # Autogrow API key is "<input id>.<template name>": the
-            # pinned commit's comfy_api/latest/_io.py builds expected
-            # ids with finalize_prefix(["ref_images"], "ref_image_0").
-            # The old bare "ref_image_0" key matched nothing, so the
-            # reference image was silently dropped.
+        for i, filename in enumerate(ref_images):
+            workflow[f"_ref_image_load_{i}"] = {"inputs": {"image": filename}, "class_type": "LoadImage"}
+            # Autogrow API key "<input id>.<template name>" (pinned commit).
             ref_inputs[f"ref_images.ref_image_{i}"] = [f"_ref_image_load_{i}", 0]
-        if ref_video_key:
-            video_filename, has_audio = prepare_ref_video(ref_video_key)
-            workflow["_ref_video_load"] = {"inputs": {"file": video_filename}, "class_type": "LoadVideo"}
+        if ref_video:
+            workflow["_ref_video_load"] = {"inputs": {"file": ref_video}, "class_type": "LoadVideo"}
             workflow["_ref_video_parts"] = {"inputs": {"video": ["_ref_video_load", 0]},
                                             "class_type": "GetVideoComponents"}
-            # <Video 1> in the prompt; frames are taken 1:1 at 24fps and
-            # trimmed to the output length by the node itself.
             ref_inputs["ref_videos.ref_video_0"] = ["_ref_video_parts", 0]
-            if has_audio:
-                # <Audio 1>: the video's soundtrack. The finished video keeps
-                # that original soundtrack too, as on the pod swaps - H3's own
-                # re-generated audio of a song is noticeably worse.
+            if inputs.get("ref_video_has_audio"):
+                # <Audio 1>, and the finished video keeps the original
+                # soundtrack (H3's re-generated audio of a song is worse).
                 ref_inputs["ref_video_audios.ref_video_audio_0"] = ["_ref_video_parts", 1]
-                workflow["105:91"]["inputs"]["audio"] = ["_ref_video_parts", 1]
+                workflow[NODE_IDS["create_video"]]["inputs"]["audio"] = ["_ref_video_parts", 1]
         workflow[NODE_IDS["prompt_and_dims"]] = {
             "inputs": {
                 "clip": [NODE_IDS["clip_loader"], 0],
                 "vae": [NODE_IDS["vae_loader"], 0],
-                "prompt": prompt_text,
+                "prompt": job["prompt"],
                 "width": width,
                 "height": height,
                 "length": ["105:107", 1],
                 "ref_image_size": "match",
-                # Encodes the reference video's soundtrack into the model's
-                # audio stream; without it <Audio 1> only reaches the text
-                # encoder (node tooltip).
-                "audio_vae": ["105:24", 0],
+                "audio_vae": [NODE_IDS["audio_vae_loader"], 0],
                 **ref_inputs,
             },
             "class_type": "MiniMaxH3ReferenceToVideo",
         }
-        # Start/end frames WITH references (user, 2026-10-06): the reference
-        # node has no first/last-frame slots, so each frame is pinned on top
-        # of its conditioning with MiniMaxH3AddGuide (core node, pinned
-        # commit; frame_idx -1 = last frame) and the guider reads the end of
-        # that chain. Only runs when a frame is given alongside references -
-        # frames alone still take the MiniMaxH3ImageToVideo path below, and
-        # references alone are untouched. Untested on a real run.
         conditioning = [NODE_IDS["prompt_and_dims"], 0]
-        for key, image_b64, frame_idx in (("start", start_frame, 0), ("end", end_frame, -1)):
-            if not image_b64:
+        for name, frame_idx in (("start_frame", 0), ("end_frame", -1)):
+            filename = inputs.get(name)
+            if not filename:
                 continue
-            workflow[f"_{key}_frame_load"] = {
-                "inputs": {"image": save_input_image(image_b64, key)},
-                "class_type": "LoadImage",
-            }
-            workflow[f"_{key}_frame_guide"] = {
+            workflow[f"_{name}_load"] = {"inputs": {"image": filename}, "class_type": "LoadImage"}
+            workflow[f"_{name}_guide"] = {
                 "inputs": {
                     "positive": conditioning,
                     "latent": [NODE_IDS["prompt_and_dims"], 1],
                     "vae": [NODE_IDS["vae_loader"], 0],
-                    "image": [f"_{key}_frame_load", 0],
+                    "image": [f"_{name}_load", 0],
                     "frame_idx": frame_idx,
                 },
                 "class_type": "MiniMaxH3AddGuide",
             }
-            conditioning = [f"_{key}_frame_guide", 0]
+            conditioning = [f"_{name}_guide", 0]
         workflow[NODE_IDS["guider"]]["inputs"]["conditioning"] = conditioning
     else:
         prompt_node = workflow[NODE_IDS["prompt_and_dims"]]["inputs"]
-        prompt_node["prompt"] = prompt_text
-        # Overwrites the link to ResolutionSelector (node "115") with a
-        # literal value - ResolutionSelector becomes unreachable from the
-        # output node and simply won't execute, which ComfyUI tolerates fine.
+        prompt_node["prompt"] = job["prompt"]
+        # Literal size replaces the link to ResolutionSelector ("115"), which
+        # then never runs.
         prompt_node["width"] = width
         prompt_node["height"] = height
-        if start_frame:
-            start_filename = save_input_image(start_frame, "start")
-            workflow["_start_frame_load"] = {
-                "inputs": {"image": start_filename},
-                "class_type": "LoadImage",
-            }
+        if inputs.get("start_frame"):
+            workflow["_start_frame_load"] = {"inputs": {"image": inputs["start_frame"]}, "class_type": "LoadImage"}
             prompt_node["first_frame"] = ["_start_frame_load", 0]
-        if end_frame:
-            end_filename = save_input_image(end_frame, "end")
-            workflow["_end_frame_load"] = {
-                "inputs": {"image": end_filename},
-                "class_type": "LoadImage",
-            }
+        if inputs.get("end_frame"):
+            workflow["_end_frame_load"] = {"inputs": {"image": inputs["end_frame"]}, "class_type": "LoadImage"}
             prompt_node["last_frame"] = ["_end_frame_load", 0]
 
-    # The graph itself does the 17n+5 frame-count snap via ComfyMathExpression
-    # (node "105:107") fed by this raw duration-in-seconds value - no need
-    # to replicate that math here, just hand it the seconds.
+    # The graph snaps the duration to 17n+5 frames (105:107).
     workflow[NODE_IDS["duration_seconds"]]["inputs"]["value"] = duration
+    workflow[NODE_IDS["seed"]]["inputs"]["noise_seed"] = job["seed"]
+    workflow[NODE_IDS["unet_loader"]]["inputs"]["unet_name"] = MODEL_CHOICES[model]["filename"]
 
-    workflow[NODE_IDS["steps"]]["inputs"]["steps"] = steps
-    workflow[NODE_IDS["seed"]]["inputs"]["noise_seed"] = seed
-
-    # LoRA: no prompt-string tag parsing on ComfyUI (see LORA_CHOICES'
-    # comment) - splice a LoraLoaderModelOnly node between the base UNET
-    # loader and PathchSageAttentionKJ only when one's requested, leaving
-    # today's direct wiring untouched otherwise.
-    workflow[NODE_IDS["unet_loader"]]["inputs"]["unet_name"] = MODEL_CHOICES[job_input.get("model", "base")]["filename"]
-
-    # LoRA chain: UNETLoader -> [turbo LoRA] -> Sage/guider.
+    # UNETLoader -> [turbo LoRA] -> [sigma shift] -> Sage -> guider/scheduler.
     model_src = [NODE_IDS["unet_loader"], 0]
-    if lora_key and lora_key in LORA_CHOICES:
+    steps = STANDARD_STEPS
+    if lora_key:
         preset = LORA_CHOICES[lora_key]
         workflow["_lora"] = {
-            "inputs": {
-                "model": model_src,
-                "lora_name": preset["filename"],
-                "strength_model": preset["multiplier"],
-            },
+            "inputs": {"model": model_src, "lora_name": preset["filename"], "strength_model": preset["multiplier"]},
             "class_type": "LoraLoaderModelOnly",
         }
         model_src = ["_lora", 0]
@@ -691,175 +731,165 @@ def build_prompt_payload(job_input, upscale_method="none"):
                 "class_type": "MiniMaxH3SigmaShift",
             }
             model_src = ["_sigma_shift", 0]
-        if "steps" not in job_input:
-            workflow[NODE_IDS["steps"]]["inputs"]["steps"] = preset["default_steps"]
+        steps = preset["steps"]
     workflow[NODE_IDS["sage_attention"]]["inputs"]["model"] = model_src
+    workflow[NODE_IDS["steps"]]["inputs"]["steps"] = steps
 
-    apply_attention_mode(workflow, job_input.get("attention", "sage"))
-
-    # Unique SaveVideo prefix per submission. ComfyUI caches node outputs, so
-    # an exact repeat of a previous job (same prompt/seed/settings) skipped
-    # every node including SaveVideo and pointed /history at the previous
-    # job's file - which fetch_output_video had already deleted after
-    # uploading it, so /view 404'd (seen on a real run). A changed prefix
-    # forces just SaveVideo to re-run and write a fresh file; everything
-    # upstream (the actual generation) is still served from the cache.
+    # A fresh SaveVideo prefix per submission: ComfyUI caches node outputs, and
+    # an exact repeat would otherwise point /history at a deleted file.
     workflow[NODE_IDS["output"]]["inputs"]["filename_prefix"] = f"video/MiniMax_H3_{uuid.uuid4().hex[:12]}"
 
-    # NVIDIA RTX VSR - spliced between VAEDecode's frame output and
-    # CreateVideo's input. resize_type is a DynamicCombo: API-format prompts carry
-    # it as FLAT keys - the selected option's key under "resize_type" and
-    # that option's own inputs under "resize_type.<name>" - which ComfyUI
-    # nests back into one dict before execute() (verified against
-    # comfy_api/latest/_io.py at the pinned commit: DynamicCombo's
-    # _expand_schema_for_dynamic matches live_inputs["resize_type"] against
-    # the option keys, finalize_prefix joins sub-inputs with ".", and
-    # build_nested_inputs rebuilds the dict). Same convention the template
-    # already uses for ComfyMathExpression's "values.a".
-    if upscale_method == "nvidia_vsr":
+    if job.get("upscale"):
         workflow["_nvidia_vsr"] = {
             "inputs": {
-                "images": ["105:10", 0],
+                "images": [NODE_IDS["video_decode"], 0],
                 "resize_type": "scale by multiplier",
-                "resize_type.scale": job_input.get("upscale_scale", NVIDIA_VSR_SCALE),
+                "resize_type.scale": NVIDIA_VSR_SCALE,
                 "quality": NVIDIA_VSR_QUALITY,
             },
             "class_type": "RTXVideoSuperResolution",
         }
-        workflow["105:91"]["inputs"]["images"] = ["_nvidia_vsr", 0]
-
-    return workflow
-
-
-def apply_attention_mode(workflow, mode):
-    """Rewires the model path for the attention A/B (see ATTENTION_MODES).
-    Runs after the LoRA splice, so it picks up whichever model (base or
-    LoRA'd) currently feeds the Sage node."""
-    if mode == "sage":
-        return
-    sage_id = NODE_IDS["sage_attention"]
-    model_src = workflow[sage_id]["inputs"]["model"]
-    del workflow[sage_id]
-    workflow[NODE_IDS["scheduler"]]["inputs"]["model"] = model_src
-    if mode == "off":
-        workflow[NODE_IDS["guider"]]["inputs"]["model"] = model_src
-    elif mode == "sparse":
-        # Only the guider needs the patch; the scheduler just builds sigmas.
-        # DynamicCombo "selection" in ComfyUI's flat API format (same
-        # convention as RTX VSR's resize_type). verbose=True logs, per
-        # attention shape, whether it actually ran sparse or why it stayed
-        # dense - the docs warn it silently falls back to dense without the
-        # comfy-kitchen sol_attn kernel.
-        workflow["_sparse_attention"] = {
-            "inputs": {
-                "model": model_src,
-                "selection": "sol-attn",
-                "selection.tau": 1.3,
-                "start_percent": 0.2,
-                "end_percent": 1.0,
-                "dense_blocks": "",
-                "min_tokens": 12288,
-                "extra_tokens": 256,
-                "sink_conditioning": "exact_kv_and_rows",
-                "verbose": True,
-            },
-            "class_type": "BlockSparseAttention",
-        }
-        workflow[NODE_IDS["guider"]]["inputs"]["model"] = ["_sparse_attention", 0]
+        workflow[NODE_IDS["create_video"]]["inputs"]["images"] = ["_nvidia_vsr", 0]
+    return workflow, steps
 
 
-# Per-job ceiling on one ComfyUI submission. Was a hardcoded 1200s, which a
-# 15s 768p clip with Sage off (standard attention, ~20-30 min sampling +
-# decode) blows straight through - seen on a real run (job dcd1a245, failed
-# at 1205s). Overridable per endpoint via COMFY_JOB_TIMEOUT_SECONDS. Stop GPU
-# and the job's cancel flags still end a job early at any point.
-COMFY_JOB_TIMEOUT_SECONDS = int(os.environ.get("COMFY_JOB_TIMEOUT_SECONDS", "3600"))
+# --- Running a graph ---------------------------------------------------------
+
+STAGE_BY_NODE = {
+    NODE_IDS["video_decode"]: "Decoding the video",
+    "_nvidia_vsr": "Upscaling 2x",
+    NODE_IDS["output"]: "Saving",
+    "r_wan": "Redrawing faces",
+    "r_vsr": "Upscaling back",
+}
 
 
-def submit_and_wait(workflow, timeout_seconds=None, should_cancel=None, should_force_kill=None):
-    if timeout_seconds is None:
-        timeout_seconds = COMFY_JOB_TIMEOUT_SECONDS
-    client_id = str(uuid.uuid4())
-    resp = requests.post(
-        f"{COMFYUI_URL}/prompt",
-        json={"prompt": workflow, "client_id": client_id},
-        timeout=30,
-    )
-    if resp.status_code == 400:
-        # ComfyUI rejected the graph before running it (unknown node class,
-        # bad input value, missing file...). Its body says exactly which node
-        # and why - raise_for_status() alone threw that away and left only
-        # "400 Client Error" (seen on the first face_refine run).
+class ProgressWatcher:
+    """Follows ComfyUI's websocket for one prompt and reports sampler steps
+    and stages through on_update(dict). Best-effort: if the websocket can't
+    be opened, the job still runs, just without step-level progress."""
+
+    def __init__(self, client_id, on_update, sampler_nodes=(NODE_IDS["sampler"],)):
+        self.client_id = client_id
+        self.on_update = on_update
+        self.sampler_nodes = set(sampler_nodes)
+        self.prompt_id = None
+        self._stop = threading.Event()
+        self._ws = None
+        self._thread = None
+
+    def start(self):
         try:
-            detail = resp.json()
-        except ValueError:
-            detail = resp.text
-        print(f"ComfyUI rejected the prompt: {json.dumps(detail)[:4000]}")
-        raise RuntimeError(f"ComfyUI rejected the workflow: {json.dumps(detail)[:3000]}")
-    resp.raise_for_status()
-    prompt_id = resp.json()["prompt_id"]
+            import websocket  # websocket-client
+            self._ws = websocket.create_connection(f"{COMFYUI_WS_URL}?clientId={self.client_id}", timeout=5)
+            self._ws.settimeout(1)
+            self._timeout_exc = websocket.WebSocketTimeoutException
+        except Exception as e:
+            print(f"Progress websocket unavailable ({e}) - continuing without step progress.")
+            self._ws = None
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-    # ComfyUI's own native cancel endpoint (POST /interrupt, optionally
-    # scoped to a prompt_id) - verified in comfyanonymous/ComfyUI's
-    # server.py, nothing custom needed. Force cancel is a harder stop
-    # (kill the whole process, see force_kill_comfyui) for a request that
-    # doesn't respond to a graceful interrupt.
-    interrupted = False
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        if should_force_kill and should_force_kill():
-            force_kill_comfyui()
-            return {"force_killed": True}
-        if not interrupted and should_cancel and should_cancel():
+    def _run(self):
+        while not self._stop.is_set():
             try:
-                requests.post(f"{COMFYUI_URL}/interrupt", json={"prompt_id": prompt_id}, timeout=10)
-            except requests.exceptions.RequestException as e:
-                print(f"Could not send /interrupt for {prompt_id}: {e}")
-            interrupted = True
+                msg = self._ws.recv()
+            except self._timeout_exc:
+                continue
+            except Exception:
+                return
+            if not isinstance(msg, str):
+                continue  # binary preview frames
+            try:
+                data = json.loads(msg)
+            except ValueError:
+                continue
+            body = data.get("data") or {}
+            if self.prompt_id and body.get("prompt_id") not in (None, self.prompt_id):
+                continue
+            try:
+                if data.get("type") == "progress" and body.get("node") in self.sampler_nodes:
+                    self.on_update({"step": int(body.get("value") or 0), "steps": int(body.get("max") or 0)})
+                elif data.get("type") == "executing" and body.get("node") in STAGE_BY_NODE:
+                    self.on_update({"stage": STAGE_BY_NODE[body["node"]]})
+            except Exception as e:
+                print(f"Progress callback failed: {e}")
 
-        r = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
-        r.raise_for_status()
-        history = r.json()
-        if prompt_id in history:
-            entry = history[prompt_id]
-            status = entry.get("status") or {}
-            if status.get("status_str") == "error":
-                # A node raised mid-run. Without this the caller went looking
-                # for SaveVideo's output and reported a bare KeyError '92'
-                # (seen on the first face_refine runs) instead of the cause.
-                for kind, data in status.get("messages") or []:
-                    if kind == "execution_error":
-                        raise RuntimeError(
-                            f"ComfyUI failed in node {data.get('node_id')} ({data.get('node_type')}): "
-                            f"{data.get('exception_type')}: {data.get('exception_message')}"
-                        )
-                raise RuntimeError(f"ComfyUI reported an error: {json.dumps(status)[:2000]}")
-            if interrupted and NODE_IDS["output"] not in entry.get("outputs", {}):
-                # Stopped before the output node ran - a real cancel, not a
-                # generation failure.
-                return {"cancelled": True}
-            return entry
-        time.sleep(1 if interrupted else 2)
-    # Stop the orphaned generation before giving up on it - without this,
-    # ComfyUI kept sampling the timed-out prompt on the GPU and the next job
-    # in the session queued behind it.
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
+
+
+def submit_and_wait(workflow, should_cancel=None, should_force_kill=None, on_progress=None,
+                    sampler_nodes=(NODE_IDS["sampler"],)):
+    client_id = str(uuid.uuid4())
+    watcher = ProgressWatcher(client_id, on_progress, sampler_nodes) if on_progress else None
+    if watcher:
+        watcher.start()
     try:
-        requests.post(f"{COMFYUI_URL}/interrupt", json={"prompt_id": prompt_id}, timeout=10)
-    except requests.exceptions.RequestException as e:
-        print(f"Could not send /interrupt for timed-out {prompt_id}: {e}")
-    raise TimeoutError(f"ComfyUI generation did not finish within {timeout_seconds}s.")
+        resp = requests.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow, "client_id": client_id}, timeout=30)
+        if resp.status_code == 400:
+            try:
+                detail = resp.json()
+            except ValueError:
+                detail = resp.text
+            print(f"ComfyUI rejected the prompt: {json.dumps(detail)[:4000]}")
+            raise RuntimeError("The generation could not be set up (ComfyUI rejected the workflow)")
+        resp.raise_for_status()
+        prompt_id = resp.json()["prompt_id"]
+        if watcher:
+            watcher.prompt_id = prompt_id
+
+        interrupted = False
+        deadline = time.time() + COMFY_JOB_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if should_force_kill and should_force_kill():
+                force_kill_comfyui()
+                return {"force_killed": True}
+            if not interrupted and should_cancel and should_cancel():
+                try:
+                    requests.post(f"{COMFYUI_URL}/interrupt", json={"prompt_id": prompt_id}, timeout=10)
+                except requests.exceptions.RequestException as e:
+                    print(f"Could not send /interrupt for {prompt_id}: {e}")
+                interrupted = True
+            r = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
+            r.raise_for_status()
+            history = r.json()
+            if prompt_id in history:
+                entry = history[prompt_id]
+                status = entry.get("status") or {}
+                if status.get("status_str") == "error":
+                    for kind, data in status.get("messages") or []:
+                        if kind == "execution_error":
+                            print(f"ComfyUI failed in node {data.get('node_id')} ({data.get('node_type')}): "
+                                  f"{data.get('exception_type')}: {data.get('exception_message')}")
+                            if interrupted:
+                                return {"cancelled": True}
+                            raise RuntimeError(f"Generation failed ({data.get('exception_type')}: "
+                                               f"{str(data.get('exception_message'))[:300]})")
+                    raise RuntimeError("Generation failed")
+                if interrupted and NODE_IDS["output"] not in entry.get("outputs", {}):
+                    return {"cancelled": True}
+                return entry
+            time.sleep(1 if interrupted else 2)
+        try:
+            requests.post(f"{COMFYUI_URL}/interrupt", json={"prompt_id": prompt_id}, timeout=10)
+        except requests.exceptions.RequestException as e:
+            print(f"Could not send /interrupt for timed-out {prompt_id}: {e}")
+        raise TimeoutError(f"The generation did not finish within {COMFY_JOB_TIMEOUT_SECONDS // 60} minutes")
+    finally:
+        if watcher:
+            watcher.stop()
 
 
 def _output_video_info_and_path(history_entry):
-    """Used by fetch_output_video: resolves a finished submission's
-    SaveVideo output to (video_info, its real path
-    under COMFYUI_OUTPUT_DIR)."""
-    outputs = history_entry["outputs"]
-    output_node = outputs[NODE_IDS["output"]]
-    # Verified against ComfyUI's actual source (comfy_api/latest/_ui.py,
-    # PreviewVideo.as_dict()) rather than assumed: SaveVideo's history
-    # output list is keyed "images" even though it's video - that's
-    # PreviewVideo's own key choice, not a ComfyLabV2 convention.
+    output_node = history_entry["outputs"][NODE_IDS["output"]]
+    # SaveVideo's history output is keyed "images" even for video.
     video_info = output_node["images"][0]
     raw_path = os.path.join(COMFYUI_OUTPUT_DIR, video_info.get("subfolder", ""), video_info["filename"])
     return video_info, raw_path
@@ -867,232 +897,155 @@ def _output_video_info_and_path(history_entry):
 
 def fetch_output_video(history_entry):
     video_info, raw_path = _output_video_info_and_path(history_entry)
-
     r = requests.get(
         f"{COMFYUI_URL}/view",
-        params={
-            "filename": video_info["filename"],
-            "subfolder": video_info.get("subfolder", ""),
-            "type": video_info.get("type", "output"),
-        },
-        timeout=60,
+        params={"filename": video_info["filename"], "subfolder": video_info.get("subfolder", ""),
+                "type": video_info.get("type", "output")},
+        timeout=120,
     )
     r.raise_for_status()
-
-    # Bytes are safely in hand now (about to be re-uploaded to Wasabi by
-    # the caller) - delete ComfyUI's own copy so COMFYUI_OUTPUT_DIR on the
-    # volume doesn't grow unbounded across a long session's worth of jobs,
-    # same reasoning as redirecting it off the container disk in the first
-    # place (see start_comfyui_if_needed).
     try:
         os.remove(raw_path)
     except OSError as e:
         print(f"Could not clean up {raw_path}: {e}")
+    return r.content
 
-    return r.content, video_info["filename"]
 
-
-def upload_result_and_get_key(raw_bytes, filename):
+def upload_result_and_get_key(raw_bytes):
+    """Uploads a finished video to Wasabi outputs/<uuid>.mp4 and returns the
+    bare key (what server.js's VALID_VIDEO_KEY / OUTPUT_KEY_RE accept)."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    ext = os.path.splitext(filename)[1].lstrip(".") or "mp4"
-    out_filename = f"{uuid.uuid4()}.{ext}"
+    out_filename = f"{uuid.uuid4()}.mp4"
     filepath = os.path.join(OUTPUT_DIR, out_filename)
-
     with open(filepath, "wb") as f:
         f.write(raw_bytes)
-
-    content_type = "video/mp4" if ext == "mp4" else "application/octet-stream"
-    key = f"outputs/{out_filename}"
-    s3_client.upload_file(filepath, S3_BUCKET, key, ExtraArgs={"ContentType": content_type})
+    try:
+        s3_client.upload_file(filepath, S3_BUCKET, f"outputs/{out_filename}", ExtraArgs={"ContentType": "video/mp4"})
+    finally:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
     return out_filename
 
 
-# RandomNoise's own noise_seed range (comfy_extras/nodes_custom_sampler.py
-# at the pinned commit: min=0, max=0xffffffffffffffff).
-SEED_MAX = 0xFFFFFFFFFFFFFFFF
-
-
-def resolve_seed(raw):
-    """None/"" -> a fresh random seed; otherwise must be a whole number in
-    RandomNoise's range (an int, or a string of digits). Anything else
-    fails the job with a clear error rather than ComfyUI's generic 400."""
-    if raw is None or raw == "":
-        return uuid.uuid4().int & 0xFFFFFFFF
-    if isinstance(raw, bool):
-        raise ValueError(f"seed must be a whole number, got {raw!r}")
-    if isinstance(raw, int):
-        seed = raw
-    elif isinstance(raw, float) and raw.is_integer():
-        seed = int(raw)
-    elif isinstance(raw, str) and raw.strip().isdigit():
-        seed = int(raw.strip())
-    else:
-        raise ValueError(f"seed must be a whole number, got {raw!r}")
-    if not 0 <= seed <= SEED_MAX:
-        raise ValueError(f"seed must be between 0 and {SEED_MAX}, got {seed}")
-    return seed
-
-
-def run_generation(job_input, should_cancel=None, should_force_kill=None, upload=True):
-    """One full generation, always a single ComfyUI submission -
-    upscale_method "nvidia_vsr" just adds RTX VSR to that same graph (see
-    build_prompt_payload). Shared by both the classic one-shot handler()
-    path and run_session()'s per-job loop below - identical either way,
-    since ComfyUI itself only ever has one thing loaded/running at a time
-    regardless of which path queued it. should_cancel/should_force_kill
-    default to None (never cancels) for the classic path, which has no
-    per-job cancel flag to poll.
-    """
-    # Resolved here (not left to build_prompt_payload's fallback) so the
-    # seed actually used can be returned with the result - needed to re-run
-    # the exact same video, e.g. with vs. without upscale.
-    job_input = dict(job_input)
-    job_input["seed"] = resolve_seed(job_input.get("seed"))
-    upscale_method = job_input.get("upscale_method", "none")
-    # Unknown values used to fall through build_prompt_payload's if/elif
-    # and silently produce an un-upscaled video - seen on a real run when a
-    # newer test page sent an upscale option to a worker still on the build
-    # before that option existed. Fail the job loudly instead.
-    if upscale_method not in UPSCALE_METHODS:
-        raise ValueError(
-            f"Unknown upscale_method {upscale_method!r} - this worker supports {sorted(UPSCALE_METHODS)}"
-        )
-    try:
-        upscale_scale = float(job_input.get("upscale_scale", NVIDIA_VSR_SCALE))
-    except (TypeError, ValueError):
-        upscale_scale = None
-    if upscale_scale not in UPSCALE_SCALES:
-        raise ValueError(
-            f"Unsupported upscale_scale {job_input.get('upscale_scale')!r} - this worker supports {sorted(UPSCALE_SCALES)}"
-        )
-    job_input["upscale_scale"] = upscale_scale
-    attention = job_input.get("attention", "sage")
-    if attention not in ATTENTION_MODES:
-        raise ValueError(f"Unknown attention {attention!r} - this worker supports {sorted(ATTENTION_MODES)}")
-    model = job_input.get("model", "base")
-    if model not in MODEL_CHOICES:
-        raise ValueError(f"Unknown model {model!r} - this worker supports {sorted(MODEL_CHOICES)}")
-    workflow = build_prompt_payload(job_input, upscale_method=upscale_method)
-    comfy_start = time.time()
-    result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
-    comfy_seconds = round(time.time() - comfy_start, 1)
-    if result.get("force_killed"):
-        return {"cancelled": True, "force_killed": True}
-    if result.get("cancelled"):
-        return {"cancelled": True}
-
-    if not upload:
-        # Warmup runs: the output is a throwaway 1-step 320x320 clip. It used
-        # to go through the same upload as a real job, so every session start
-        # (and every re-warm after a crash/force-kill) left an orphaned, blurry
-        # video in Wasabi with no record of where it came from. Just delete
-        # ComfyUI's local copy instead.
-        _, raw_path = _output_video_info_and_path(result)
+def remove_inputs(filenames):
+    for name in filenames:
+        if not name:
+            continue
         try:
-            os.remove(raw_path)
-        except OSError as e:
-            print(f"Could not clean up warmup output {raw_path}: {e}")
-        return {"seed": job_input["seed"]}
-
-    raw_bytes, filename = fetch_output_video(result)
-    video_key = upload_result_and_get_key(raw_bytes, filename)
-    return {
-        "videoKey": video_key,
-        "seed": job_input["seed"],
-        "attention": attention,
-        "model": model,
-        "comfy_seconds": comfy_seconds,
-    }
+            os.remove(os.path.join(COMFYUI_INPUT_DIR, name))
+        except OSError:
+            pass
 
 
-# --- Face refine (post-generation, opt-in) --------------------------------
-# Base H3 renders faces badly once a head is a small part of the frame (see
-# MERGE_NOTES.md "Known limitation"). ComfyUI-H3-FaceRefine's tracker
-# (H3FaceTrackCrop) follows each face through the clip and crops so it fills
-# a canvas; our comfylab_face_wan node redraws those crops with Wan 2.2's
-# low-noise 14B model (+ 4-step lightx2v LoRA), at a per-frame strength that
-# leaves faces 120px and up untouched; the pack's H3FaceStitch pastes them
-# back. The pack's own H3 redraw is the second engine ("engine": "h3", see
-# build_h3_redraw_payload): its H3PerFrameDenoise model patches broke
-# sampling on our ComfyUI (issue #19 on the pack), so that engine keeps the
-# node's per-frame mask and leaves its patches out.
-#
-# The Wan files are NOT part of the engine script, so session start and H3
-# generation are unchanged; the first refine on a volume downloads them
-# (~22.5GB, once per volume).
-#
-# Job shape (comfylab_gpu_session_jobs.input):
-#   {"mode": "face_refine", "source_video_key": "<key>.mp4",
-#    "subjects": optional 1-4 (default: counted - the most small faces in
-#                any one shot, capped at 4), "denoise": 0.05-1.0 (Wan default 0.3, H3 0.4), "seed": ...,
-#    "small_denoise": 0.05-1.0 (Wan only, default 0.6) - strength for faces under REFINE_FACE_PX_TINY,
-#    "prompt": optional face prompt (blank = the node's generic one),
-#    "canvas": "auto" (default) | 384 | 512 | 640 | 768,
-#    "steps": 2-8 (default 3; the H3 engine always runs 8),
-#    "engine": "wan" (default) | "h3"}
-#
-# "engine": "h3" - the pack's own H3 redraw, back as a second engine (see
-# build_h3_redraw_payload). Nothing extra to download: it uses the H3 model,
-# turbo LoRA, text encoder and VAEs the engine script already put on the
-# volume, through the generation graph's own loader nodes, so the copy a
-# generation already loaded is reused rather than loaded twice.
-REFINE_MODE = "face_refine"
-REFINE_ENGINES = {"wan", "h3"}
-REFINE_MAX_SUBJECTS = 4            # most people refined per shot (the largest small faces win)
-# Face heights (source px, detector face box) the refine works on - set by the
-# user 2026-10-04 from real videos: the Alpha Timber mother and daughter
-# (23-31px, melted) are the smallest worth fixing; on the faces test video
-# (813cdb5d) three friends at ~57-64px looked fine and one at ~52-58px didn't.
-# Only a few px separate those, so this edge is tight - tune from the per-shot
-# sizes the face count now logs.
-# 2026-10-04: floor 22 -> 18 - on Alpha Timber the daughter measured 20-24px,
-# so 22 skipped her on part of the shot.
-REFINE_FACE_PX_MIN = 18.0          # smaller faces are ignored: not counted or picked as a person
-# Once a person IS being tracked, their face keeps being fixed down to this
-# (user, 2026-10-04): on the family clip (da2f6e17) all three faces shrink to
-# 15-17px near the end, and at 18px those frames kept the melted original.
-# Background people stay out - they're never picked (REFINE_FACE_PX_MIN).
+def run_warmup(model="base"):
+    """1-step 320x320 throwaway generation: absorbs model load and CUDA warmup
+    before the user's first real job. Never uploaded."""
+    job = {"prompt": "warmup", "seed": 1, "upscale": False}
+    workflow, _ = build_prompt_payload(job, model, None, {}, 320, 320, 1.0)
+    workflow[NODE_IDS["steps"]]["inputs"]["steps"] = 1
+    result = submit_and_wait(workflow)
+    _, raw_path = _output_video_info_and_path(result)
+    try:
+        os.remove(raw_path)
+    except OSError:
+        pass
+
+
+def run_generation(job, report, should_cancel=None, should_force_kill=None, loaded_model=None):
+    """One validated generate job. report(dict) writes progress. Returns the
+    job output dict; model_used is the H3 model now resident."""
+    model, lora_key = plan_generation(job)
+    staged = []
+    try:
+        if model != loaded_model:
+            if model == "ref2va":
+                if not model_files_present("ref2va"):
+                    report({"stage": "First-time setup: downloading the motion model (one time only)"})
+                    ensure_model("ref2va")
+                report({"stage": "Loading the motion model (about 30s)"})
+            elif loaded_model is not None:
+                report({"stage": "Switching back to the standard model (about 30s)"})
+        report({"stage": "Preparing your inputs"})
+
+        inputs = {"ref_images": []}
+        if job.get("ref_video"):
+            video_file, info = load_ref_video(job["ref_video"])
+            staged.append(video_file)
+            width, height = motion_size(info["width"], info["height"])
+            frames = motion_frames(min(info["seconds"], DURATION_MAX))
+            duration = frames / 24.0
+            inputs["ref_video"] = video_file
+            inputs["ref_video_has_audio"] = info["has_audio"]
+        else:
+            width, height = ASPECT_PRESETS[job["aspect"]]
+            duration = job["duration"]
+        for key in job["ref_images"]:
+            name = load_input_image(key)
+            staged.append(name)
+            inputs["ref_images"].append(name)
+        for name in ("start_frame", "end_frame"):
+            if job.get(name):
+                filename = load_input_image(job[name], target_size=(width, height))
+                staged.append(filename)
+                inputs[name] = filename
+
+        workflow, steps = build_prompt_payload(job, model, lora_key, inputs, width, height, duration)
+        report({"stage": "Loading the motion model (about 30s)" if model != loaded_model and model == "ref2va"
+                else "Generating", "step": 0, "steps": steps})
+
+        def on_progress(update):
+            if "step" in update:
+                update = {"stage": "Generating", **update}
+            report(update)
+
+        comfy_start = time.time()
+        result = submit_and_wait(workflow, should_cancel, should_force_kill, on_progress)
+        comfy_seconds = round(time.time() - comfy_start, 1)
+        if result.get("force_killed"):
+            return {"cancelled": True, "force_killed": True}, None
+        if result.get("cancelled"):
+            return {"cancelled": True}, model
+        report({"stage": "Saving"})
+        video_key = upload_result_and_get_key(fetch_output_video(result))
+        return {
+            "videoKey": video_key,
+            "storage": "wasabi",
+            "kind": job_kind(job),
+            "seed": job["seed"],
+            "width": width * (2 if job["upscale"] else 1),
+            "height": height * (2 if job["upscale"] else 1),
+            "base_width": width,
+            "base_height": height,
+            "duration": round(duration, 2),
+            "speed": job["speed"],
+            "upscaled": bool(job["upscale"]),
+            "comfy_seconds": comfy_seconds,
+        }, model
+    finally:
+        remove_inputs(staged)
+
+
+# --- Face refine (button only, Wan engine, official settings) --------------
+# Signed off 2026-10-04 (MERGE_NOTES "Official face-refine settings"): Wan 2.2
+# low-noise + lightx2v 4 steps; strength 0.3, 0.6 for faces typically under
+# 32px; full up to 60px, untouched from 80px; crop 2x the face; detector 0.25;
+# 18px floor to pick a person, 12px once tracked; up to 4 people per shot;
+# detection gaps up to 8 frames bridged (inside ComfyLabWanFaceRedraw).
+REFINE_MAX_SUBJECTS = 4
+REFINE_FACE_PX_MIN = 18.0
 REFINE_FACE_PX_MIN_TRACKED = 12.0
-# Wan: a clip (person x shot) whose face is typically under this gets the
-# small-face strength instead. 0.3 looked best on most faces but was too gentle
-# on the Alpha Timber mother (23-30px) and daughter (20-24px), where 0.6 was
-# much better; the father (~27-45px, mostly in the upper 30s) and up stay on 0.3.
 REFINE_FACE_PX_TINY = 32.0
-# 2026-10-04 (user): 45/60 -> 60/62. On the park video (813cdb5d) three
-# friends measured 56-59px - inside the old fade, so 0.3 and 0.4 barely
-# touched them and looked the same; the furthest-right friend (60px+) looked
-# fine and must stay untouched. Note the Wan paste is full once the fade's
-# strength is >= WEIGHT_RAMP (0.2), so the real cut-off sits at ~80% of the
-# way through the fade (60/90 would have redrawn everything up to ~84px).
-REFINE_FACE_PX_SMALL = 60.0        # full strength at or below this (was 45)
-# 62 -> 65 (user, 2026-10-04): the woman on the left of the park shot is
-# 59-63px and sat at 62-63px for the shot's first ~16 frames, so those were
-# left unfixed while the rest of her shot was redrawn.
-# 65 -> 80 (user, 2026-10-04): the official setting after the park, Alpha
-# Timber and family-clip tests. The Wan paste is full up to ~76px.
-REFINE_FACE_PX_LARGE = 80.0        # none at or above this (was 65, 62, 60, before that 120)
-# Crop = this many face heights (the pack's default is 3). At 2 the face fills
-# half the crop instead of a third, so the redraw gets ~1.5x the pixels on it;
-# less context around the face. User, 2026-10-04.
+REFINE_FACE_PX_SMALL = 60.0
+REFINE_FACE_PX_LARGE = 80.0
 REFINE_CROP_FACTOR = 2.0
-# Detector score a box needs to count as a face (was 0.35). Lower keeps the
-# borderline real faces (turned, blurred, shadowed) the old bar dropped - on
-# 813cdb5d the middle friend went undetected for long stretches, and the
-# refine fades out wherever there's no detection. More junk clears the bar
-# too; the 18px floor and the duplicate check catch most of it.
 REFINE_DETECT_CONFIDENCE = 0.25
-FACE_DETECTOR = "face_yolov8m.pt"  # Bingsu/adetailer, downloaded by ensure_comfyui_engine.sh
-WAN_REFINE_DEFAULT_DENOISE = 0.3   # faces REFINE_FACE_PX_TINY and up (user, 2026-10-04: 0.3 best on most faces; was 0.6)
-WAN_REFINE_SMALL_FACE_DENOISE = 0.6  # faces under REFINE_FACE_PX_TINY; starting sigma ~0.88 at shift 5, right at the low-noise expert's 0.875 boundary
-WAN_REFINE_STEPS = 4               # default (user, 2026-10-04); 3 and 2 are test-page options (2 saved ~20s of redraw on cba2f8ef). The lightx2v LoRA is distilled for 4
+FACE_DETECTOR = "face_yolov8m.pt"
+WAN_REFINE_DENOISE = 0.3
+WAN_REFINE_SMALL_FACE_DENOISE = 0.6
+WAN_REFINE_STEPS = 4
 WAN_REFINE_SHIFT = 5.0
-H3_REFINE_DEFAULT_DENOISE = 0.4   # the pack's shipped base denoise; H3PerFrameDenoise scales it per frame
-H3_REFINE_STEPS = 8               # default: the 8-step turbo LoRA (LORA_CHOICES["turbo"])
-# H3 refine steps -> turbo LoRA. 8 uses Comfy-Org's 8-step LoRA; 4/3/2 use its
-# 4-step 768p LoRA (LORA_CHOICES["fast"]; crops are redrawn at <=512px). Both
-# are already on the volume (engine script).
-H3_REFINE_STEP_LORAS = {8: "turbo", 4: "fast", 3: "fast", 2: "fast"}
-REFINE_CANVAS_SIZES = {384, 512, 640, 768}  # job "canvas"; default "auto" (tracker picks, capped at 768)
 WAN_REFINE_FILES = {
     "unet": ({"filename": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
               "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
@@ -1113,34 +1066,31 @@ WAN_REFINE_FILES = {
 }
 
 
-def ensure_wan_refine_files(report_stage=None):
-    """Downloads the Wan refine models on first use (skips files already on
-    the volume). Returns True if anything had to be downloaded."""
+def ensure_wan_refine_files(report):
     missing = [(spec, sub) for spec, sub in WAN_REFINE_FILES.values()
                if not os.path.exists(os.path.join(VOLUME_MODELS_DIR, sub, spec["filename"]))]
     if not missing:
         return False
-    if report_stage:
-        report_stage("First-time setup: downloading the Wan face-refine models (~22.5GB, once per volume)")
+    report({"stage": "First-time setup: downloading the face models (one time only)"})
     for spec, sub in missing:
         ensure_model_file(spec, sub)
     return True
 
 
 def downscale_video_for_refine(src_path, dst_path, max_w=1344, max_h=768):
-    """Re-encodes a (usually RTX-upscaled) video back down to H3's native
-    canvas before refining, audio stream copied untouched. Without this a
-    15s 2x clip is ~18GB of float32 frames per copy in ComfyUI, and the
-    chained per-subject stitches each hold another copy. Returns
-    (source_w, source_h, downscale_factor)."""
-    import av  # ships with ComfyUI (requirements.txt: av>=17)
+    """Re-encodes a (usually 2x-upscaled) video back to H3's native canvas
+    before refining, audio copied untouched. Returns the downscale factor."""
+    import av
     with av.open(src_path) as inp:
         vin = inp.streams.video[0]
         w, h = vin.codec_context.width, vin.codec_context.height
-        scale = min(1.0, max_w / w, max_h / h)
+        # Fit the larger side to 1344 and the smaller to 768 whatever the
+        # orientation, so portrait and square videos aren't over-shrunk.
+        long_side, short_side = max(w, h), min(w, h)
+        scale = min(1.0, max_w / long_side, max_h / short_side)
         if scale >= 1.0:
             shutil.copyfile(src_path, dst_path)
-            return w, h, 1.0
+            return 1.0
         tw = max(32, int(round(w * scale / 32)) * 32)
         th = max(32, int(round(h * scale / 32)) * 32)
         ain = inp.streams.audio[0] if inp.streams.audio else None
@@ -1158,26 +1108,25 @@ def downscale_video_for_refine(src_path, dst_path, max_w=1344, max_h=768):
                     out.mux(packet)
                     continue
                 for frame in packet.decode():
-                    # Source timestamps kept as-is; the encoder rescales them.
                     small = frame.reformat(width=tw, height=th, format="yuv420p", interpolation="AREA")
                     for p in vout.encode(small):
                         out.mux(p)
             for p in vout.encode():
                 out.mux(p)
-    return w, h, w / tw
+    return w / tw
 
 
 def prepare_refine_source(video_key):
-    """Downloads outputs/<video_key> from Wasabi and writes a native-size
-    copy into ComfyUI's input/ dir. Returns (input_filename, factor)."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tmp_path = os.path.join(OUTPUT_DIR, f"refine_src_{uuid.uuid4().hex}.mp4")
-    s3_client.download_file(S3_BUCKET, f"outputs/{video_key}", tmp_path)
-    input_dir = os.path.join(COMFYUI_DIR, "input")
-    os.makedirs(input_dir, exist_ok=True)
+    try:
+        s3_client.download_file(S3_BUCKET, f"outputs/{video_key}", tmp_path)
+    except Exception:
+        raise JobRejected("The source video could not be found")
+    os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
     filename = f"refine_{uuid.uuid4().hex[:12]}.mp4"
     try:
-        _, _, factor = downscale_video_for_refine(tmp_path, os.path.join(input_dir, filename))
+        factor = downscale_video_for_refine(tmp_path, os.path.join(COMFYUI_INPUT_DIR, filename))
     finally:
         try:
             os.remove(tmp_path)
@@ -1186,48 +1135,10 @@ def prepare_refine_source(video_key):
     return filename, factor
 
 
-def default_refine_tuning():
-    return {"face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE,
-            "crop_factor": REFINE_CROP_FACTOR, "confidence": REFINE_DETECT_CONFIDENCE}
-
-
-def stitch_feather(tune):
-    """The paste's soft edge, in source px. Tuned at a 3x crop (24px); scaled
-    with the crop so a tighter crop's blend still fades out before the crop's
-    border - at 2x, an unscaled 24px blur left ~3% of the redraw showing at
-    the border on 28px faces, a faint box."""
-    return max(8, int(round(24 * tune["crop_factor"] / 3.0)))
-
-
-def refine_tuning(job_input):
-    """The size range, crop and detector bar, each overridable per job (test
-    page) so the old values can be compared without a redeploy."""
-    tune = default_refine_tuning()
-    for key, lo, hi in (("face_px_small", 10.0, 400.0), ("face_px_large", 10.0, 400.0),
-                        ("crop_factor", 1.5, 4.0), ("confidence", 0.1, 0.9)):
-        if job_input.get(key) in (None, ""):
-            continue
-        try:
-            value = float(job_input[key])
-        except (TypeError, ValueError):
-            raise ValueError(f"{key} must be a number, got {job_input[key]!r}")
-        if not lo <= value <= hi:
-            raise ValueError(f"{key} must be between {lo:g} and {hi:g}, got {value}")
-        tune[key] = value
-    if tune["face_px_large"] <= tune["face_px_small"]:
-        raise ValueError(f"face_px_large ({tune['face_px_large']:g}) must be above "
-                         f"face_px_small ({tune['face_px_small']:g})")
-    return tune
-
-
-def refine_select_node(source_filename, tune=None):
-    """The pack's H3 Load Video + Face Select: loads the video and finds every
-    face and cut in one pass. Built identically for the people-count prompt
-    and the refine prompt, so ComfyUI's cache reuses the first one's result
-    instead of detecting again."""
+def refine_select_node(source_filename):
     return {"class_type": "H3FaceSelect", "inputs": {
         "video": source_filename, "detector": FACE_DETECTOR,
-        "confidence": (tune or default_refine_tuning())["confidence"],
+        "confidence": REFINE_DETECT_CONFIDENCE,
         "select": "largest_face", "select_index": 0, "confirmed_pick": "",
         "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
         "skip_first_frames": 0, "frame_load_cap": 0, "select_every_nth": 1,
@@ -1235,92 +1146,47 @@ def refine_select_node(source_filename, tune=None):
         "X": 0, "Y": 0, "frame_index": 0}}
 
 
-def fetch_node_timings(history_entry):
-    """Per-node run times for a finished prompt, from the comfylab_face_wan
-    timing hook (GET /comfylab/timings/<prompt_id>). Logging only: returns []
-    if anything is missing rather than failing the job."""
-    try:
-        prompt_id = history_entry["prompt"][1]
-        r = requests.get(f"{COMFYUI_URL}/comfylab/timings/{prompt_id}", timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"Could not read node timings: {e}")
-        return []
+def stitch_feather():
+    return max(8, int(round(24 * REFINE_CROP_FACTOR / 3.0)))
 
 
-def summarize_timings(stages, node_rows):
-    """{stage: seconds} plus ComfyUI node time summed per node type, biggest
-    first - what the refine's timing report shows."""
-    by_type = {}
-    for _node_id, class_name, seconds in node_rows:
-        by_type[class_name] = round(by_type.get(class_name, 0.0) + float(seconds), 1)
+def build_people_count_payload(source_filename):
     return {
-        "stages": {k: round(v, 1) for k, v in stages.items()},
-        "nodes_by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
-    }
-
-
-def build_people_count_payload(source_filename, tune=None):
-    """Short first prompt: face finding + ComfyLabSmallFaceCount. Its report's
-    first line is "small_face_people=N found=M"."""
-    return {
-        "r_select": refine_select_node(source_filename, tune),
+        "r_select": refine_select_node(source_filename),
         "r_count": {"class_type": "ComfyLabSmallFaceCount", "inputs": {
-            "face_pick": ["r_select", 2], "face_px_large": (tune or default_refine_tuning())["face_px_large"],
-            "face_px_min": REFINE_FACE_PX_MIN,
-            "max_people": REFINE_MAX_SUBJECTS}},
+            "face_pick": ["r_select", 2], "face_px_large": REFINE_FACE_PX_LARGE,
+            "face_px_min": REFINE_FACE_PX_MIN, "max_people": REFINE_MAX_SUBJECTS}},
         "r_count_report": {"class_type": "PreviewAny", "inputs": {"source": ["r_count", 1]}},
     }
 
 
-def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, wan_prompt, canvas=None,
-                         steps=WAN_REFINE_STEPS, small_denoise=WAN_REFINE_SMALL_FACE_DENOISE, tune=None):
-    """The pack's H3FaceSelect loads the video and detects every face and cut
-    ONCE; ComfyLabFacePickIndex re-picks that for each person, so each
-    tracker reuses the boxes instead of detecting again. All crops are
-    redrawn in one ComfyLabWanFaceRedraw node (Wan loads once, batched, and
-    is unloaded inside the node when it finishes), then stitched back one
-    subject after another. canvas: None = the tracker's auto size (capped at
-    768), or a fixed square size (e.g. 384) for every crop."""
-    tune = tune or default_refine_tuning()
-    wf = {"r_select": refine_select_node(source_filename, tune)}
+def build_refine_payload(source_filename, subjects, seed, upscale_scale):
+    wf = {"r_select": refine_select_node(source_filename)}
     source = ["r_select", 0]
-    audio = ["r_select", 1]
     redraw_inputs = {
         "unet_name": WAN_REFINE_FILES["unet"][0]["filename"],
         "lora_name": WAN_REFINE_FILES["lora"][0]["filename"],
         "clip_name": WAN_REFINE_FILES["clip"][0]["filename"],
         "vae_name": WAN_REFINE_FILES["vae"][0]["filename"],
-        "prompt": wan_prompt or "", "denoise": denoise, "steps": steps,
+        "prompt": "", "denoise": WAN_REFINE_DENOISE, "steps": WAN_REFINE_STEPS,
         "shift": WAN_REFINE_SHIFT, "seed": seed,
-        # The pack's H3PerFrameDenoise ramp, ending at zero: faces at or
-        # above 120px are left exactly as they are.
-        "face_px_small": tune["face_px_small"], "face_px_large": tune["face_px_large"], "smooth_frames": 9,
+        "face_px_small": REFINE_FACE_PX_SMALL, "face_px_large": REFINE_FACE_PX_LARGE, "smooth_frames": 9,
         "face_px_min": REFINE_FACE_PX_MIN_TRACKED,
-        # Per clip: small_denoise when the face is typically under
-        # REFINE_FACE_PX_TINY, denoise otherwise.
-        "small_denoise": small_denoise, "small_face_px": REFINE_FACE_PX_TINY,
+        "small_denoise": WAN_REFINE_SMALL_FACE_DENOISE, "small_face_px": REFINE_FACE_PX_TINY,
         "sage_attention": True,
-        # The detector's own face boxes, for the duplicate-person check.
         "face_pick": ["r_select", 2],
     }
     for i in range(subjects):
         p = f"r{i}_"
-        # Person i = the i-th largest SMALL face in each shot: faces already
-        # big enough are skipped, since the refine leaves them alone anyway.
         wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
             "face_pick": ["r_select", 2], "index": i,
-            "skip_large": True, "face_px_large": tune["face_px_large"],
+            "skip_large": True, "face_px_large": REFINE_FACE_PX_LARGE,
             "face_px_min": REFINE_FACE_PX_MIN}}
         wf[p + "track"] = {"class_type": "H3FaceTrackCrop", "inputs": {
             "images": source, "face_pick": [p + "pick", 0],
-            # detector/confidence/cut settings are inert with a face_pick wired
-            # (H3FaceSelect above already did that pass); kept valid for the schema.
-            "detector": FACE_DETECTOR, "confidence": tune["confidence"],
-            "crop_factor": tune["crop_factor"],
-            "canvas_width": canvas or 768, "canvas_height": canvas or 768,
-            "canvas_mode": "manual" if canvas else "auto_capped_768",
+            "detector": FACE_DETECTOR, "confidence": REFINE_DETECT_CONFIDENCE,
+            "crop_factor": REFINE_CROP_FACTOR,
+            "canvas_width": 768, "canvas_height": 768, "canvas_mode": "auto_capped_768",
             "smooth_window": 21, "size_smooth_window": 51,
             "smooth_method": "gaussian", "size_mode": "per_frame",
             "identity_track": False, "identity_threshold": 0.28,
@@ -1328,744 +1194,269 @@ def build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale
             "fallback_head_frac": 0.5, "identity_model": "insightface",
             "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
             "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
-        wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
-        wf[p + "pick_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pick", 1]}}
         redraw_inputs[f"crops_{i}"] = [p + "track", 0]
         redraw_inputs[f"transform_{i}"] = [p + "track", 1]
-    wf["r_select_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_select", 4]}}
     wf["r_wan"] = {"class_type": "ComfyLabWanFaceRedraw", "inputs": redraw_inputs}
-    wf["r_wan_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_wan", 4]}}
     images = source
     for i in range(subjects):
         p = f"r{i}_"
         wf[p + "stitch"] = {"class_type": "H3FaceStitch", "inputs": {
-            # The redraw node's transform: its per-frame weights are zero on
-            # frames it didn't redraw, so those keep the video's own pixels.
             "base_images": images, "refined_crops": ["r_wan", i], "transform": ["r_wan", 5 + i],
-            "paste_region": "face_only", "mask_dilation": 24, "feather": stitch_feather(tune), "colour_match": 1.0,
+            "paste_region": "face_only", "mask_dilation": 24, "feather": stitch_feather(), "colour_match": 1.0,
             "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
         images = [p + "stitch", 0]
-
     if upscale_scale:
         wf["r_vsr"] = {"class_type": "RTXVideoSuperResolution", "inputs": {
             "images": images, "resize_type": "scale by multiplier",
             "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
         images = ["r_vsr", 0]
     wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
-        "fps": ["r_select", 6], "bit_depth": 8, "images": images, "audio": audio}}
-    # GPU (NVENC) H.264 instead of core SaveVideo's CPU libx264 - same
-    # history output shape, falls back to libx264 if NVENC isn't usable.
+        "fps": ["r_select", 6], "bit_depth": 8, "images": images, "audio": ["r_select", 1]}}
     wf[NODE_IDS["output"]] = {"class_type": "ComfyLabSaveVideoNVENC", "inputs": {
         "filename_prefix": f"video/FaceRefineWan_{uuid.uuid4().hex[:12]}",
         "video": ["r_create", 0]}}
     return wf
 
 
-def h3_refine_tracker(source, pick, canvas, i, tune):
-    return {"class_type": "H3FaceTrackCrop", "inputs": {
-        "images": source, "face_pick": pick,
-        "detector": FACE_DETECTOR, "confidence": tune["confidence"],
-        "crop_factor": tune["crop_factor"],
-        "canvas_width": canvas or 768, "canvas_height": canvas or 768,
-        "canvas_mode": "manual" if canvas else "auto_capped_768",
-        "smooth_window": 21, "size_smooth_window": 51,
-        "smooth_method": "gaussian", "size_mode": "per_frame",
-        "identity_track": False, "identity_threshold": 0.28,
-        "select": "largest_face", "select_index": i, "fallback_detector": "none",
-        "fallback_head_frac": 0.5, "identity_model": "insightface",
-        "cut_detection": "auto (pyscenedetect)", "cut_threshold": 3.0,
-        "absent_shots": "off", "X": 0, "Y": 0, "frame_index": 0}}
-
-
-def build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff_name, canvas=None,
-                            split_shots=False, steps=H3_REFINE_STEPS, tune=None, h3_model="base"):
-    """Step 1 of 2 of the H3 engine: track each person, then one
-    ComfyLabH3FaceRedraw node redraws everyone - built like the Wan engine's
-    node: one clip per person per shot (never across a cut; the whole shot,
-    so frames where the face is big enough to leave alone stay in as
-    unchanged context), at no more than 512px, prompt encoded once. Each clip's per-frame strength comes from the pack's
-    H3PerFrameDenoise (full on faces <= 30px, zero at >= 120px, zero where
-    the face is lost); its latent is used, not its patched model (see
-    comfylab_face_wan/h3_refine.py). The redrawn crops and their stitch
-    transforms are written to a hand-off file; step 2
-    (build_h3_stitch_payload) stitches them in after the worker has unloaded
-    H3 and cleared ComfyUI's cache - stitching and upscaling a 15s clip with
-    H3 and its text encoder still in RAM (~35GB) ran the worker out of memory
-    (job 1a45f78a)."""
-    tune = tune or default_refine_tuning()
-    wf = {"r_select": refine_select_node(source_filename, tune)}
-    source = ["r_select", 0]
-    # The generation graph's own node ids and inputs (workflow_template.json),
-    # so ComfyUI's cache hands back the models a generation already loaded.
-    base_lora = LORA_CHOICES[H3_REFINE_STEP_LORAS[steps]]
-    wf["105:6"] = {"class_type": "UNETLoader", "inputs": {
-        "unet_name": MODEL_CHOICES[h3_model]["filename"], "weight_dtype": "default"}}
-    wf["105:13"] = {"class_type": "CLIPLoader", "inputs": {
-        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}}
-    wf["105:11"] = {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}}
-    wf["105:24"] = {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}}
-    wf["h_lora"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
-        "model": ["105:6", 0], "lora_name": base_lora["filename"], "strength_model": base_lora["multiplier"]}}
-    wf["h_sage"] = {"class_type": "PathchSageAttentionKJ", "inputs": {
-        "model": ["h_lora", 0], "sage_attention": "auto", "allow_compile": False}}
-    wf["h_check"] = {"class_type": "ComfyLabH3StepCheck", "inputs": {"model": ["h_sage", 0], "label": "h3 refine"}}
-    redraw_inputs = {
-        "model": ["h_check", 0], "clip": ["105:13", 0], "vae": ["105:11", 0], "audio_vae": ["105:24", 0],
-        "audio": ["r_select", 1], "fps": ["r_select", 6],
-        "prompt": prompt or "", "denoise": denoise, "steps": steps, "seed": seed,
-        "sampler_name": "er_sde",
-        # H3PerFrameDenoise's ramp, ending at zero: faces at or above 120px
-        # are left exactly as they are.
-        "denoise_multiplier_small_face": 1.0, "denoise_multiplier_large_face": 0.0,
-        "face_px_small": tune["face_px_small"], "face_px_large": tune["face_px_large"], "gamma": 1.0,
-        "smooth_frames": 9, "face_px_min": REFINE_FACE_PX_MIN_TRACKED,
-        "split_shots": bool(split_shots),
-        # The detector's own face boxes, for the duplicate-person check.
-        "face_pick": ["r_select", 2],
-    }
-    save_inputs = {"name": handoff_name}
-    for i in range(subjects):
-        p = f"r{i}_"
-        wf[p + "pick"] = {"class_type": "ComfyLabFacePickIndex", "inputs": {
-            "face_pick": ["r_select", 2], "index": i,
-            "skip_large": True, "face_px_large": tune["face_px_large"],
-            "face_px_min": REFINE_FACE_PX_MIN}}
-        wf[p + "pick_report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "pick", 1]}}
-        wf[p + "track"] = h3_refine_tracker(source, [p + "pick", 0], canvas, i, tune)
-        wf[p + "report"] = {"class_type": "PreviewAny", "inputs": {"source": [p + "track", 3]}}
-        redraw_inputs[f"crops_{i}"] = [p + "track", 0]
-        redraw_inputs[f"transform_{i}"] = [p + "track", 1]
-        save_inputs[f"crops_{i}"] = ["r_h3", i]
-        save_inputs[f"transform_{i}"] = ["r_h3", 5 + i]
-    wf["r_h3"] = {"class_type": "ComfyLabH3FaceRedraw", "inputs": redraw_inputs}
-    wf["r_h3_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_h3", 4]}}
-    wf["r_select_report"] = {"class_type": "PreviewAny", "inputs": {"source": ["r_select", 4]}}
-    # Same node id as the generation graph's SaveVideo, so submit_and_wait's
-    # cancel detection works unchanged.
-    wf[NODE_IDS["output"]] = {"class_type": "ComfyLabSaveRefineCrops", "inputs": save_inputs}
-    return wf
-
-
-def build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff_name, tune=None):
-    """Step 2 of 2 of the H3 engine, run after the worker has unloaded H3 and
-    cleared ComfyUI's cache: reload the source (plain decode - no face
-    finding), stitch each person's redrawn crops back one after another,
-    upscale back, encode."""
-    tune = tune or default_refine_tuning()
-    wf = {
-        "s_load": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
-        "s_comp": {"class_type": "GetVideoComponents", "inputs": {"video": ["s_load", 0]}},
-        "s_crops": {"class_type": "ComfyLabLoadRefineCrops", "inputs": {"name": handoff_name}},
-    }
-    images = ["s_comp", 0]
-    for i in range(subjects):
-        wf[f"s{i}_stitch"] = {"class_type": "H3FaceStitch", "inputs": {
-            "base_images": images, "refined_crops": ["s_crops", i], "transform": ["s_crops", 4 + i],
-            "paste_region": "face_only", "mask_dilation": 24, "feather": stitch_feather(tune), "colour_match": 1.0,
-            "blend": 1.0, "undetected_frames": "fade_out", "feather_scales_with_crop": False}}
-        images = [f"s{i}_stitch", 0]
-    if upscale_scale:
-        wf["r_vsr"] = {"class_type": "RTXVideoSuperResolution", "inputs": {
-            "images": images, "resize_type": "scale by multiplier",
-            "resize_type.scale": upscale_scale, "quality": NVIDIA_VSR_QUALITY}}
-        images = ["r_vsr", 0]
-    wf["r_create"] = {"class_type": "CreateVideo", "inputs": {
-        "fps": ["s_comp", 2], "bit_depth": 8, "images": images, "audio": ["s_comp", 1]}}
-    wf[NODE_IDS["output"]] = {"class_type": "ComfyLabSaveVideoNVENC", "inputs": {
-        "filename_prefix": f"video/FaceRefineH3_{uuid.uuid4().hex[:12]}",
-        "video": ["r_create", 0]}}
-    return wf
-
-
-def container_ram_used():
-    """Bytes this container is using against its memory limit (cgroup v2,
-    then v1). None if neither is readable. psutil would report the HOST's
-    RAM (755GB on these workers), not the ~89GB the worker is limited to."""
-    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
-        try:
-            with open(path) as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
-            continue
-    return None
-
-
-def free_comfyui_memory(wait_seconds=60):
-    """Unloads every model and clears ComfyUI's output cache (POST /free),
-    then waits for it to happen. /free only sets flags; ComfyUI's worker acts
-    on them the next time it looks at its queue (the flag itself wakes it),
-    so this waits until the container's memory use stops falling."""
-    before = container_ram_used()
-    requests.post(f"{COMFYUI_URL}/free", json={"unload_models": True, "free_memory": True},
-                  timeout=10).raise_for_status()
-    time.sleep(2)
-    if before is None:
-        time.sleep(10)
-        print("Freed ComfyUI memory (container memory use not readable).")
-        return
-    last, steady = before, 0
-    deadline = time.time() + wait_seconds
-    while time.time() < deadline and steady < 3:
-        time.sleep(1)
-        now = container_ram_used() or last
-        steady = steady + 1 if abs(now - last) < 256e6 else 0
-        last = now
-    print(f"Freed ComfyUI memory: {before / 1e9:.1f}GB -> {last / 1e9:.1f}GB used")
-
-
-# Upscale-only job (test page "Upscale a video" section): RTX VSR on an
-# uploaded video, original audio kept. H3 and its text encoder are unloaded
-# first - nvidia-vfx allocates outside ComfyUI's memory manager, and RTX VSR
-# next to a loaded H3 killed a 15s job on the pod. The session loop reloads
-# H3 afterwards, as after an H3 refine.
-UPSCALE_MODE = "upscale"
-# Raised from 4K (3840x2160) so 4x works on a 1024x784 swap (user,
-# 2026-10-06). At the cap a 15s clip holds ~56GB of float frames in RAM -
-# fits the 89GB worker only because the standalone job loads nothing else;
-# untested. 4096 per side is also NVENC H.264's limit.
-UPSCALE_MAX_OUTPUT_PIXELS = 4096 * 3200
-UPSCALE_MAX_SIDE = 4096
-# H3's 17n+5 frame snap rounds UP, so a "15.17s" generation is 379 frames
-# (15.8s) - the worker's own outputs must pass.
-UPSCALE_MAX_SECONDS = 16.0
-
-
-def is_upscale_job(job_row):
-    return ((job_row or {}).get("input") or {}).get("mode") == UPSCALE_MODE
-
-
-def run_upscale_only(job_input, should_cancel=None, should_force_kill=None, report_stage=None):
-    report_stage = report_stage or (lambda text: None)
-    try:
-        scale = float(job_input.get("upscale_scale", NVIDIA_VSR_SCALE))
-    except (TypeError, ValueError):
-        scale = None
-    if scale not in UPSCALE_SCALES:
-        raise ValueError(f"upscale_scale must be one of {sorted(UPSCALE_SCALES)}, got {job_input.get('upscale_scale')!r}")
-    report_stage("Downloading the video...")
-    filename, info = download_input_video(job_input.get("video_key"), "upscale")
-    out_w, out_h = round(info["width"] * scale), round(info["height"] * scale)
-    if out_w * out_h > UPSCALE_MAX_OUTPUT_PIXELS or max(out_w, out_h) > UPSCALE_MAX_SIDE:
-        raise ValueError(f"{info['width']}x{info['height']} at {scale:g}x would be {out_w}x{out_h} - "
-                         f"above the {UPSCALE_MAX_SIDE}px / {UPSCALE_MAX_OUTPUT_PIXELS / 1e6:.1f}MP limit; "
-                         f"use 2x or a smaller video")
-    if info["seconds"] > UPSCALE_MAX_SECONDS:
-        raise ValueError(f"The video is {info['seconds']:.1f}s - trim it to 15s or less")
-    print(f"Upscale: {info['width']}x{info['height']} -> {out_w}x{out_h}, {info['seconds']:.1f}s, "
-          f"{info['fps']:.2f}fps, audio={'yes' if info['has_audio'] else 'no'}.")
-    report_stage("Freeing GPU memory...")
-    free_comfyui_memory()
-    wf = {
-        "u_load": {"class_type": "LoadVideo", "inputs": {"file": filename}},
-        "u_parts": {"class_type": "GetVideoComponents", "inputs": {"video": ["u_load", 0]}},
-        "u_vsr": {"class_type": "RTXVideoSuperResolution", "inputs": {
-            "images": ["u_parts", 0], "resize_type": "scale by multiplier",
-            "resize_type.scale": scale, "quality": NVIDIA_VSR_QUALITY}},
-        "u_create": {"class_type": "CreateVideo", "inputs": {
-            "fps": ["u_parts", 2], "bit_depth": 8, "images": ["u_vsr", 0]}},
-        NODE_IDS["output"]: {"class_type": "ComfyLabSaveVideoNVENC", "inputs": {
-            "filename_prefix": f"video/Upscale_{uuid.uuid4().hex[:12]}",
-            "video": ["u_create", 0]}},
-    }
-    if info["has_audio"]:
-        wf["u_create"]["inputs"]["audio"] = ["u_parts", 1]
-    report_stage(f"Upscaling to {out_w}x{out_h}...")
-    comfy_start = time.time()
-    result = submit_and_wait(wf, should_cancel=should_cancel, should_force_kill=should_force_kill)
-    comfy_seconds = round(time.time() - comfy_start, 1)
-    if result.get("force_killed"):
-        return {"cancelled": True, "force_killed": True}
-    if result.get("cancelled"):
-        return {"cancelled": True}
-    raw_bytes, out_name = fetch_output_video(result)
-    return {
-        "videoKey": upload_result_and_get_key(raw_bytes, out_name),
-        "upscale_scale": scale,
-        "source_size": f"{info['width']}x{info['height']}",
-        "output_size": f"{out_w}x{out_h}",
-        "comfy_seconds": comfy_seconds,
-    }
-
-
-# =====================================================================
-# TEST SITE ONLY - DO NOT PORT TO PRODUCTION (see handler()).
-def run_standalone_upscale(job_input):
-    """A one-off RunPod job with no GPU session: starts ComfyUI, upscales,
-    returns. Loads only the RTX VSR node - no H3 - and needs no warmup."""
-    start = time.time()
-    try:
-        ensure_comfyui_engine()
-        symlink_models_to_volume()
-        start_comfyui_if_needed()
-        result = run_upscale_only(job_input, report_stage=print)
-    except Exception as e:
-        return {"error": str(e)}
-    result["total_seconds"] = round(time.time() - start, 1)
-    return result
-# END TEST SITE ONLY
-# =====================================================================
-
-
-def is_h3_refine_job(job_row):
-    job_input = (job_row or {}).get("input") or {}
-    return (job_input.get("mode") == REFINE_MODE
-            and str(job_input.get("engine") or "").strip().lower() == "h3")
-
-
-def run_face_refine(job_input, should_cancel=None, should_force_kill=None, report_stage=None):
-    source_key = (job_input.get("source_video_key") or "").strip()
-    if not source_key:
-        raise ValueError("face_refine needs source_video_key")
-    # People to refine: counted automatically unless the job names a number.
-    subjects = job_input.get("subjects")
-    if subjects not in (None, "", "auto"):
-        try:
-            subjects = int(subjects)
-        except (TypeError, ValueError):
-            raise ValueError(f"subjects must be a whole number or 'auto', got {job_input.get('subjects')!r}")
-        if not 1 <= subjects <= REFINE_MAX_SUBJECTS:
-            raise ValueError(f"subjects must be 1-{REFINE_MAX_SUBJECTS}, got {subjects}")
-    else:
-        subjects = None
-    engine = (job_input.get("engine") or "wan").strip().lower()
-    if engine not in REFINE_ENGINES:
-        raise ValueError(f"engine must be one of {sorted(REFINE_ENGINES)}, got {job_input.get('engine')!r}")
-    default_denoise = H3_REFINE_DEFAULT_DENOISE if engine == "h3" else WAN_REFINE_DEFAULT_DENOISE
-    try:
-        denoise = float(job_input.get("denoise", default_denoise))
-    except (TypeError, ValueError):
-        raise ValueError(f"denoise must be a number, got {job_input.get('denoise')!r}")
-    if not 0.05 <= denoise <= 1.0:
-        raise ValueError(f"denoise must be between 0.05 and 1.0, got {denoise}")
-    try:
-        small_denoise = float(job_input.get("small_denoise", WAN_REFINE_SMALL_FACE_DENOISE))
-    except (TypeError, ValueError):
-        raise ValueError(f"small_denoise must be a number, got {job_input.get('small_denoise')!r}")
-    if not 0.05 <= small_denoise <= 1.0:
-        raise ValueError(f"small_denoise must be between 0.05 and 1.0, got {small_denoise}")
-    tune = refine_tuning(job_input)
-    # The H3 engine reuses the session's loaded H3 (set by run_session).
-    h3_model = job_input.get("model") or "base"
-    if h3_model not in MODEL_CHOICES:
-        raise ValueError(f"Unknown model {h3_model!r}")
-    if engine == "h3" and MODEL_CHOICES[h3_model].get("reference_node"):
-        # The H3 engine redraws with base's turbo LoRA - not Ref2VA's.
-        raise ValueError("The H3 refine engine needs a base session - use the Wan engine with Ref2VA")
-    seed = resolve_seed(job_input.get("seed"))
-    canvas = job_input.get("canvas")
-    if canvas in (None, "", "auto"):
-        canvas = None
-    else:
-        try:
-            canvas = int(canvas)
-        except (TypeError, ValueError):
-            raise ValueError(f"canvas must be 'auto' or a size in pixels, got {job_input.get('canvas')!r}")
-        if canvas not in REFINE_CANVAS_SIZES:
-            raise ValueError(f"canvas must be 'auto' or one of {sorted(REFINE_CANVAS_SIZES)}, got {canvas}")
-    try:
-        steps = int(job_input.get("steps", WAN_REFINE_STEPS))
-    except (TypeError, ValueError):
-        raise ValueError(f"steps must be a whole number, got {job_input.get('steps')!r}")
-    if not 2 <= steps <= 8:
-        raise ValueError(f"steps must be 2-8, got {steps}")
-    # Both engines redraw face crops, not the scene, so they get a face prompt
-    # (the node's generic one unless overridden) - never the source's whole
-    # multi-shot prompt. With it, H3 redrew a shot-4 woman against a prompt
-    # mostly about the men in shots 1-3 (job 848f54fc).
-    prompt = (job_input.get("prompt") or "").strip()
-    # H3 only, for testing: true = one clip per person per shot instead of one
-    # per person across cuts. Off by default: per-shot clips made the faces
-    # clearly worse (job 3b749775 vs 36c1d9a7, 0.4, cba2f8ef), and the man's
-    # face on the mother came from the whole-scene prompt, not the cut (0.6
-    # with one clip per person and the generic prompt: no man's face).
-    split_shots = job_input.get("split_shots", False) is True
-    if engine == "h3":
-        try:
-            steps = int(job_input.get("steps", H3_REFINE_STEPS))
-        except (TypeError, ValueError):
-            raise ValueError(f"steps must be a whole number, got {job_input.get('steps')!r}")
-        if steps not in H3_REFINE_STEP_LORAS:
-            raise ValueError(f"H3 steps must be one of {sorted(H3_REFINE_STEP_LORAS)}, got {steps}")
-    stages = {}
-    node_rows = []
-    t = time.time()
-    # The H3 engine needs nothing beyond what the engine script downloads.
-    downloaded = ensure_wan_refine_files(report_stage) if engine == "wan" else False
-    if downloaded:
-        stages["wan_first_download"] = time.time() - t
-    if report_stage:
-        report_stage("Refining faces")
-
-    t = time.time()
+def run_face_refine(job, owner_id, report, should_cancel=None, should_force_kill=None):
+    source_key = job["source_video_key"]
+    if not refine_source_allowed(owner_id, source_key):
+        raise JobRejected("Face fix is only available on your own generated videos (not reference or motion swap videos)")
+    downloaded = ensure_wan_refine_files(report)
+    report({"stage": "Finding faces"})
     source_filename, factor = prepare_refine_source(source_key)
-    stages["source_download_and_shrink"] = time.time() - t
-    upscale_scale = None
-    if job_input.get("upscale_back", True):
-        upscale_scale = next((s for s in sorted(UPSCALE_SCALES) if abs(factor - s) < 0.05), None)
+    upscale_scale = NVIDIA_VSR_SCALE if abs(factor - NVIDIA_VSR_SCALE) < 0.05 else None
     comfy_start = time.time()
-    count_report = None
     try:
-        if subjects is None:
-            if report_stage:
-                report_stage("Finding faces")
-            t = time.time()
-            counted = submit_and_wait(build_people_count_payload(source_filename, tune),
-                                      should_cancel=should_cancel, should_force_kill=should_force_kill)
-            stages["comfy_find_and_count_faces"] = time.time() - t
-            if counted.get("force_killed"):
-                return {"cancelled": True, "force_killed": True}
-            if counted.get("cancelled"):
-                return {"cancelled": True}
-            node_rows += fetch_node_timings(counted)
-            text = counted.get("outputs", {}).get("r_count_report", {}).get("text")
-            count_report = (text[0] if isinstance(text, list) else text) or ""
-            match = re.search(r"small_face_people=(\d+)", count_report)
-            if not match:
-                raise RuntimeError(f"Could not read the people count: {count_report[:300]!r}")
-            subjects = int(match.group(1))
-            if subjects == 0:
-                # Nothing to fix: hand back the original video, no Wan, no upload.
-                return {
-                    "videoKey": source_key,
-                    "mode": REFINE_MODE,
-                    "no_small_faces": True,
-                    "message": "No small faces found - the video was left as it is.",
-                    "source_video_key": source_key,
-                    "subjects": 0,
-                    "comfy_seconds": round(time.time() - comfy_start, 1),
-                    "tracker_reports": [count_report],
-                }
-            if report_stage:
-                report_stage(f"Refining faces ({subjects} {'person' if subjects == 1 else 'people'})")
-        if engine == "h3":
-            # Two prompts with H3 unloaded in between - see build_h3_redraw_payload.
-            handoff = f"h3refine_{uuid.uuid4().hex[:12]}"
-            # ComfyUI's temp dir (container disk) - see h3_refine._handoff_path.
-            handoff_path = os.path.join(COMFYUI_DIR, "temp", "refine_handoff", f"{handoff}.pt")
-            t = time.time()
-            redraw = submit_and_wait(
-                build_h3_redraw_payload(source_filename, subjects, denoise, seed, prompt, handoff, canvas,
-                                        split_shots, steps, tune, h3_model),
-                should_cancel=should_cancel, should_force_kill=should_force_kill)
-            stages["comfy_h3_redraw"] = time.time() - t
-            if redraw.get("force_killed") or redraw.get("cancelled"):
-                result = redraw
-            else:
-                node_rows += fetch_node_timings(redraw)
-                redraw_outputs = redraw.get("outputs", {})
-                if report_stage:
-                    report_stage("Stitching faces back in")
-                t = time.time()
-                free_comfyui_memory()
-                stages["unload_h3"] = time.time() - t
-                t = time.time()
-                result = submit_and_wait(
-                    build_h3_stitch_payload(source_filename, subjects, upscale_scale, handoff, tune),
-                    should_cancel=should_cancel, should_force_kill=should_force_kill)
-                stages["comfy_stitch_and_upscale"] = time.time() - t
-                # Reports live on the redraw prompt; keep them with the result.
-                if not (result.get("force_killed") or result.get("cancelled")):
-                    result.setdefault("outputs", {})
-                    for k, v in redraw_outputs.items():
-                        result["outputs"].setdefault(k, v)
-        else:
-            workflow = build_refine_payload(source_filename, subjects, denoise, seed, upscale_scale, prompt,
-                                            canvas, steps, small_denoise, tune)
-            t = time.time()
-            result = submit_and_wait(workflow, should_cancel=should_cancel, should_force_kill=should_force_kill)
-            stages["comfy_refine"] = time.time() - t
+        counted = submit_and_wait(build_people_count_payload(source_filename), should_cancel, should_force_kill)
+        if counted.get("force_killed"):
+            return {"cancelled": True, "force_killed": True}
+        if counted.get("cancelled"):
+            return {"cancelled": True}
+        text = counted.get("outputs", {}).get("r_count_report", {}).get("text")
+        count_report = (text[0] if isinstance(text, list) else text) or ""
+        match = re.search(r"small_face_people=(\d+)", count_report)
+        if not match:
+            raise RuntimeError("Could not count the faces in this video")
+        subjects = min(REFINE_MAX_SUBJECTS, int(match.group(1)))
+        if subjects == 0:
+            return {
+                "videoKey": source_key, "storage": "wasabi", "kind": "refine", "mode": "face_refine",
+                "no_small_faces": True,
+                "message": "No small faces needed fixing - your video was left as it is.",
+                "source_video_key": source_key, "subjects": 0,
+                "comfy_seconds": round(time.time() - comfy_start, 1),
+            }
+        report({"stage": f"Fixing faces ({subjects} {'person' if subjects == 1 else 'people'})"})
+        result = submit_and_wait(build_refine_payload(source_filename, subjects, job["seed"], upscale_scale),
+                                 should_cancel, should_force_kill, on_progress=report, sampler_nodes=("r_wan",))
     finally:
-        try:
-            os.remove(os.path.join(COMFYUI_DIR, "input", source_filename))
-        except OSError:
-            pass
-        if engine == "h3":
-            try:
-                os.remove(handoff_path)
-            except (OSError, NameError):
-                pass
-    comfy_seconds = round(time.time() - comfy_start, 1)
+        remove_inputs([source_filename])
     if result.get("force_killed"):
         return {"cancelled": True, "force_killed": True}
     if result.get("cancelled"):
         return {"cancelled": True}
-
-    # Tracker reports (one per subject) - what it found, lost frames, the
-    # canvas it chose. Surfaced so a bad refine can be diagnosed.
-    reports = [count_report] if count_report else []
-    for i in range(subjects):
-        text = result.get("outputs", {}).get(f"r{i}_report", {}).get("text")
-        if text:
-            reports.append(text[0] if isinstance(text, list) else text)
-
-    for name in ["r_select_report"] + [f"r{i}_pick_report" for i in range(subjects)] + ["r_h3_report"]:
-        text = result.get("outputs", {}).get(name, {}).get("text")
-        if text:
-            reports.append(text[0] if isinstance(text, list) else text)
-    wan_report = result.get("outputs", {}).get("r_wan_report", {}).get("text")
-    if wan_report:
-        reports.append(wan_report[0] if isinstance(wan_report, list) else wan_report)
-
-    if not result.get("cancelled") and not result.get("force_killed"):
-        node_rows += fetch_node_timings(result)
-    t = time.time()
-    raw_bytes, filename = fetch_output_video(result)
-    video_key = upload_result_and_get_key(raw_bytes, filename)
-    stages["fetch_and_upload"] = time.time() - t
-    encoder = (result.get("outputs", {}).get(NODE_IDS["output"], {}).get("encoder") or [None])[0]
-    timings = summarize_timings(stages, node_rows)
-    timings["encoder"] = encoder
-    print(f"Face refine timings: {json.dumps(timings)}")
+    report({"stage": "Saving"})
+    video_key = upload_result_and_get_key(fetch_output_video(result))
     return {
-        "videoKey": video_key,
-        "mode": REFINE_MODE,
-        "engine": engine,
-        "split_shots": split_shots if engine == "h3" else None,
-        "first_time_download": downloaded,
-        "canvas": canvas or "auto",
-        "steps": steps,
-        "source_video_key": source_key,
-        "subjects": subjects,
-        "subjects_counted": count_report is not None,
-        "denoise": denoise,
-        "small_denoise": small_denoise if engine == "wan" else None,
-        "small_face_px": REFINE_FACE_PX_TINY if engine == "wan" else None,
-        "tuning": tune,
-        "seed": seed,
-        "upscaled_back": upscale_scale,
-        "timings": timings,
-        "comfy_seconds": comfy_seconds,
-        "tracker_reports": reports,
+        "videoKey": video_key, "storage": "wasabi", "kind": "refine", "mode": "face_refine",
+        "source_video_key": source_key, "subjects": subjects, "seed": job["seed"],
+        "upscaled_back": bool(upscale_scale), "first_time_download": downloaded,
+        "comfy_seconds": round(time.time() - comfy_start, 1),
     }
 
 
-# --- Session mode (held-open worker) -------------------------------------
-# Mirrors minimax-h3-worker/handler.py's run_session() pattern: one RunPod
-# job that never returns until the session ends, which is what keeps this
-# worker excluded from RunPod's pool for anyone/anything else's /run call
-# the whole time. New generation requests can't reach an already-busy
-# worker through RunPod's own routing, so they arrive here by polling
-# Supabase instead (see claim_next_queued_job). cancel_requested/
-# force_cancel_requested are wired through to run_generation() below, same
-# shape as production. Still NOT replicated: step-level progress reporting
-# (needs ComfyUI's websocket API, not yet built) and production's
-# keep-warm ping (see this file's own comment on that above).
+# --- Session state (production tables) -------------------------------------
+
+def get_session_owner(session_id):
+    rows = sb_get("gpu_sessions", {"id": f"eq.{session_id}", "select": "user_id,ended_at"})
+    if not rows:
+        return None
+    return rows[0]
 
 
 def is_session_active(session_id):
-    """A session is active only while comfylab_gpu_sessions.ended_at is
-    still null AND the single active_gpu_sessions-style claim slot still
-    points at THIS session (not just any claim - a later session could in
-    principle have re-claimed the slot after this one ended)."""
+    """Active only while gpu_sessions.ended_at is null AND the session's
+    active_gpu_sessions claim row exists. Manual Stop, the meter's
+    out-of-credit auto-stop and the reaper all clear one or both."""
     try:
-        sessions = sb_get(
-            "comfylab_gpu_sessions",
-            {"id": f"eq.{session_id}", "select": "ended_at"},
-        )
+        sessions = sb_get("gpu_sessions", {"id": f"eq.{session_id}", "select": "ended_at"})
         if not sessions or sessions[0].get("ended_at") is not None:
             return False
-
-        claims = sb_get(
-            "comfylab_active_gpu_sessions",
-            {"slot": "eq.default", "select": "session_id"},
-        )
-        return len(claims) > 0 and claims[0].get("session_id") == session_id
+        claims = sb_get("active_gpu_sessions", {"session_id": f"eq.{session_id}", "select": "user_id"})
+        return len(claims) > 0
     except Exception as e:
         print(f"Could not check session state (treating as still active): {e}")
         return True
 
 
 def touch_session_heartbeat(session_id):
+    """active_gpu_sessions.last_activity_at - server.js's reapDeadWorkers
+    treats 5 minutes without it as a dead worker."""
     try:
-        sb_patch(
-            "comfylab_active_gpu_sessions",
-            {"slot": "eq.default", "session_id": f"eq.{session_id}"},
-            {"last_activity_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-        )
+        sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"last_activity_at": utc_now_iso()})
     except Exception as e:
         print(f"Could not write heartbeat for session {session_id}: {e}")
 
 
 def mark_session_worker_started(session_id):
+    """Sets worker_started_at: the UI's "ready" signal AND the moment the
+    billing meter starts charging (server.js meterActiveSessions)."""
     try:
-        sb_patch(
-            "comfylab_active_gpu_sessions",
-            {"slot": "eq.default", "session_id": f"eq.{session_id}"},
-            {"worker_started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-        )
+        sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"worker_started_at": utc_now_iso()})
     except Exception as e:
         print(f"Could not mark worker started for session {session_id}: {e}")
 
 
-def mark_session_ended(session_id, reason):
+def reset_worker_started(session_id):
     try:
-        sb_patch(
-            "comfylab_gpu_sessions",
-            {"id": f"eq.{session_id}", "ended_at": "is.null"},
-            {"ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "end_reason": reason},
-        )
+        sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"worker_started_at": None})
+    except Exception as e:
+        print(f"Could not reset worker_started for session {session_id}: {e}")
+
+
+def mark_session_ended(session_id, reason):
+    """reason must be one of gpu_sessions_end_reason_check's values."""
+    try:
+        sb_patch("gpu_sessions", {"id": f"eq.{session_id}", "ended_at": "is.null"},
+                 {"ended_at": utc_now_iso(), "end_reason": reason})
     except Exception as e:
         print(f"Could not mark session {session_id} ended: {e}")
     try:
-        sb_delete("comfylab_active_gpu_sessions", {"slot": "eq.default", "session_id": f"eq.{session_id}"})
+        sb_delete("active_gpu_sessions", {"session_id": f"eq.{session_id}"})
     except Exception as e:
         print(f"Could not release active_gpu_sessions claim for {session_id}: {e}")
 
 
-def utc_now_iso():
-    """Worker-clock UTC timestamp for the comfylab_gpu_session_jobs timing
-    columns (started_at / finished_at)."""
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-
 def claim_next_queued_job(session_id):
-    queued = sb_get(
-        "comfylab_gpu_session_jobs",
-        {
-            "session_id": f"eq.{session_id}",
-            "status": "eq.queued",
-            "order": "created_at.asc",
-            "limit": "1",
-        },
-    )
+    queued = sb_get("gpu_session_jobs", {
+        "session_id": f"eq.{session_id}", "status": "eq.queued", "order": "created_at.asc", "limit": "1",
+    })
     if not queued:
         return None
-
-    job_row = queued[0]
-    claimed = sb_patch(
-        "comfylab_gpu_session_jobs",
-        {"id": f"eq.{job_row['id']}", "status": "eq.queued"},
-        {"status": "processing", "started_at": utc_now_iso()},
-    )
-    if not claimed:
-        return None
-    return claimed[0]
+    claimed = sb_patch("gpu_session_jobs", {"id": f"eq.{queued[0]['id']}", "status": "eq.queued"},
+                       {"status": "processing"})
+    return claimed[0] if claimed else None
 
 
-def is_job_cancel_requested(job_row_id):
+def _job_flag(job_row_id, column):
     try:
-        rows = sb_get(
-            "comfylab_gpu_session_jobs",
-            {"id": f"eq.{job_row_id}", "select": "cancel_requested"},
-        )
-        return bool(rows and rows[0].get("cancel_requested"))
+        rows = sb_get("gpu_session_jobs", {"id": f"eq.{job_row_id}", "select": column})
+        return bool(rows and rows[0].get(column))
     except Exception as e:
-        print(f"Could not check cancel flag for job {job_row_id}: {e}")
+        print(f"Could not check {column} for job {job_row_id}: {e}")
         return False
 
 
-def is_job_force_cancel_requested(job_row_id):
-    try:
-        rows = sb_get(
-            "comfylab_gpu_session_jobs",
-            {"id": f"eq.{job_row_id}", "select": "force_cancel_requested"},
-        )
-        return bool(rows and rows[0].get("force_cancel_requested"))
-    except Exception as e:
-        print(f"Could not check force cancel flag for job {job_row_id}: {e}")
-        return False
+def make_progress_writer(job_row_id):
+    """Writes gpu_session_jobs.progress, merged and throttled. Shape kept
+    compatible with the site's progress readers: {stage, step, steps,
+    progress, state: {sampling_step, sampling_steps}}."""
+    current = {}
+    last_write = [0.0]
+    lock = threading.Lock()
 
+    def report(update):
+        with lock:
+            current.update(update)
+            if "stage" in update and "step" not in update and update.get("stage") != "Generating":
+                current.pop("step", None)
+                current.pop("steps", None)
+            body = dict(current)
+            if body.get("steps"):
+                body["progress"] = round(min(1.0, body.get("step", 0) / body["steps"]), 3)
+                body["state"] = {"sampling_step": body.get("step", 0), "sampling_steps": body["steps"]}
+            now = time.time()
+            stage_changed = "stage" in update
+            if not stage_changed and now - last_write[0] < PROGRESS_WRITE_INTERVAL_SECONDS:
+                return
+            last_write[0] = now
+        try:
+            sb_patch("gpu_session_jobs", {"id": f"eq.{job_row_id}"}, {"progress": body})
+        except Exception as e:
+            print(f"Could not write progress for job {job_row_id}: {e}")
 
-def set_job_stage(job_row_id, text):
-    """Progress note on a still-processing job (output.stage), e.g. the Wan
-    refine's first-time model download. finish_job() overwrites output."""
-    try:
-        sb_patch("comfylab_gpu_session_jobs", {"id": f"eq.{job_row_id}"}, {"output": {"stage": text}})
-    except Exception as e:
-        print(f"Could not write stage for job {job_row_id}: {e}")
+    return report
 
 
 def finish_job(job_row_id, output):
-    if output.get("cancelled"):
-        status = "cancelled"
-    elif output.get("error"):
-        status = "failed"
-    else:
-        status = "completed"
+    status = "cancelled" if output.get("cancelled") else "failed" if output.get("error") else "completed"
     try:
-        sb_patch(
-            "comfylab_gpu_session_jobs",
-            {"id": f"eq.{job_row_id}"},
-            {
-                "status": status,
-                "output": output,
-                "finished_at": utc_now_iso(),
-                # total_seconds / queue_wait_seconds are generated columns
-                # in Postgres, derived from started_at/finished_at/created_at.
-                "comfy_seconds": output.get("comfy_seconds"),
-            },
-        )
+        sb_patch("gpu_session_jobs", {"id": f"eq.{job_row_id}"}, {"status": status, "output": output})
     except Exception as e:
         print(f"Could not write final result for job {job_row_id}: {e}")
 
 
-def run_session(session_id, model="base"):
-    """The held-open loop - see the module docstring above this section.
-    model: the H3 model this session loads (MODEL_CHOICES key). The warmup,
-    every re-warm and every generation without its own "model" use it."""
+def run_session(session_id):
     session_start = time.time()
-    last_activity = time.time()
     last_heartbeat = 0.0
     jobs_processed = 0
+    comfy_restarts = 0
     print(f"Session {session_id}: held-open loop starting.")
 
-    try:
-        ensure_comfyui_engine()
-        symlink_models_to_volume()
-        t = time.time()
-        ensure_model_file(MODEL_CHOICES[model], "diffusion_models")  # no-op once on the volume
-        if MODEL_CHOICES[model].get("reference_node"):
-            for spec in LORA_CHOICES.values():
-                if spec.get("reference_node"):
-                    ensure_model_file(spec, "loras")
-        if time.time() - t > 5:
-            print(f"Session {session_id}: downloaded this session's H3 model in {round(time.time() - t)}s.")
-        start_comfyui_if_needed()
-    except Exception as e:
-        print(f"Session {session_id}: ComfyUI failed to start ({e}) - ending session.")
-        mark_session_ended(session_id, "error")
-        return {
-            "sessionEnded": True,
-            "reason": "worker_error",
-            "session_id": session_id,
-            "jobs_processed": 0,
-            "session_duration_seconds": round(time.time() - session_start, 1),
-            "last_error": str(e),
-        }
-
-    # Absorbs the one-time model-load/CUDA warmup cost here, during the
-    # "Starting..." wait, instead of the user's first real prompt - a tiny
-    # 1-step throwaway generation at the model's minimum practical size.
-    # Mirrors warmup_kobold()'s role in minimax-h3-worker/handler.py.
-    warmup_seconds = None
-    try:
-        warmup_start = time.time()
-        run_generation({
-            "prompt": "warmup",
-            "width": 320,
-            "height": 320,
-            "duration": 1.0,
-            "steps": 1,
-            "model": model,
-        }, upload=False)
-        warmup_seconds = round(time.time() - warmup_start, 1)
-        print(f"Session {session_id}: warmup generation done ({warmup_seconds}s).")
-    except Exception as e:
-        print(f"Session {session_id}: warmup generation failed, continuing anyway ({e}).")
-
-    mark_session_worker_started(session_id)
-
-    def session_summary(reason, **extra):
+    def ended(reason, **extra):
         summary = {
             "sessionEnded": True,
             "reason": reason,
             "session_id": session_id,
             "jobs_processed": jobs_processed,
+            "comfy_restarts": comfy_restarts,
+            # Everything from this job's start to "ready" (engine setup,
+            # ComfyUI start, model load, warmup). server.js's reconciliation
+            # bills execution time minus this: the user pays from ready on.
             "warmup_seconds": warmup_seconds,
             "session_duration_seconds": round(time.time() - session_start, 1),
         }
         summary.update(extra)
         return summary
+
+    warmup_seconds = 0.0
+    try:
+        owner = get_session_owner(session_id)
+    except Exception as e:
+        print(f"Session {session_id}: could not read the session ({e}).")
+        owner = None
+    if not owner or owner.get("ended_at") is not None or not owner.get("user_id"):
+        # Unknown, already-ended, or ownerless session: nothing to run. Never
+        # touch the GPU for it.
+        print(f"Session {session_id}: not an active session - refusing.")
+        return ended("not_active")
+    owner_id = owner["user_id"]
+
+    # Heartbeat through startup too: a first boot on a fresh volume (Sage
+    # build, model downloads) can take longer than the reaper's 5-minute
+    # heartbeat window.
+    startup_heartbeat_stop = threading.Event()
+
+    def startup_heartbeat():
+        touch_session_heartbeat(session_id)
+        while not startup_heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+            touch_session_heartbeat(session_id)
+
+    threading.Thread(target=startup_heartbeat, daemon=True).start()
+    try:
+        ensure_comfyui_engine()
+        symlink_models_to_volume()
+        start_comfyui_if_needed()
+        run_warmup("base")
+    except Exception as e:
+        print(f"Session {session_id}: ComfyUI failed to start ({e}) - ending session.")
+        warmup_seconds = round(time.time() - session_start, 1)
+        mark_session_ended(session_id, "error")
+        return ended("worker_error", last_error=str(e))
+    finally:
+        startup_heartbeat_stop.set()
+
+    warmup_seconds = round(time.time() - session_start, 1)
+    if not is_session_active(session_id):
+        # Stopped while starting (Stop pressed, no worker found in time...).
+        return ended("stopped")
+    mark_session_worker_started(session_id)
+    loaded_model = "base"
+    # The idle clock starts here, after the warmup - a first-time download or
+    # a slow model load never eats into the user's 45 minutes.
+    last_activity = time.time()
+    print(f"Session {session_id}: ready after {warmup_seconds}s.")
 
     while True:
         now = time.time()
@@ -2074,13 +1465,13 @@ def run_session(session_id, model="base"):
             last_heartbeat = now
 
         if now - session_start > SESSION_SAFETY_MAX_SECONDS:
-            print(f"Session {session_id}: hit the {SESSION_SAFETY_MAX_SECONDS}s safety cutoff, ending.")
-            mark_session_ended(session_id, "safety_timeout")
-            return session_summary("safety_timeout")
+            print(f"Session {session_id}: hit the safety cutoff, ending.")
+            mark_session_ended(session_id, "timeout")
+            return ended("safety_timeout")
 
         if not is_session_active(session_id):
             print(f"Session {session_id}: no longer active, ending loop.")
-            return session_summary("stopped")
+            return ended("stopped")
 
         try:
             job_row = claim_next_queued_job(session_id)
@@ -2092,11 +1483,19 @@ def run_session(session_id, model="base"):
             if time.time() - last_activity > SESSION_IDLE_TIMEOUT_SECONDS:
                 print(f"Session {session_id}: idle past {SESSION_IDLE_TIMEOUT_SECONDS}s, ending.")
                 mark_session_ended(session_id, "timeout")
-                return session_summary("timeout")
+                return ended("timeout")
             time.sleep(SESSION_POLL_INTERVAL_SECONDS)
             continue
 
-        print(f"Session {session_id}: processing job {job_row['id']}.")
+        job_id = job_row["id"]
+        print(f"Session {session_id}: processing job {job_id}.")
+        report = make_progress_writer(job_id)
+
+        if job_row.get("cancel_requested"):
+            finish_job(job_id, {"cancelled": True})
+            jobs_processed += 1
+            last_activity = time.time()
+            continue
 
         heartbeat_stop = threading.Event()
 
@@ -2108,142 +1507,69 @@ def run_session(session_id, model="base"):
         heartbeat_thread.start()
         try:
             try:
-                # Stop GPU mid-generation counts as a force cancel. Stop only
-                # ends the session (ended_at + claim row deleted) - it never
-                # sets this job's own cancel flags - and the loop's own
-                # is_session_active() check above only runs BETWEEN jobs, so
-                # without this a running generation kept the GPU busy until
-                # it finished or hit submit_and_wait's 20-minute timeout
-                # (seen on a real run: a huge-resolution job kept going after
-                # Stop until it was cancelled by hand in RunPod). There's no
-                # reaper on this test endpoint to backstop it the way
-                # production's REAP_STOP_GRACE_MS does. Force-kill, not a
-                # graceful /interrupt: the session is over either way, and an
-                # interrupt only lands at a step boundary, which can be
-                # minutes away at high resolution.
-                runner_kwargs = {}
-                if (job_row["input"] or {}).get("mode") == REFINE_MODE:
-                    job_runner = run_face_refine
-                    runner_kwargs["report_stage"] = lambda text: set_job_stage(job_row["id"], text)
-                    job_input = {"model": model, **(job_row["input"] or {})}
-                elif is_upscale_job(job_row):
-                    job_runner = run_upscale_only
-                    runner_kwargs["report_stage"] = lambda text: set_job_stage(job_row["id"], text)
-                    job_input = dict(job_row["input"] or {})
+                if job_row.get("user_id") != owner_id or job_row.get("session_id") != session_id:
+                    raise JobRejected("This job does not belong to this session")
+                job = validate_job(job_row.get("input"), owner_id)
+                # Stop GPU / out of credit / reaper mid-job: the session is
+                # over, so kill the generation now rather than finishing it.
+                kwargs = {
+                    "should_cancel": lambda: _job_flag(job_id, "cancel_requested"),
+                    "should_force_kill": lambda: (_job_flag(job_id, "force_cancel_requested")
+                                                  or not is_session_active(session_id)),
+                }
+                if job["mode"] == "face_refine":
+                    result = run_face_refine(job, owner_id, report, **kwargs)
                 else:
-                    job_runner = run_generation
-                    # A generation without its own "model" uses the session's.
-                    job_input = {"model": model, **(job_row["input"] or {})}
-                result = job_runner(
-                    job_input,
-                    should_cancel=lambda: is_job_cancel_requested(job_row["id"]),
-                    should_force_kill=lambda: (
-                        is_job_force_cancel_requested(job_row["id"])
-                        or not is_session_active(session_id)
-                    ),
-                    **runner_kwargs,
-                )
-            except Exception as e:
+                    result, new_model = run_generation(job, report, loaded_model=loaded_model, **kwargs)
+                    loaded_model = new_model
+            except JobRejected as e:
                 result = {"error": str(e)}
+            except Exception as e:
+                print(f"Session {session_id}: job {job_id} failed: {e}")
+                result = {"error": str(e)[:500] or "The generation failed"}
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=5)
 
-        finish_job(job_row["id"], result)
+        finish_job(job_id, result)
         jobs_processed += 1
 
-        # Session stopped during this job (see should_force_kill above) -
-        # end now rather than restarting and re-warming a ComfyUI that was
-        # just killed for a session nobody is using anymore.
         if not is_session_active(session_id):
-            print(f"Session {session_id}: stopped during job {job_row['id']}, ending loop.")
-            return session_summary("stopped")
+            print(f"Session {session_id}: stopped during job {job_id}, ending loop.")
+            return ended("stopped")
 
-        # Two separate ways ComfyUI can be down after a job: we killed it
-        # ourselves (force_killed), or it crashed on its own - a real run
-        # hit this via what looked like an OOM mid-upscale (ComfyUI's HTTP
-        # server itself stopped responding, not a clean in-graph error).
-        # Without this check, an unplanned crash left every later job in
-        # the session failing the same way forever, since nothing else
-        # here ever re-checks whether ComfyUI is still alive between jobs.
-        needs_restart = result.get("force_killed") or (result.get("error") and not is_comfyui_ready())
-        if needs_restart:
-            reason = "force-killed" if result.get("force_killed") else "crashed unexpectedly"
-            print(f"Session {session_id}: ComfyUI {reason} - restarting and re-warming.")
+        # ComfyUI is down after a force-kill, or after an unplanned crash
+        # (e.g. out of memory): restart and re-warm, showing "starting" again.
+        if result.get("force_killed") or (result.get("error") and not is_comfyui_ready()):
+            why = "force-killed" if result.get("force_killed") else "crashed"
+            print(f"Session {session_id}: ComfyUI {why} - restarting and re-warming.")
+            reset_worker_started(session_id)
             try:
                 start_comfyui_if_needed()
-                run_generation({
-                    "prompt": "warmup",
-                    "width": 320,
-                    "height": 320,
-                    "duration": 1.0,
-                    "steps": 1,
-                    "model": model,
-                }, upload=False)
+                run_warmup("base")
+                loaded_model = "base"
+                comfy_restarts += 1
+                mark_session_worker_started(session_id)
             except Exception as e:
-                print(f"Session {session_id}: failed to restart after ComfyUI {reason} ({e}) - ending session.")
+                print(f"Session {session_id}: restart failed ({e}) - ending session.")
                 mark_session_ended(session_id, "error")
-                return session_summary("worker_error", last_error=str(e))
-        elif (is_h3_refine_job(job_row) or is_upscale_job(job_row)) and is_comfyui_ready():
-            # The H3 refine and the upscale-only job unload H3 and its text
-            # encoder (see run_face_refine, run_upscale_only). Load them straight back - after the
-            # result is already delivered - so the next generation doesn't
-            # pay the ~40s reload. Same throwaway warmup as session start.
-            try:
-                reload_start = time.time()
-                run_generation({
-                    "prompt": "warmup",
-                    "width": 320,
-                    "height": 320,
-                    "duration": 1.0,
-                    "steps": 1,
-                    "model": model,
-                }, upload=False)
-                print(f"Session {session_id}: H3 reloaded after the {job_row['input'].get('mode')} job "
-                      f"({round(time.time() - reload_start, 1)}s).")
-            except Exception as e:
-                print(f"Session {session_id}: H3 reload after the {job_row['input'].get('mode')} job failed, "
-                      f"the next generation will load it instead ({e}).")
+                return ended("worker_error", last_error=str(e))
 
+        # Restarted after each job FINISHES, never at claim time: a long job
+        # must not count as idle time.
         last_activity = time.time()
 
 
 def handler(job):
-    job_input = job["input"]
-
-    # Session mode ONLY - this one RunPod job IS the held-open worker for
-    # the named session, and stays inside run_session() until the session
-    # ends. There is deliberately no classic one-shot fallback: a frontend-
-    # side check ("don't call /run without a session") is not a real
-    # boundary, since anyone holding the RunPod API key can send any job
-    # shape directly, bypassing whatever the test page's or website's own
-    # JS does or doesn't allow. The only enforcement that actually means
-    # anything lives here, in the one place that decides whether GPU work
-    # happens at all - a request with no session_id gets rejected outright,
-    # before touching ComfyUI or the GPU, rather than silently running a
-    # full generation for whoever sent it.
+    job_input = job.get("input") or {}
     session_id = job_input.get("session_id")
-
-    # =====================================================================
-    # TEST SITE ONLY - DO NOT PORT TO PRODUCTION.
-    # The one exception to session-only: a standalone upscale job (test
-    # page "Upscale a video"), so it runs on its own worker without a GPU
-    # session or H3. It runs OUTSIDE session billing - anyone holding the
-    # RunPod API key can send it - so production must not copy this as is;
-    # an upscale there needs its own charge against the user's balance.
-    # See MERGE_NOTES.md "Do not port: standalone upscale job".
-    if not session_id and job_input.get("mode") == UPSCALE_MODE:
-        return run_standalone_upscale(job_input)
-    # END TEST SITE ONLY
-    # =====================================================================
-
-    if not session_id:
-        return {"error": "This endpoint only accepts session-mode jobs (session_id required). Start a GPU session first."}
-
-    model = job_input.get("model") or "base"
-    if model not in MODEL_CHOICES:
-        return {"error": f"Unknown model {model!r} - this worker supports {sorted(MODEL_CHOICES)}"}
-    return run_session(session_id, model)
+    # Session mode only. Anyone holding the RunPod API key can send any job
+    # shape, so a request without a real, active session is refused here,
+    # before touching ComfyUI or the GPU.
+    if not isinstance(session_id, str) or not re.fullmatch(UUID_RE, session_id):
+        return {"error": "This endpoint only accepts GPU sessions started by the website."}
+    return run_session(session_id)
 
 
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
