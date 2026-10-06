@@ -50,6 +50,14 @@ centre-cropped to the output canvas. Reference videos must be 24fps and
 <=15.5s (probed with PyAV). Face-refine sources must be the owner's own Wasabi
 video of kind generate/refine (`refine_source_allowed`).
 
+**Free trial**: `gpu_sessions.is_trial` (read once at session start, never
+from the job) makes `validate_job` refuse face fix, motion swap, start/end
+frames and more than 2 pictures, force upscale off and clamp the length to
+3s; the job's own `is_trial` stamp (added by the database trigger) must
+agree. Every trial video gets the `assets/watermark.png` "Bizzle Studio"
+mark burned in bottom-right (`apply_watermark`, PyAV + Pillow, audio
+copied); if that fails the job fails rather than upload an unmarked video.
+
 What the worker decides (never the user):
 
 | Job | Model | LoRA | Steps | Size | Upscale |

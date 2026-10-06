@@ -170,6 +170,14 @@ REF_VIDEO_MAX_SECONDS = 15.5  # H3's trained range tops out at 15s
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 OUTPUT_KEY_RE = re.compile(rf"^{UUID_RE}\.mp4$")
 
+# Free trial (gpu_sessions.is_trial, set by server.js at session start — never
+# taken from the job): generate only, at most 3s and 2 pictures, no start/end
+# frames, no motion swap, no upscale, no face fix, and a burned-in watermark.
+# server.js and the job-input trigger enforce the same rules first.
+TRIAL_MAX_DURATION = 3.0
+TRIAL_MAX_PICTURES = 2
+WATERMARK_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "watermark.png")
+
 GENERATE_FIELDS = {"v", "mode", "prompt", "aspect", "duration", "speed", "seed", "upscale",
                    "ref_images", "start_frame", "end_frame", "ref_video", "is_trial"}
 REFINE_FIELDS = {"v", "mode", "source_video_key", "seed", "is_trial"}
@@ -364,7 +372,7 @@ def resolve_seed(raw):
     return raw
 
 
-def validate_job(job_input, owner_id):
+def validate_job(job_input, owner_id, is_trial=False):
     """Whitelists and normalises a gpu_session_jobs.input. server.js already
     did all of this before inserting; repeated here because the table can be
     written by other paths (a direct insert under RLS before the cutover
@@ -377,11 +385,16 @@ def validate_job(job_input, owner_id):
         raise JobRejected("Session owner unknown")
     if job_input.get("v") != JOB_VERSION:
         raise JobRejected("This job was made for an older version of the site - refresh the page and try again")
-    if job_input.get("is_trial") not in (None, False):
-        raise JobRejected("Trial jobs are not supported")
+    # is_trial is stamped by the job-input trigger from the session row; the
+    # worker uses its own read of the session (is_trial argument) and only
+    # requires the stamp to agree.
+    if job_input.get("is_trial") not in (None, False, True) or bool(job_input.get("is_trial")) != bool(is_trial):
+        raise JobRejected("This job doesn't match its session")
     mode = job_input.get("mode")
 
     if mode == "face_refine":
+        if is_trial:
+            raise JobRejected("Fix faces is a subscriber feature")
         unknown = set(job_input) - REFINE_FIELDS
         if unknown:
             raise JobRejected(f"Unknown fields: {', '.join(sorted(unknown))}")
@@ -443,6 +456,16 @@ def validate_job(job_input, owner_id):
             raise JobRejected("Start/end frames can't be combined with a motion swap")
         upscale = False  # off for motion swaps for now (user, 2026-10-06)
 
+    if is_trial:
+        if ref_video is not None:
+            raise JobRejected("Motion swap is a subscriber feature")
+        if frames:
+            raise JobRejected("Start/end frames are a subscriber feature")
+        if len(ref_images) > TRIAL_MAX_PICTURES:
+            raise JobRejected(f"The free trial allows up to {TRIAL_MAX_PICTURES} reference pictures")
+        upscale = False
+        duration = min(duration, TRIAL_MAX_DURATION)
+
     return {
         "mode": "generate",
         "prompt": prompt,
@@ -455,7 +478,70 @@ def validate_job(job_input, owner_id):
         "start_frame": frames.get("start_frame"),
         "end_frame": frames.get("end_frame"),
         "ref_video": ref_video,
+        "trial": bool(is_trial),
     }
+
+
+def apply_watermark(raw_bytes):
+    """Burns the free-trial "Bizzle Studio" mark into the bottom-right corner
+    of every frame (PyAV + Pillow; audio copied untouched). Returns the new
+    MP4 bytes. Raises on any failure: an unmarked trial video must never be
+    uploaded (fail closed)."""
+    import av
+    from PIL import Image
+    work = os.path.join(OUTPUT_DIR, f"wm_{uuid.uuid4().hex}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    src, dst = work + "_in.mp4", work + "_out.mp4"
+    try:
+        with open(src, "wb") as f:
+            f.write(raw_bytes)
+        mark = Image.open(WATERMARK_PATH).convert("RGBA")
+        with av.open(src) as inp:
+            vin = inp.streams.video[0]
+            w, h = vin.codec_context.width, vin.codec_context.height
+            # About 28% of the frame width at most (the PNG is 376px wide).
+            scale = min(1.0, (w * 0.28) / mark.width)
+            if scale < 1.0:
+                mark = mark.resize((max(1, round(mark.width * scale)), max(1, round(mark.height * scale))), Image.LANCZOS)
+            margin = max(8, round(min(w, h) * 0.03))
+            pos = (w - mark.width - margin, h - mark.height - margin)
+            fps = vin.average_rate or 24
+            ain = inp.streams.audio[0] if inp.streams.audio else None
+            with av.open(dst, mode="w") as out:
+                vout = out.add_stream("libx264", rate=fps)
+                vout.width, vout.height, vout.pix_fmt = w, h, "yuv420p"
+                vout.options = {"crf": "18", "preset": "medium"}
+                aout = out.add_stream_from_template(ain) if ain is not None else None
+                frames = 0
+                for packet in inp.demux(*([vin] + ([ain] if ain is not None else []))):
+                    if packet.stream is ain:
+                        if packet.dts is None:
+                            continue
+                        packet.stream = aout
+                        out.mux(packet)
+                        continue
+                    for frame in packet.decode():
+                        img = frame.to_image().convert("RGBA")
+                        img.alpha_composite(mark, dest=pos)
+                        new = av.VideoFrame.from_image(img.convert("RGB")).reformat(format="yuv420p")
+                        new.pts, new.time_base = frame.pts, frame.time_base
+                        for p in vout.encode(new):
+                            out.mux(p)
+                        frames += 1
+                for p in vout.encode():
+                    out.mux(p)
+        if frames == 0:
+            raise RuntimeError("no frames")
+        with open(dst, "rb") as f:
+            return f.read()
+    except Exception as e:
+        raise RuntimeError(f"The free-trial watermark could not be applied ({type(e).__name__})")
+    finally:
+        for path in (src, dst):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def job_kind(job):
@@ -1008,11 +1094,15 @@ def run_generation(job, report, should_cancel=None, should_force_kill=None, load
         if result.get("cancelled"):
             return {"cancelled": True}, model
         report({"stage": "Saving"})
-        video_key = upload_result_and_get_key(fetch_output_video(result))
+        raw = fetch_output_video(result)
+        if job.get("trial"):
+            raw = apply_watermark(raw)
+        video_key = upload_result_and_get_key(raw)
         return {
             "videoKey": video_key,
             "storage": "wasabi",
             "kind": job_kind(job),
+            "trial": bool(job.get("trial")),
             "seed": job["seed"],
             "width": width * (2 if job["upscale"] else 1),
             "height": height * (2 if job["upscale"] else 1),
@@ -1269,7 +1359,7 @@ def run_face_refine(job, owner_id, report, should_cancel=None, should_force_kill
 # --- Session state (production tables) -------------------------------------
 
 def get_session_owner(session_id):
-    rows = sb_get("gpu_sessions", {"id": f"eq.{session_id}", "select": "user_id,ended_at"})
+    rows = sb_get("gpu_sessions", {"id": f"eq.{session_id}", "select": "user_id,ended_at,is_trial"})
     if not rows:
         return None
     return rows[0]
@@ -1433,6 +1523,7 @@ def run_session(session_id):
         print(f"Session {session_id}: not an active session - refusing.")
         return ended("not_active")
     owner_id = owner["user_id"]
+    is_trial = bool(owner.get("is_trial"))
     mark_session_execution_started(session_id)
 
     # Heartbeat through startup too: a first boot on a fresh volume (Sage
@@ -1521,7 +1612,7 @@ def run_session(session_id):
             try:
                 if job_row.get("user_id") != owner_id or job_row.get("session_id") != session_id:
                     raise JobRejected("This job does not belong to this session")
-                job = validate_job(job_row.get("input"), owner_id)
+                job = validate_job(job_row.get("input"), owner_id, is_trial)
                 # Stop GPU / out of credit / reaper mid-job: the session is
                 # over, so kill the generation now rather than finishing it.
                 kwargs = {

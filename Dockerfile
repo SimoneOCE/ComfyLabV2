@@ -144,6 +144,8 @@ RUN python -c "import torch, cv2; print('torch', torch.__version__, '| cv2', cv2
 
 COPY comfyui_engine ./comfyui_engine
 COPY handler.py .
+# Free-trial watermark (handler.py apply_watermark).
+COPY assets ./assets
 COPY test_input.json .
 
 # websocket-client: step progress from ComfyUI's websocket (handler.py

@@ -34,6 +34,10 @@ below:
   billed, from the moment a worker picks up the session job (worker startup,
   model loads, warmup and swaps included); only queue time is free.
 
+- Free trial (from the koboldcpp-era `claude/nice-galileo-miba75` branches,
+  2026-10-06): 10-minute one-time grant, 3s / 2 pictures, no frames / motion
+  swap / upscale / face fix, watermark burned in by the worker.
+
 **Rejected / not ported**
 - Standalone upscale job and the upscale-only session job (no billing path).
 - All test-page pickers: model, engine, attention, blind A/B, LoRA list, H3
