@@ -1548,6 +1548,25 @@ def run_upscale_only(job_input, should_cancel=None, should_force_kill=None, repo
     }
 
 
+# =====================================================================
+# TEST SITE ONLY - DO NOT PORT TO PRODUCTION (see handler()).
+def run_standalone_upscale(job_input):
+    """A one-off RunPod job with no GPU session: starts ComfyUI, upscales,
+    returns. Loads only the RTX VSR node - no H3 - and needs no warmup."""
+    start = time.time()
+    try:
+        ensure_comfyui_engine()
+        symlink_models_to_volume()
+        start_comfyui_if_needed()
+        result = run_upscale_only(job_input, report_stage=print)
+    except Exception as e:
+        return {"error": str(e)}
+    result["total_seconds"] = round(time.time() - start, 1)
+    return result
+# END TEST SITE ONLY
+# =====================================================================
+
+
 def is_h3_refine_job(job_row):
     job_input = (job_row or {}).get("input") or {}
     return (job_input.get("mode") == REFINE_MODE
@@ -2165,6 +2184,20 @@ def handler(job):
     # before touching ComfyUI or the GPU, rather than silently running a
     # full generation for whoever sent it.
     session_id = job_input.get("session_id")
+
+    # =====================================================================
+    # TEST SITE ONLY - DO NOT PORT TO PRODUCTION.
+    # The one exception to session-only: a standalone upscale job (test
+    # page "Upscale a video"), so it runs on its own worker without a GPU
+    # session or H3. It runs OUTSIDE session billing - anyone holding the
+    # RunPod API key can send it - so production must not copy this as is;
+    # an upscale there needs its own charge against the user's balance.
+    # See MERGE_NOTES.md "Do not port: standalone upscale job".
+    if not session_id and job_input.get("mode") == UPSCALE_MODE:
+        return run_standalone_upscale(job_input)
+    # END TEST SITE ONLY
+    # =====================================================================
+
     if not session_id:
         return {"error": "This endpoint only accepts session-mode jobs (session_id required). Start a GPU session first."}
 

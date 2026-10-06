@@ -703,3 +703,20 @@ encoder), runs LoadVideo -> GetVideoComponents -> RTX VSR (ULTRA) ->
 CreateVideo (original audio) -> NVENC save, then the session loop reloads H3
 with the warmup as after an H3 refine. Limits: output <= 3840x2160 pixels per
 frame, video <= 15.5s. Works in any session model. Not yet run on a GPU.
+
+## Do not port: standalone upscale job (TEST SITE ONLY, 2026-10-06)
+
+The test page's "Upscale a video" button sends its own RunPod job
+(`{mode: "upscale", video_key, upscale_scale}`, no `session_id`) instead of
+using the GPU session. `handler()` lets exactly that one job shape through
+without a session (`run_standalone_upscale`); everything else is still
+refused. Both sides are fenced with "TEST SITE ONLY - DO NOT PORT TO
+PRODUCTION" comments (handler.py: `handler()` and `run_standalone_upscale`;
+test/index.html: the section and `runUpscaleOnly`).
+Why it must not be ported as is: it runs outside session billing, so anyone
+with the RunPod API key gets free GPU time. If production wants an upscale,
+it needs its own metering (charge the job's GPU seconds to the user's
+balance, server-side) or must run inside the user's session.
+The shared pieces are fine to port: `run_upscale_only` (frees H3, RTX VSR,
+keeps audio, 4K/15.5s limits), `download_input_video`, and the session-mode
+`mode: "upscale"` job (H3 reloaded after it), which stays metered.

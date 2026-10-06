@@ -184,11 +184,14 @@
 
   <button id="submitBtn" onclick="runJob()">Run Generation</button>
 
+  <!-- TEST SITE ONLY - DO NOT PORT TO PRODUCTION: runs outside session billing (see runUpscaleOnly). -->
   <h2>Upscale a video</h2>
   <p style="color:#888; font-size:0.85rem;">
-    Upload any video (15s or shorter) and upscale it with RTX Video Super Resolution on the GPU
-    session above. The original audio is kept. H3 is unloaded for the upscale and reloaded after
-    it, so the next generation starts normally. Output is capped at 4K (3840x2160 pixels).
+    Upload any video (15s or shorter) and upscale it with RTX Video Super Resolution. Runs as its own
+    RunPod job - no GPU session needed, and H3 isn't loaded. Needs the endpoint ID, API key and S3
+    keys above. If a GPU session is running and the endpoint only allows one worker, this waits in
+    RunPod's queue until the session ends. The original audio is kept. Output is capped at 4K
+    (3840x2160 pixels).
   </p>
   <label>Video to upscale <input id="upscaleOnlyVideo" type="file" accept="video/*" /></label>
   <label>Scale
@@ -973,17 +976,20 @@ document.getElementById('clearFrames').addEventListener('click', () => {
   for (const id of ['startFramePreview', 'endFramePreview']) document.getElementById(id).innerHTML = '';
 });
 
+// =====================================================================
+// TEST SITE ONLY - DO NOT PORT TO PRODUCTION. A standalone RunPod job with
+// no GPU session (the worker's one session-less exception, see handler.py
+// handler()) - it runs outside session billing. MERGE_NOTES.md "Do not
+// port: standalone upscale job".
 async function runUpscaleOnly() {
   const btn = document.getElementById('upscaleOnlyBtn');
   const statusEl = document.getElementById('status');
   document.getElementById('resultVideo').style.display = 'none';
   document.getElementById('downloadLinkWrap').innerHTML = '';
-  if (!sessionId) {
-    statusEl.textContent = 'No active GPU session - click "Run GPU" first.';
-    return;
-  }
-  if (!sessionReady) {
-    statusEl.textContent = 'GPU session is still starting - wait for "Session ready" before upscaling.';
+  const endpointId = document.getElementById('endpointId').value.trim();
+  const apiKey = document.getElementById('apiKey').value.trim();
+  if (!endpointId || !apiKey) {
+    statusEl.textContent = 'Fill in the RunPod endpoint ID and API key first.';
     return;
   }
   const file = document.getElementById('upscaleOnlyVideo').files[0];
@@ -995,19 +1001,48 @@ async function runUpscaleOnly() {
   try {
     statusEl.textContent = 'Uploading the video...';
     const videoKey = await uploadRefVideo(file);
-    statusEl.textContent = 'Queuing the upscale on held-open session worker...';
-    const resultKey = await runSessionJob({
-      mode: 'upscale',
-      video_key: videoKey,
-      upscale_scale: Number(document.getElementById('upscaleOnlyScale').value),
-    }, statusEl);
-    if (resultKey) await handleVideoKey(resultKey);
+    const runResp = await fetch(`https://api.runpod.ai/v2/${endpointId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({ input: {
+        mode: 'upscale',
+        video_key: videoKey,
+        upscale_scale: Number(document.getElementById('upscaleOnlyScale').value),
+      } }),
+    });
+    const runData = await runResp.json();
+    if (!runData.id) throw new Error(`RunPod /run failed: ${JSON.stringify(runData)}`);
+    const sent = Date.now();
+    while (true) {
+      await new Promise(r => setTimeout(r, 3000));
+      const st = await (await fetch(`https://api.runpod.ai/v2/${endpointId}/status/${runData.id}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+      })).json();
+      const waited = ((Date.now() - sent) / 1000).toFixed(0);
+      statusEl.textContent = `Upscale job ${runData.id} - ${st.status} (${waited}s; IN_QUEUE means it's waiting for a free worker)`;
+      if (st.status === 'COMPLETED') {
+        const out = st.output || {};
+        if (out.error || !out.videoKey) {
+          statusEl.textContent += `\n\n${JSON.stringify(out, null, 2)}`;
+          return;
+        }
+        statusEl.textContent += `\n\nDone. ${JSON.stringify(out, null, 2)}`;
+        await handleVideoKey(out.videoKey);
+        return;
+      }
+      if (['FAILED', 'CANCELLED', 'TIMED_OUT'].includes(st.status)) {
+        statusEl.textContent += `\n\n${JSON.stringify(st, null, 2)}`;
+        return;
+      }
+    }
   } catch (err) {
     statusEl.textContent = `Error: ${err.message}`;
   } finally {
     btn.disabled = false;
   }
 }
+// END TEST SITE ONLY
+// =====================================================================
 
 async function runRefine() {
   const btn = document.getElementById('refineBtn');
