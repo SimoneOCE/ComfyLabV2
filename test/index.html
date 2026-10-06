@@ -502,11 +502,49 @@ async function pollUntilWorkerStarted() {
       sessionReady = true;
       setGpuSessionStatus(`Session ready (started ${new Date(claim.worker_started_at).toLocaleTimeString()}). Run Generation now uses this held-open worker.`);
       updateGpuSessionButton();
+      watchSessionEnd();
       return;
     }
     setGpuSessionStatus('Starting... (ComfyUI booting + warmup generation on the worker)');
     await new Promise(r => setTimeout(r, 2000));
   }
+}
+
+// Notices a session the worker ended on its own (idle timeout, safety
+// cutoff, crash) or that was stopped from another tab - otherwise the page
+// kept showing "Stop GPU" for a session that no longer existed.
+let sessionEndWatchHandle = null;
+const SESSION_END_MESSAGES = {
+  timeout: 'Session ended: idle timeout (no jobs for 10 minutes).',
+  safety_timeout: 'Session ended: hit the 23-hour safety cutoff.',
+  error: 'Session ended: worker error. Check RunPod logs.',
+  manual: 'Session stopped.',
+};
+function watchSessionEnd() {
+  if (sessionEndWatchHandle) clearInterval(sessionEndWatchHandle);
+  const watched = sessionId;
+  sessionEndWatchHandle = setInterval(async () => {
+    if (!sessionId || sessionId !== watched) {
+      clearInterval(sessionEndWatchHandle);
+      sessionEndWatchHandle = null;
+      return;
+    }
+    try {
+      const rows = await sbRequest('GET', 'comfylab_gpu_sessions', {
+        params: { id: `eq.${watched}`, select: 'ended_at,end_reason' },
+      });
+      const row = rows[0];
+      if (!row || !row.ended_at) return;
+      clearInterval(sessionEndWatchHandle);
+      sessionEndWatchHandle = null;
+      if (sessionId !== watched) return;
+      sessionId = null;
+      sessionReady = false;
+      updateGpuSessionButton();
+      setGpuSessionStatus(SESSION_END_MESSAGES[row.end_reason] ||
+        `Session ended (${row.end_reason || 'unknown reason'}).`);
+    } catch (e) { /* network blip - try again next tick */ }
+  }, 10000);
 }
 
 function updateGpuSessionButton() {
@@ -626,6 +664,7 @@ async function toggleGpuSession() {
     if (claim.worker_started_at) {
       sessionReady = true;
       setGpuSessionStatus(`Reconnected to session ${sessionId} (already ready).`);
+      watchSessionEnd();
     } else {
       setGpuSessionStatus('Reconnecting to existing session...');
       pollUntilWorkerStarted();
