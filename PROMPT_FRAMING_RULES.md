@@ -166,3 +166,114 @@ say the crowd is out of focus, turned away or in silhouette.
 
 Update this table after every framing test, and promote rules from
 [hypothesis] to [tested] (or drop them) based on what we see.
+
+## Motion swap prompts (Ref2VA: reference video + picture)
+
+Rules for the motion swap / character swap (a reference video `<Video 1>`, one
+picture per new person `<Picture N>`, the video's soundtrack `<Audio 1>`).
+Learned on the worker, Ref2VA with the 4-step and 8-step turbo, 2026-10-05/06
+(rap clips, Albanese/Hanson, IShowSpeed in Thriller). Every free-form attempt
+at the Thriller swap came back as the original performer; the official format
+plus a full-body swap worked first time.
+
+### S1. Use MiniMax's official full-reference format [tested]
+
+Ref2VA was trained on prompts in MiniMax's six-section format
+(MiniMaxAI/MiniMax-H3 `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`). Free-form
+paragraphs ("use <Video 1> as the guide... match the exact movements and
+framing") made it copy <Video 1> wholesale. The enhancer should always output:
+
+- `subject_definitions:` - `<Video 1> is the source video for the target
+  video edit.`; one `<Subject N>` line per person, pointing at their picture;
+  `<Audio 1> is the synchronized audio track of <Video 1> and is reused in the
+  target video.`
+- `summary:` - starts `[video editing + reference generation + audio reuse]
+  The target video is an edited version of <Video 1>.`
+- `retention_analysis:` - one line per label with the fixed markers:
+  `fully_preserved`, `partially_preserved`, `attribute_transfer`,
+  `weak_reference`; audio `fully_copy`.
+- `detailed_description:` - one style sentence, then `[Shot 1] ...`, later
+  shots `[Shot N] At MM:SS.mmm, ...`, citing the labels where they apply.
+- `overall_soundscape:` and `non_diegetic_music:`.
+
+### S2. Swap the whole person, not just the face [tested]
+
+Take only the choreography, position and camera move from the video. The new
+person keeps their own face, hair, skin and clothes from their picture
+(`fully_preserved`), and the video's performer is "replaced in full".
+Face-only swaps that keep the original's outfit or hair let the original win
+(Thriller came back as MJ; Hanson kept the rapper's hands).
+
+### S3. Don't describe other people's looks [tested]
+
+Background people are only "kept exactly as they appear in <Video 1>".
+Describing the zombies' decaying skin and makeup next to the lead painted it
+onto the swapped person.
+
+### S4. Let the picture carry the identity [tested]
+
+Don't re-describe what the picture already shows (hair). Add only what
+fights the original: the person's skin tone when the original performer has
+makeup or a very different skin tone, and the clothes visible in the
+picture. Refer to the person as "the young man from <Picture 1>" / their
+`<Subject N>` label, tied to the picture every time.
+
+### S5. Positive wording only [tested]
+
+Describe what should be there. "No sunglasses", "low quality", "grainy",
+"no new speech or sounds" pulled in the very thing named (the last one froze
+every mouth in a rap swap).
+
+### S6. Singing, rapping, lip-sync [tested]
+
+Say who performs and tie it to `<Audio 1>` ("Only <Subject 2> raps the
+lyrics of <Audio 1>"); give the non-performer "mouth closed" in the shot
+lines. "Rapping" after two names made both rap.
+
+### S7. Restate the swapped people in every shot line [tested]
+
+On long multi-shot clips, people named only once reverted to the originals
+near the end.
+
+### Settings that go with it [tested]
+
+- 24fps reference, duration at most 15.0s (H3 rounds frames up; 15.17s
+  became 379 frames, past its 362-frame training range).
+- Output the same shape as the reference (640x480 source -> 1024x768).
+- Ref2VA 4-step turbo is enough when the prompt is right (~4.3 min for 15s
+  at 1024x768); 8-step turbo ~7.7 min; no turbo ~26 min.
+- One clear, front-facing, well-lit picture per person is enough.
+
+### Template (the Thriller prompt that worked)
+
+```
+subject_definitions:
+<Video 1> is the source video for the target video edit.
+<Subject 1> is the young man in <Picture 1>, exactly as he appears in <Picture 1>: his own face, his own hair, his smooth dark brown skin, and his own outfit from <Picture 1>, the black leather jacket over a black T-shirt with a diamond chain and pendant. He replaces the whole lead dancer of <Video 1> and performs that dancer's choreography in that dancer's position.
+<Subject 2> is the group of background dancers in <Video 1>, kept exactly as they appear in <Video 1>.
+<Audio 1> is the synchronized audio track of <Video 1> and is reused in the target video.
+
+summary:
+[video editing + reference generation + audio reuse] The target video is an edited version of <Video 1>. The lead dancer of <Video 1> is replaced in full by <Subject 1>, the young man from <Picture 1>, with his own appearance and outfit, and the original street is replaced by a rain-soaked neon city street at night. <Subject 1> leads <Subject 2> through the same dance, with the same camera move and timing as <Video 1>, while <Audio 1> is reused as the soundtrack.
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - the young man from <Picture 1> keeps his face, hair, smooth dark brown skin, outfit and full identity, and takes the lead dancer's place and choreography from <Video 1>.
+<Subject 2> (appears in [Shot 1]): fully_preserved - the background dancers, their positions and their synchronized moves are kept as in <Video 1>.
+<Video 1> (choreography, camera movement and timing): partially_preserved - the dance, the camera pull-back and the timing are kept; the lead dancer is replaced in full by <Subject 1> and the street environment is replaced.
+<Audio 1>: fully_copy - <Audio 1> is reused 1:1 as the target video's complete final audio track.
+
+detailed_description:
+The target video is a sharp, modern, photorealistic high-definition music video with moody cinematic night lighting and saturated neon colour.
+[Shot 1] The shot opens on a medium close-up of <Subject 1>, the young man from <Picture 1>, looking exactly as he does in <Picture 1>, with his smooth dark brown skin, wearing his black leather jacket over a black T-shirt with his diamond chain. He walks toward the camera down a rain-soaked neon city street at night, pink and blue neon signs glowing behind him and reflecting on the wet asphalt, with <Subject 2> following behind him as in <Video 1>. As in <Video 1>, the camera slowly pulls back into a wide shot, revealing <Subject 1> at the front of the formation, leading <Subject 2> through the dance step for step: sharp shoulder isolations, claw-hand gestures, side steps and hip thrusts, every move on the beat of <Audio 1>. Steam rises from street vents and light fog hangs at ground level. <Subject 1> looks exactly like the young man in <Picture 1> from the first frame to the last.
+
+overall_soundscape:
+Footsteps on wet asphalt and the city ambience within <Audio 1> continue throughout.
+
+non_diegetic_music:
+<Audio 1> is directly reused as the complete soundtrack.
+```
+
+For the enhancer: the user should only have to say who replaces whom and
+what changes ("swap the lead for Picture 1, new background: neon street");
+the enhancer writes the six sections, a shot list from the reference video's
+cuts, and applies S2-S7.

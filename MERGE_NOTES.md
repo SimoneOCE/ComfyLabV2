@@ -642,6 +642,8 @@ fal ~$0.90; this worker ~$0.70 (20 steps, GPU time) / ~$0.16 (4-step turbo).
 
 ## Motion-swap prompt rules, for a future prompt enhancer (user, 2026-10-06)
 
+Full version with the template: PROMPT_FRAMING_RULES.md, "Motion swap prompts".
+
 Learned on the Thriller test (Ref2VA, 4-step turbo, one picture of the new
 person, 640x480 reference video). The prompt that worked is the last one
 below; every earlier one came back as the original performer.
