@@ -488,11 +488,21 @@ def download_input_video(video_key, prefix):
         if not c.streams.video:
             raise ValueError("The uploaded video has no video stream")
         v = c.streams.video[0]
+        fps = float(v.average_rate or 0)
+        # The picture's own length, not the container's (a soundtrack can
+        # run past the frames): frame count / fps, then the stream's own
+        # duration, then the container's as a last resort.
+        if v.frames and fps:
+            seconds = v.frames / fps
+        elif v.duration and v.time_base:
+            seconds = float(v.duration * v.time_base)
+        else:
+            seconds = float(c.duration / av.time_base) if c.duration else 0.0
         info = {
             "width": v.codec_context.width,
             "height": v.codec_context.height,
-            "fps": float(v.average_rate or 0),
-            "seconds": float(c.duration / av.time_base) if c.duration else 0.0,
+            "fps": fps,
+            "seconds": seconds,
             "has_audio": bool(c.streams.audio),
         }
     return filename, info
@@ -1494,7 +1504,9 @@ UPSCALE_MODE = "upscale"
 # untested. 4096 per side is also NVENC H.264's limit.
 UPSCALE_MAX_OUTPUT_PIXELS = 4096 * 3200
 UPSCALE_MAX_SIDE = 4096
-UPSCALE_MAX_SECONDS = 15.5
+# H3's 17n+5 frame snap rounds UP, so a "15.17s" generation is 379 frames
+# (15.8s) - the worker's own outputs must pass.
+UPSCALE_MAX_SECONDS = 16.0
 
 
 def is_upscale_job(job_row):

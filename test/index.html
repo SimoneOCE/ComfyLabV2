@@ -187,7 +187,7 @@
   <!-- TEST SITE ONLY - DO NOT PORT TO PRODUCTION: runs outside session billing (see runUpscaleOnly). -->
   <h2>Upscale a video</h2>
   <p style="color:#888; font-size:0.85rem;">
-    Upload any video (15s or shorter) and upscale it with RTX Video Super Resolution. Runs as its own
+    Upload any video (16s or shorter) and upscale it with RTX Video Super Resolution. Runs as its own
     RunPod job - no GPU session needed, and H3 isn't loaded. Needs the endpoint ID, API key and S3
     keys above. If a GPU session is running and the endpoint only allows one worker, this waits in
     RunPod's queue until the session ends. The original audio is kept. Output is capped at 4096px per side
@@ -960,9 +960,13 @@ document.getElementById('refVideo').addEventListener('change', () => {
       info.textContent = `${secs.toFixed(2)}s - too long, trim it to 15s or less.`;
       return;
     }
-    document.getElementById('duration').value = secs.toFixed(2);
+    // Capped at 15.0: H3 rounds the frame count UP to its 17n+5 grid, and
+    // 362 frames (15.08s) is its trained maximum - 15.17s became 379 frames.
+    const dur = Math.min(secs, 15);
+    document.getElementById('duration').value = dur.toFixed(2);
     info.style.color = '#9c9';
-    info.textContent = `${secs.toFixed(2)}s - duration set to match. Make sure it's 24fps.`;
+    info.textContent = `${secs.toFixed(2)}s - duration set to ${dur.toFixed(2)}s` +
+      (secs > 15 ? ' (H3 max; the end of the video is not used).' : '.') + " Make sure it's 24fps.";
   };
   v.onerror = () => { info.textContent = 'The browser could not read this video (it can still be uploaded).'; };
   v.src = URL.createObjectURL(file);

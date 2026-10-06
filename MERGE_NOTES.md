@@ -702,7 +702,7 @@ by the page) and `upscale_scale` 2/4: frees ComfyUI memory (H3 + text
 encoder), runs LoadVideo -> GetVideoComponents -> RTX VSR (ULTRA) ->
 CreateVideo (original audio) -> NVENC save, then the session loop reloads H3
 with the warmup as after an H3 refine. Limits: output <= 4096px per side and 4096x3200
-pixels per frame (raised from 4K for 4x on 1024x784), video <= 15.5s. Works in any session model. Not yet run on a GPU.
+pixels per frame (raised from 4K for 4x on 1024x784), video <= 16s (H3 outputs snap up to 15.8s). Works in any session model. Not yet run on a GPU.
 
 ## Do not port: standalone upscale job (TEST SITE ONLY, 2026-10-06)
 
@@ -718,5 +718,5 @@ with the RunPod API key gets free GPU time. If production wants an upscale,
 it needs its own metering (charge the job's GPU seconds to the user's
 balance, server-side) or must run inside the user's session.
 The shared pieces are fine to port: `run_upscale_only` (frees H3, RTX VSR,
-keeps audio, 4096px-side / 13.1MP and 15.5s limits), `download_input_video`, and the session-mode
+keeps audio, 4096px-side / 13.1MP and 16s limits), `download_input_video`, and the session-mode
 `mode: "upscale"` job (H3 reloaded after it), which stays metered.
