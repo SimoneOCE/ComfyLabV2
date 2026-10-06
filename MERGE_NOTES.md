@@ -739,3 +739,17 @@ keeps audio, 4096px-side / 13.1MP and 16s limits), `download_input_video`, and t
   CPU-encoded.
 - Each fresh worker builds the nvidia-vfx wheel at boot (part of the ~60s
   cold start); could be baked into the image.
+
+## Result: reference images work on base (user, 2026-10-06)
+
+Base (FL2VA) session, one reference picture (IShowSpeed photo), no reference
+video, run through MiniMaxH3ReferenceToVideo with base's weights, official
+full-reference prompt format ([reference generation], <Subject 1> from
+<Picture 1>, fully_preserved): user rated it "pretty good" - he was
+recognisable. My earlier claim that base "probably won't follow the
+pictures" was a guess and was wrong. Likely why: the text encoder is a
+vision-language model (Qwen3-VL) and sees the picture directly, and base
+shares Ref2VA's architecture.
+Plan update (pending a few more pictures / an optional same-seed comparison
+with Ref2VA): reference images stay on base with no model swap; Ref2VA only
+for motion swap (reference video).
