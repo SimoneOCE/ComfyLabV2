@@ -184,6 +184,21 @@
 
   <button id="submitBtn" onclick="runJob()">Run Generation</button>
 
+  <h2>Upscale a video</h2>
+  <p style="color:#888; font-size:0.85rem;">
+    Upload any video (15s or shorter) and upscale it with RTX Video Super Resolution on the GPU
+    session above. The original audio is kept. H3 is unloaded for the upscale and reloaded after
+    it, so the next generation starts normally. Output is capped at 4K (3840x2160 pixels).
+  </p>
+  <label>Video to upscale <input id="upscaleOnlyVideo" type="file" accept="video/*" /></label>
+  <label>Scale
+    <select id="upscaleOnlyScale">
+      <option value="2" selected>2x</option>
+      <option value="4">4x (small videos only)</option>
+    </select>
+  </label>
+  <button id="upscaleOnlyBtn" onclick="runUpscaleOnly()">Upscale</button>
+
   <h2>Refine faces (post-generation)</h2>
   <p style="color:#888; font-size:0.85rem;">
     Re-draws small faces in a video you already generated: each person's face is tracked and cropped
@@ -957,6 +972,42 @@ document.getElementById('clearFrames').addEventListener('click', () => {
   for (const id of ['startFrame', 'endFrame']) document.getElementById(id).value = '';
   for (const id of ['startFramePreview', 'endFramePreview']) document.getElementById(id).innerHTML = '';
 });
+
+async function runUpscaleOnly() {
+  const btn = document.getElementById('upscaleOnlyBtn');
+  const statusEl = document.getElementById('status');
+  document.getElementById('resultVideo').style.display = 'none';
+  document.getElementById('downloadLinkWrap').innerHTML = '';
+  if (!sessionId) {
+    statusEl.textContent = 'No active GPU session - click "Run GPU" first.';
+    return;
+  }
+  if (!sessionReady) {
+    statusEl.textContent = 'GPU session is still starting - wait for "Session ready" before upscaling.';
+    return;
+  }
+  const file = document.getElementById('upscaleOnlyVideo').files[0];
+  if (!file) {
+    statusEl.textContent = 'Choose a video to upscale.';
+    return;
+  }
+  btn.disabled = true;
+  try {
+    statusEl.textContent = 'Uploading the video...';
+    const videoKey = await uploadRefVideo(file);
+    statusEl.textContent = 'Queuing the upscale on held-open session worker...';
+    const resultKey = await runSessionJob({
+      mode: 'upscale',
+      video_key: videoKey,
+      upscale_scale: Number(document.getElementById('upscaleOnlyScale').value),
+    }, statusEl);
+    if (resultKey) await handleVideoKey(resultKey);
+  } catch (err) {
+    statusEl.textContent = `Error: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
 
 async function runRefine() {
   const btn = document.getElementById('refineBtn');

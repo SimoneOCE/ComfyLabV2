@@ -694,3 +694,12 @@ detailed_description, overall_soundscape, non_diegetic_music.
   shot line or they revert near the end of long clips.
 - Turbo: the 4-step Ref2VA turbo is fine for swaps when the prompt is right;
   the official guide still recommends 20 steps for reference-heavy work.
+
+## Built: upscale-only job (test page "Upscale a video", 2026-10-06)
+
+Session job `mode: "upscale"` with `video_key` (uploaded to Wasabi `inputs/`
+by the page) and `upscale_scale` 2/4: frees ComfyUI memory (H3 + text
+encoder), runs LoadVideo -> GetVideoComponents -> RTX VSR (ULTRA) ->
+CreateVideo (original audio) -> NVENC save, then the session loop reloads H3
+with the warmup as after an H3 refine. Limits: output <= 3840x2160 pixels per
+frame, video <= 15.5s. Works in any session model. Not yet run on a GPU.

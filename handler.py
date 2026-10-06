@@ -472,27 +472,40 @@ REF_VIDEO_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+\.(mp4|mov|webm|mkv)$")
 REF_VIDEO_MAX_SECONDS = 15.5  # H3's trained range tops out at 15s
 
 
+def download_input_video(video_key, prefix):
+    """Downloads inputs/<video_key> (uploaded by the test page) into
+    ComfyUI's input/ dir and probes it. Returns (input_filename, info) with
+    info = {width, height, fps, seconds, has_audio}."""
+    if not REF_VIDEO_KEY_RE.match(video_key or ""):
+        raise ValueError(f"Bad video key {video_key!r}")
+    import av
+    input_dir = os.path.join(COMFYUI_DIR, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    filename = f"{prefix}_{video_key}"
+    path = os.path.join(input_dir, filename)
+    s3_client.download_file(S3_BUCKET, f"inputs/{video_key}", path)
+    with av.open(path) as c:
+        if not c.streams.video:
+            raise ValueError("The uploaded video has no video stream")
+        v = c.streams.video[0]
+        info = {
+            "width": v.codec_context.width,
+            "height": v.codec_context.height,
+            "fps": float(v.average_rate or 0),
+            "seconds": float(c.duration / av.time_base) if c.duration else 0.0,
+            "has_audio": bool(c.streams.audio),
+        }
+    return filename, info
+
+
 def prepare_ref_video(video_key):
     """Downloads inputs/<video_key> (uploaded by the test page) into
     ComfyUI's input/ dir. Returns (input_filename, has_audio). Refuses a
     video that isn't ~24fps (the node takes frames 1:1 at 24fps, so any other
     rate plays at the wrong speed) or is longer than 15s (its soundtrack is
     also the finished video's, and would run past the generated frames)."""
-    if not REF_VIDEO_KEY_RE.match(video_key or ""):
-        raise ValueError(f"Bad reference video key {video_key!r}")
-    import av
-    input_dir = os.path.join(COMFYUI_DIR, "input")
-    os.makedirs(input_dir, exist_ok=True)
-    filename = f"refvideo_{video_key}"
-    path = os.path.join(input_dir, filename)
-    s3_client.download_file(S3_BUCKET, f"inputs/{video_key}", path)
-    with av.open(path) as c:
-        if not c.streams.video:
-            raise ValueError("The reference video has no video stream")
-        v = c.streams.video[0]
-        fps = float(v.average_rate or 0)
-        seconds = float(c.duration / av.time_base) if c.duration else 0.0
-        has_audio = bool(c.streams.audio)
+    filename, info = download_input_video(video_key, "refvideo")
+    fps, seconds, has_audio = info["fps"], info["seconds"], info["has_audio"]
     if not 23.5 <= fps <= 24.5:
         raise ValueError(f"The reference video is {fps:.2f}fps - export it at 24fps")
     if seconds > REF_VIDEO_MAX_SECONDS:
@@ -1469,6 +1482,72 @@ def free_comfyui_memory(wait_seconds=60):
     print(f"Freed ComfyUI memory: {before / 1e9:.1f}GB -> {last / 1e9:.1f}GB used")
 
 
+# Upscale-only job (test page "Upscale a video" section): RTX VSR on an
+# uploaded video, original audio kept. H3 and its text encoder are unloaded
+# first - nvidia-vfx allocates outside ComfyUI's memory manager, and RTX VSR
+# next to a loaded H3 killed a 15s job on the pod. The session loop reloads
+# H3 afterwards, as after an H3 refine.
+UPSCALE_MODE = "upscale"
+UPSCALE_MAX_OUTPUT_PIXELS = 3840 * 2160   # per frame: 4K UHD
+UPSCALE_MAX_SECONDS = 15.5
+
+
+def is_upscale_job(job_row):
+    return ((job_row or {}).get("input") or {}).get("mode") == UPSCALE_MODE
+
+
+def run_upscale_only(job_input, should_cancel=None, should_force_kill=None, report_stage=None):
+    report_stage = report_stage or (lambda text: None)
+    try:
+        scale = float(job_input.get("upscale_scale", NVIDIA_VSR_SCALE))
+    except (TypeError, ValueError):
+        scale = None
+    if scale not in UPSCALE_SCALES:
+        raise ValueError(f"upscale_scale must be one of {sorted(UPSCALE_SCALES)}, got {job_input.get('upscale_scale')!r}")
+    report_stage("Downloading the video...")
+    filename, info = download_input_video(job_input.get("video_key"), "upscale")
+    out_w, out_h = round(info["width"] * scale), round(info["height"] * scale)
+    if out_w * out_h > UPSCALE_MAX_OUTPUT_PIXELS:
+        raise ValueError(f"{info['width']}x{info['height']} at {scale:g}x would be {out_w}x{out_h} - "
+                         f"above 4K (3840x2160 pixels); use 2x or a smaller video")
+    if info["seconds"] > UPSCALE_MAX_SECONDS:
+        raise ValueError(f"The video is {info['seconds']:.1f}s - trim it to 15s or less")
+    print(f"Upscale: {info['width']}x{info['height']} -> {out_w}x{out_h}, {info['seconds']:.1f}s, "
+          f"{info['fps']:.2f}fps, audio={'yes' if info['has_audio'] else 'no'}.")
+    report_stage("Freeing GPU memory...")
+    free_comfyui_memory()
+    wf = {
+        "u_load": {"class_type": "LoadVideo", "inputs": {"file": filename}},
+        "u_parts": {"class_type": "GetVideoComponents", "inputs": {"video": ["u_load", 0]}},
+        "u_vsr": {"class_type": "RTXVideoSuperResolution", "inputs": {
+            "images": ["u_parts", 0], "resize_type": "scale by multiplier",
+            "resize_type.scale": scale, "quality": NVIDIA_VSR_QUALITY}},
+        "u_create": {"class_type": "CreateVideo", "inputs": {
+            "fps": ["u_parts", 2], "bit_depth": 8, "images": ["u_vsr", 0]}},
+        NODE_IDS["output"]: {"class_type": "ComfyLabSaveVideoNVENC", "inputs": {
+            "filename_prefix": f"video/Upscale_{uuid.uuid4().hex[:12]}",
+            "video": ["u_create", 0]}},
+    }
+    if info["has_audio"]:
+        wf["u_create"]["inputs"]["audio"] = ["u_parts", 1]
+    report_stage(f"Upscaling to {out_w}x{out_h}...")
+    comfy_start = time.time()
+    result = submit_and_wait(wf, should_cancel=should_cancel, should_force_kill=should_force_kill)
+    comfy_seconds = round(time.time() - comfy_start, 1)
+    if result.get("force_killed"):
+        return {"cancelled": True, "force_killed": True}
+    if result.get("cancelled"):
+        return {"cancelled": True}
+    raw_bytes, out_name = fetch_output_video(result)
+    return {
+        "videoKey": upload_result_and_get_key(raw_bytes, out_name),
+        "upscale_scale": scale,
+        "source_size": f"{info['width']}x{info['height']}",
+        "output_size": f"{out_w}x{out_h}",
+        "comfy_seconds": comfy_seconds,
+    }
+
+
 def is_h3_refine_job(job_row):
     job_input = (job_row or {}).get("input") or {}
     return (job_input.get("mode") == REFINE_MODE
@@ -1989,6 +2068,10 @@ def run_session(session_id, model="base"):
                     job_runner = run_face_refine
                     runner_kwargs["report_stage"] = lambda text: set_job_stage(job_row["id"], text)
                     job_input = {"model": model, **(job_row["input"] or {})}
+                elif is_upscale_job(job_row):
+                    job_runner = run_upscale_only
+                    runner_kwargs["report_stage"] = lambda text: set_job_stage(job_row["id"], text)
+                    job_input = dict(job_row["input"] or {})
                 else:
                     job_runner = run_generation
                     # A generation without its own "model" uses the session's.
@@ -2043,9 +2126,9 @@ def run_session(session_id, model="base"):
                 print(f"Session {session_id}: failed to restart after ComfyUI {reason} ({e}) - ending session.")
                 mark_session_ended(session_id, "error")
                 return session_summary("worker_error", last_error=str(e))
-        elif is_h3_refine_job(job_row) and is_comfyui_ready():
-            # The H3 refine unloads H3 and its text encoder before stitching
-            # (see run_face_refine). Load them straight back - after the
+        elif (is_h3_refine_job(job_row) or is_upscale_job(job_row)) and is_comfyui_ready():
+            # The H3 refine and the upscale-only job unload H3 and its text
+            # encoder (see run_face_refine, run_upscale_only). Load them straight back - after the
             # result is already delivered - so the next generation doesn't
             # pay the ~40s reload. Same throwaway warmup as session start.
             try:
@@ -2058,10 +2141,10 @@ def run_session(session_id, model="base"):
                     "steps": 1,
                     "model": model,
                 }, upload=False)
-                print(f"Session {session_id}: H3 reloaded after the face refine "
+                print(f"Session {session_id}: H3 reloaded after the {job_row['input'].get('mode')} job "
                       f"({round(time.time() - reload_start, 1)}s).")
             except Exception as e:
-                print(f"Session {session_id}: H3 reload after the face refine failed, "
+                print(f"Session {session_id}: H3 reload after the {job_row['input'].get('mode')} job failed, "
                       f"the next generation will load it instead ({e}).")
 
         last_activity = time.time()
