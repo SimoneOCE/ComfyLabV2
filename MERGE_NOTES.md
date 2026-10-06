@@ -639,3 +639,58 @@ also has newer base 4-step turbos (v1.1, v1.2).
 Pricing found for the 15s 768p motion swap: Higgsfield Genjutsu ~$5.20 (app,
 104 credits) / ~$10.22 (API); MiniMax API $2.40 (output + reference video);
 fal ~$0.90; this worker ~$0.70 (20 steps, GPU time) / ~$0.16 (4-step turbo).
+
+## Motion-swap prompt rules, for a future prompt enhancer (user, 2026-10-06)
+
+Learned on the Thriller test (Ref2VA, 4-step turbo, one picture of the new
+person, 640x480 reference video). The prompt that worked is the last one
+below; every earlier one came back as the original performer.
+
+**Use MiniMax's official full-reference format** (Ref2VA was trained on it;
+docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md in MiniMaxAI/MiniMax-H3): six
+sections in order - subject_definitions, summary, retention_analysis,
+detailed_description, overall_soundscape, non_diegetic_music.
+- `<Video 1> is the source video for the target video edit.`
+- `<Subject 1> is the [person] in <Picture 1>, exactly as he appears in
+  <Picture 1>: his own face, his own hair, his [skin], and his own outfit from
+  <Picture 1> ... He replaces the whole lead dancer of <Video 1> and performs
+  that dancer's choreography in that dancer's position.`
+- `<Subject 2> is the group of background dancers in <Video 1>, kept exactly
+  as they appear in <Video 1>.`
+- `<Audio 1> is the synchronized audio track of <Video 1> and is reused in the
+  target video.`
+- summary starts `[video editing + reference generation + audio reuse] The
+  target video is an edited version of <Video 1>.` then says the lead is
+  "replaced in full by <Subject 1>".
+- retention_analysis: `<Subject 1> ... fully_preserved` (kept as in the
+  picture, takes the lead's place and choreography); `<Video 1> (choreography,
+  camera movement and timing): partially_preserved - ... the lead dancer is
+  replaced in full ...`; `<Audio 1>: fully_copy`.
+- detailed_description: one style sentence, then `[Shot 1]` (later shots `[Shot
+  N] At MM:SS.mmm, ...`), citing the labels where they apply, ending with
+  "<Subject 1> looks exactly like the young man in <Picture 1> from the first
+  frame to the last."
+
+**What failed, and why:**
+- Free-form paragraphs ("Use <Video 1> as the guide... match the exact
+  movements and framing"): the model copied <Video 1> wholesale.
+- Face-only swaps that keep the original's outfit/hair ("the rapper's look",
+  "red Thriller jacket"): the original performer's look wins. Do a full-body
+  swap - the person's own clothes and hair from the picture - and take only
+  the choreography from the video.
+- Describing other people's looks near the swapped person (the zombies'
+  "decaying skin", makeup): it bleeds onto the swapped person. Describe
+  background people only as "kept exactly as they appear in <Video 1>".
+- Re-describing what the picture already shows (hair): leave it to the
+  picture; only add the skin tone when the original performer has makeup or
+  a very different skin tone, and the visible clothes.
+- Negations / naming defects ("no sunglasses", "low quality", "grainy"):
+  describe only what should be there.
+- Earlier, simpler swaps (Homer/Peter/Marge, Albanese/Hanson) worked with a
+  plain "the man in X is Y from <Picture 1>" per-shot format, but carried over
+  the originals' costumes and skin (Hanson's hands) - same lesson: full body.
+- Also from the rap swaps: "no new speech or sounds" froze every mouth; say
+  who sings/raps and tie it to <Audio 1>. Restate the swapped person in every
+  shot line or they revert near the end of long clips.
+- Turbo: the 4-step Ref2VA turbo is fine for swaps when the prompt is right;
+  the official guide still recommends 20 steps for reference-heavy work.
