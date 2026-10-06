@@ -768,3 +768,16 @@ output, user's call). Final plan:
   which isn't made for it.
 Still to test on base: a non-famous face, a product with a logo/text, 2-3
 references at once, a picture plus audio.
+
+## Merge: idle timeout is 45 minutes, not 10 (user, 2026-10-06)
+
+The test worker ends a session after `SESSION_IDLE_TIMEOUT_SECONDS = 10 * 60`
+(10 min) with no job - e.g. session c4ab05f9 ended with reason "timeout"
+979s after start, 1 job processed. That is too short for real users. At the
+merge the session idle timeout must be **45 minutes** of inactivity. Do not
+carry the 10-minute value over. Note for pricing: idle GPU time inside a
+session is metered, so a 45-minute idle window can charge a user up to 45
+minutes for nothing - decide whether the UI should warn before it ends or
+whether idle time is billed. Related known bug: the idle clock starts at
+session start, so a first-time model download eats into it (start it after
+warmup).
