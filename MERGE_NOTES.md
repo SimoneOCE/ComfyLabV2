@@ -720,3 +720,20 @@ balance, server-side) or must run inside the user's session.
 The shared pieces are fine to port: `run_upscale_only` (frees H3, RTX VSR,
 keeps audio, 4096px-side / 13.1MP and 16s limits), `download_input_video`, and the session-mode
 `mode: "upscale"` job (H3 reloaded after it), which stays metered.
+
+## Upscale findings from the first 4x run (2026-10-06, not built)
+
+- 4x of a 1024x784 swap -> 4096x3136, 15.8s: worked, 130.6s job (RTX VSR
+  ~51s, save ~79s). Output is H.264 High **level 6.0**: Apple devices can't
+  decode it (iPhone AirDrop lands it in Files with no Save Video; Mac
+  QuickTime plays it but Export fails with "Cannot Decode"). Re-encoding to
+  2822x2160 H.264 level 5.1 fixed it. For production: anything above 4K
+  should be saved at an Apple-safe size (fit within 3840x2160 / 4096x2160,
+  level <= 5.2), or the 4x option capped.
+- NVENC refused that size ("OpenEncodeSessionEx failed: unsupported device")
+  and ComfyLabSaveVideoNVENC fell back to CPU libx264. Check a normal-size
+  job's log: if NVENC fails there too, the container likely lacks the
+  `video` driver capability (NVIDIA_DRIVER_CAPABILITIES) and every save is
+  CPU-encoded.
+- Each fresh worker builds the nvidia-vfx wheel at boot (part of the ~60s
+  cold start); could be baked into the image.
