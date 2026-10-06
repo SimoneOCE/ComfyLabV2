@@ -553,18 +553,12 @@ def build_prompt_payload(job_input, upscale_method="none"):
     #     last_frame optional Image inputs (same node as plain T2V).
     #   - ref_image -> a DIFFERENT node, MiniMaxH3ReferenceToVideo, whose
     #     ref_images go through the prompt via <Picture i> tags rather than
-    #     anchoring a specific frame. The two aren't composable without
-    #     chaining MiniMaxH3AddGuide on top (not implemented here yet) - a
-    #     ref_image request takes the ReferenceToVideo path. Mixing the two
-    #     is refused rather than silently dropping the frames (user,
-    #     2026-10-04: one or the other per generation).
-    if (ref_images or ref_video_key) and (start_frame or end_frame):
-        raise ValueError("Use references OR start/end frames in one generation, not both")
+    #     anchoring a specific frame. A request with references takes the
+    #     ReferenceToVideo path; if it also has start/end frames they're
+    #     pinned on top with MiniMaxH3AddGuide (see below).
     if len(ref_images) > MAX_REF_IMAGES:
         raise ValueError(f"At most {MAX_REF_IMAGES} reference images, got {len(ref_images)}")
     reference_node = MODEL_CHOICES[job_input.get("model", "base")].get("reference_node", False)
-    if reference_node and (start_frame or end_frame):
-        raise ValueError("Start/end frames need a base session - Ref2VA has no first/last-frame inputs")
     if ref_video_key and not reference_node:
         raise ValueError("A reference video (motion swap) needs a Ref2VA session")
     lora_key = job_input.get("lora")
@@ -614,6 +608,33 @@ def build_prompt_payload(job_input, upscale_method="none"):
             },
             "class_type": "MiniMaxH3ReferenceToVideo",
         }
+        # Start/end frames WITH references (user, 2026-10-06): the reference
+        # node has no first/last-frame slots, so each frame is pinned on top
+        # of its conditioning with MiniMaxH3AddGuide (core node, pinned
+        # commit; frame_idx -1 = last frame) and the guider reads the end of
+        # that chain. Only runs when a frame is given alongside references -
+        # frames alone still take the MiniMaxH3ImageToVideo path below, and
+        # references alone are untouched. Untested on a real run.
+        conditioning = [NODE_IDS["prompt_and_dims"], 0]
+        for key, image_b64, frame_idx in (("start", start_frame, 0), ("end", end_frame, -1)):
+            if not image_b64:
+                continue
+            workflow[f"_{key}_frame_load"] = {
+                "inputs": {"image": save_input_image(image_b64, key)},
+                "class_type": "LoadImage",
+            }
+            workflow[f"_{key}_frame_guide"] = {
+                "inputs": {
+                    "positive": conditioning,
+                    "latent": [NODE_IDS["prompt_and_dims"], 1],
+                    "vae": [NODE_IDS["vae_loader"], 0],
+                    "image": [f"_{key}_frame_load", 0],
+                    "frame_idx": frame_idx,
+                },
+                "class_type": "MiniMaxH3AddGuide",
+            }
+            conditioning = [f"_{key}_frame_guide", 0]
+        workflow[NODE_IDS["guider"]]["inputs"]["conditioning"] = conditioning
     else:
         prompt_node = workflow[NODE_IDS["prompt_and_dims"]]["inputs"]
         prompt_node["prompt"] = prompt_text

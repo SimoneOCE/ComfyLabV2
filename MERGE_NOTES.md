@@ -781,3 +781,14 @@ minutes for nothing - decide whether the UI should warn before it ends or
 whether idle time is billed. Related known bug: the idle clock starts at
 session start, so a first-time model download eats into it (start it after
 warmup).
+
+## Built: start/end frames together with reference pictures (2026-10-06)
+
+Previously refused. Now, when a job has reference pictures (or a reference
+video) AND a start and/or end frame, the frames are pinned on top of
+MiniMaxH3ReferenceToVideo's conditioning with core `MiniMaxH3AddGuide`
+(frame_idx 0 = first frame, -1 = last frame) and BasicGuider reads the end of
+that chain. Checked offline that every other job type (text, turbo, start
+only, start+end, references only, Ref2VA swap, Ref2VA text, upscale) builds
+an identical graph to before. Not yet run on a GPU. Possible conflict: a
+start frame that shows a referenced person differently from their picture.
