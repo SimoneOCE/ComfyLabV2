@@ -753,3 +753,18 @@ shares Ref2VA's architecture.
 Plan update (pending a few more pictures / an optional same-seed comparison
 with Ref2VA): reference images stay on base with no model swap; Ref2VA only
 for motion swap (reference video).
+
+## Decision: two models - base + Ref2VA; DaSiWa out (user, 2026-10-06)
+
+DaSiWa V3 with a reference picture (Speed, base turbo LoRA): poor prompt
+following - asked for parkour, got him giving a speech in a comedy club.
+Ref2VA ruled out for plain/reference-image generation (choppy text-only
+output, user's call). Final plan:
+- base (FL2VA): text-to-video, start/end frames, reference images (worked
+  well on Speed and a phone-case ad). Loaded at session start.
+- Ref2VA: motion swap (reference video) only, swapped in when such a job
+  arrives (~23-28s measured) and back to base for the next base job.
+- DaSiWa: dropped. Caveat not tested: it ran with base's fl2v turbo LoRA,
+  which isn't made for it.
+Still to test on base: a non-famous face, a product with a logo/text, 2-3
+references at once, a picture plus audio.
