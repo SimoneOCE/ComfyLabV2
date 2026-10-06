@@ -190,8 +190,8 @@
     Upload any video (15s or shorter) and upscale it with RTX Video Super Resolution. Runs as its own
     RunPod job - no GPU session needed, and H3 isn't loaded. Needs the endpoint ID, API key and S3
     keys above. If a GPU session is running and the endpoint only allows one worker, this waits in
-    RunPod's queue until the session ends. The original audio is kept. Output is capped at 4K
-    (3840x2160 pixels).
+    RunPod's queue until the session ends. The original audio is kept. Output is capped at 4096px per side
+    (13.1MP), so 4x fits videos up to 1024x800.
   </p>
   <label>Video to upscale <input id="upscaleOnlyVideo" type="file" accept="video/*" /></label>
   <label>Scale

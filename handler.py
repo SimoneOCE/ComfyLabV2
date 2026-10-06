@@ -1488,7 +1488,12 @@ def free_comfyui_memory(wait_seconds=60):
 # next to a loaded H3 killed a 15s job on the pod. The session loop reloads
 # H3 afterwards, as after an H3 refine.
 UPSCALE_MODE = "upscale"
-UPSCALE_MAX_OUTPUT_PIXELS = 3840 * 2160   # per frame: 4K UHD
+# Raised from 4K (3840x2160) so 4x works on a 1024x784 swap (user,
+# 2026-10-06). At the cap a 15s clip holds ~56GB of float frames in RAM -
+# fits the 89GB worker only because the standalone job loads nothing else;
+# untested. 4096 per side is also NVENC H.264's limit.
+UPSCALE_MAX_OUTPUT_PIXELS = 4096 * 3200
+UPSCALE_MAX_SIDE = 4096
 UPSCALE_MAX_SECONDS = 15.5
 
 
@@ -1507,9 +1512,10 @@ def run_upscale_only(job_input, should_cancel=None, should_force_kill=None, repo
     report_stage("Downloading the video...")
     filename, info = download_input_video(job_input.get("video_key"), "upscale")
     out_w, out_h = round(info["width"] * scale), round(info["height"] * scale)
-    if out_w * out_h > UPSCALE_MAX_OUTPUT_PIXELS:
+    if out_w * out_h > UPSCALE_MAX_OUTPUT_PIXELS or max(out_w, out_h) > UPSCALE_MAX_SIDE:
         raise ValueError(f"{info['width']}x{info['height']} at {scale:g}x would be {out_w}x{out_h} - "
-                         f"above 4K (3840x2160 pixels); use 2x or a smaller video")
+                         f"above the {UPSCALE_MAX_SIDE}px / {UPSCALE_MAX_OUTPUT_PIXELS / 1e6:.1f}MP limit; "
+                         f"use 2x or a smaller video")
     if info["seconds"] > UPSCALE_MAX_SECONDS:
         raise ValueError(f"The video is {info['seconds']:.1f}s - trim it to 15s or less")
     print(f"Upscale: {info['width']}x{info['height']} -> {out_w}x{out_h}, {info['seconds']:.1f}s, "
