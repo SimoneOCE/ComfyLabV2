@@ -141,6 +141,22 @@ LORA_CHOICES = {
         "default_steps": 4,
         "reference_node": True,
     },
+    # lightx2v's (the turbo LoRAs' authors) newer Ref2VA turbo: 8 steps,
+    # v1.0, trained at 768p (1344x768) - the 4-step above is v0.1 trained at
+    # 544p. Same ComfyUI conversion and key layout as the 4-step (headers
+    # compared). Their 768p turbos are trained with flow shift 6 video / 3
+    # audio instead of H3's default 12/3 (Minimax-H3-Turbo README, model
+    # specs; this file isn't in that table yet, so 6/3 is by analogy), so a
+    # MiniMaxH3SigmaShift node is spliced in after the LoRA.
+    "ref2v_turbo_8": {
+        "filename": "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+        "repo": "lightx2v/Minimax-h3-Turbo",
+        "repo_path": "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+        "multiplier": 1.0,
+        "default_steps": 8,
+        "reference_node": True,
+        "shift": (6.0, 3.0),
+    },
 }
 
 # NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI) -
@@ -530,7 +546,7 @@ def build_prompt_payload(job_input, upscale_method="none"):
         raise ValueError("A reference video (motion swap) needs a Ref2VA session")
     lora_key = job_input.get("lora")
     if lora_key and lora_key in LORA_CHOICES and LORA_CHOICES[lora_key].get("reference_node", False) != reference_node:
-        raise ValueError("That turbo LoRA is for the other model - Ref2VA uses ref2v_turbo, base/DaSiWa use turbo/fast")
+        raise ValueError("That turbo LoRA is for the other model - Ref2VA uses ref2v_turbo/ref2v_turbo_8, base/DaSiWa use turbo/fast")
     if ref_images or ref_video_key or reference_node:
         ref_inputs = {}
         for i, img in enumerate(ref_images):
@@ -625,6 +641,12 @@ def build_prompt_payload(job_input, upscale_method="none"):
             "class_type": "LoraLoaderModelOnly",
         }
         model_src = ["_lora", 0]
+        if preset.get("shift"):
+            workflow["_sigma_shift"] = {
+                "inputs": {"model": model_src, "shift_video": preset["shift"][0], "shift_audio": preset["shift"][1]},
+                "class_type": "MiniMaxH3SigmaShift",
+            }
+            model_src = ["_sigma_shift", 0]
         if "steps" not in job_input:
             workflow[NODE_IDS["steps"]]["inputs"]["steps"] = preset["default_steps"]
     workflow[NODE_IDS["sage_attention"]]["inputs"]["model"] = model_src
@@ -1856,7 +1878,9 @@ def run_session(session_id, model="base"):
         t = time.time()
         ensure_model_file(MODEL_CHOICES[model], "diffusion_models")  # no-op once on the volume
         if MODEL_CHOICES[model].get("reference_node"):
-            ensure_model_file(LORA_CHOICES["ref2v_turbo"], "loras")
+            for spec in LORA_CHOICES.values():
+                if spec.get("reference_node"):
+                    ensure_model_file(spec, "loras")
         if time.time() - t > 5:
             print(f"Session {session_id}: downloaded this session's H3 model in {round(time.time() - t)}s.")
         start_comfyui_if_needed()

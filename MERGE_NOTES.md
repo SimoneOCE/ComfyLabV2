@@ -624,3 +624,18 @@ New LoRA `ref2v_turbo` (Ref2VA's 4-step turbo, downloaded by the first Ref2VA
 session); LoRAs are refused on the wrong model. A reference video in a base
 session is refused. Not yet run on a GPU. Open: RTX 2x on a 15s swap crashed
 the pod (see above) and the worker splices it into the same graph.
+
+## Built: Ref2VA 8-step turbo (2026-10-06)
+
+`LORA_CHOICES["ref2v_turbo_8"]` = lightx2v/Minimax-h3-Turbo
+`minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16` (the turbo LoRAs'
+authors; Comfy-Org only mirrors the 4-step v0.1, trained at 544p). Same
+ComfyUI conversion as the 4-step (headers compared). Runs with flow shift 6/3
+via a spliced MiniMaxH3SigmaShift node: lightx2v's 768p turbos are trained at
+6/3, not H3's default 12/3 (this file isn't in their spec table yet, so by
+analogy). Not yet run. Related, not changed: the base "fast" LoRA is also a
+768p lightx2v turbo (trained at 6/3) but runs at the default 12/3; lightx2v
+also has newer base 4-step turbos (v1.1, v1.2).
+Pricing found for the 15s 768p motion swap: Higgsfield Genjutsu ~$5.20 (app,
+104 credits) / ~$10.22 (API); MiniMax API $2.40 (output + reference video);
+fal ~$0.90; this worker ~$0.70 (20 steps, GPU time) / ~$0.16 (4-step turbo).

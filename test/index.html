@@ -84,7 +84,7 @@
       Reference video: 24fps, 15s or shorter (the worker refuses anything else). Duration is set to
       its length. In the prompt it's &lt;Video 1&gt; and its soundtrack &lt;Audio 1&gt;; the finished
       video keeps the original soundtrack. Pictures are &lt;Picture 1&gt;-&lt;Picture 3&gt;, one character
-      each. For the fast version pick LoRA "Turbo (Ref2VA, 4-step)" and set Steps to 4. Upscale: start with None -
+      each. Turbo: "Turbo (Ref2VA, 8-step 768p)" with Steps 8 (better, ~2x the time), or "Turbo (Ref2VA, 4-step)" with Steps 4 (fastest). Upscale: start with None -
       RTX 2x crashed a 15s swap on the pod.
     </div>
     <label>Reference video <input id="refVideo" type="file" accept="video/*" /></label>
@@ -106,6 +106,7 @@
       <option value="turbo">Turbo</option>
       <option value="fast">Fast</option>
       <option value="ref2v_turbo">Turbo (Ref2VA, 4-step)</option>
+      <option value="ref2v_turbo_8">Turbo (Ref2VA, 8-step 768p - better quality)</option>
     </select>
   </label>
   <label>Attention
