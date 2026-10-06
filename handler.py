@@ -153,18 +153,18 @@ NVIDIA_VSR_SCALE = 2.0
 NVIDIA_VSR_QUALITY = "ULTRA"
 
 # --- Job limits (mirrors server.js's validateJobRequest) ------------------
-PROMPT_MAX_CHARS = 6000
+PROMPT_MAX_CHARS = 20000
 DURATION_MIN = 1.0
 DURATION_MAX = 15.0
 MAX_REF_IMAGES = 9            # <Picture 1..9>
 MOTION_MAX_PICTURES = 3
 MAX_FRAMES = 362              # H3's trained maximum (17n+5)
 SEED_MAX = 0xFFFFFFFF
-IMAGE_MAX_BYTES = 10 * 1024 * 1024
-IMAGE_MAX_SIDE = 8192
-IMAGE_MAX_PIXELS = 40_000_000
+IMAGE_MAX_BYTES = 50 * 1024 * 1024
+IMAGE_MAX_SIDE = 16384
+IMAGE_MAX_PIXELS = 200_000_000
 REF_IMAGE_MAX_SIDE = 1536     # references are downscaled to this before use
-VIDEO_MAX_BYTES = 100 * 1024 * 1024
+VIDEO_MAX_BYTES = 800 * 1024 * 1024
 VIDEO_MAX_SIDE = 4096
 REF_VIDEO_MAX_SECONDS = 15.5  # H3's trained range tops out at 15s
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -598,13 +598,13 @@ def load_input_image(key, target_size=None):
     from PIL import Image, ImageOps
     size = _object_size(key)
     if size <= 0 or size > IMAGE_MAX_BYTES:
-        raise JobRejected("A picture is too large (max 10MB)")
+        raise JobRejected("A picture is too large (max 50MB)")
     os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
     tmp = os.path.join(COMFYUI_INPUT_DIR, f"dl_{uuid.uuid4().hex}")
     try:
         s3_client.download_file(S3_BUCKET, key, tmp)
         if os.path.getsize(tmp) > IMAGE_MAX_BYTES:
-            raise JobRejected("A picture is too large (max 10MB)")
+            raise JobRejected("A picture is too large (max 50MB)")
         Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS
         try:
             with Image.open(tmp) as probe:
@@ -664,7 +664,7 @@ def load_ref_video(key):
     (input_filename, info)."""
     size = _object_size(key)
     if size <= 0 or size > VIDEO_MAX_BYTES:
-        raise JobRejected("The reference video is too large (max 100MB)")
+        raise JobRejected("The reference video is too large (max 800MB)")
     os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
     filename = f"refvideo_{uuid.uuid4().hex}{os.path.splitext(key)[1]}"
     path = os.path.join(COMFYUI_INPUT_DIR, filename)
