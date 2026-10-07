@@ -163,9 +163,73 @@ say the crowd is out of focus, turned away or in silhouette.
 | pending | Alpha Timber 15s (reframed) | 3 | Builder chest-up, truck out of focus behind | ? |
 | | | 4 | Family of 3 waist-up, child in dad's arms, small pull-back ending on a medium shot | ? |
 | to test | Crowd/protest shot | - | Sharp foreground speaker chest-up, out-of-focus crowd behind (rule 5a) | ? |
+| 2026-10-07 | Polka-dot bag UGC ad, 15s 9:16, 1 reference picture, 5 shots (live site, `53ea2eb1`) | 1, 4, 5 | Selfie-style chest-up and waist-up creator, face large in frame, talking to camera | **Good**: clean faces, natural lip-sync |
+| | | 2, 3 | Hands-only close-ups of the bag (touching the button, packing items) | **Good**: bag faithful to the picture in every shot |
 
 Update this table after every framing test, and promote rules from
 [hypothesis] to [tested] (or drop them) based on what we see.
+
+## Ad prompts (reference picture or text)
+
+Rules for ad-style videos, written for the site's Prompt Assistant
+(`ENHANCE_AD_RULES` and `enhanceAspectRule` in the website's `server.js`).
+Users often type only "an ad for this bag", and the assistant can't see the
+pictures, so these rules carry the craft. From two hand-written ad prompts on
+2026-10-07: a UGC bag ad (tested, see the log) and a trendy music-only edit
+(not yet rendered).
+
+### A1. Pick one format [hypothesis]
+
+- **UGC**: one creator filming herself or himself, selfie-style, handheld, in a real
+  everyday place, talking to camera in short casual lines. The default for
+  "an ad" in 9:16. **[tested]** 2026-10-07: came out convincing.
+- **Trendy edit**: beat-synced cuts, whip pans, slow-motion drops, orbits,
+  music and sound effects only, nobody speaks.
+- **Polished commercial**: studio + lifestyle, smooth moves, music, at most
+  one short tagline. The default for "an ad" in 16:9 / 1:1.
+
+### A2. The product is the hero [tested]
+
+- It's in every shot, named the same way each time ("the bag from
+  <Picture 1>").
+- Include at least one hands-only close-up of its details.
+- End on a hero shot of the product.
+- Hands-only product shots also keep face counts down (rules 1-3).
+
+### A3. Don't invent the product [hypothesis]
+
+- Only show what the picture shows: no inside, extra colours, logos or
+  packaging.
+- Handle it plausibly (hold, wear, set down, turn, put everyday items in).
+- The assistant can't see the picture, so it never guesses the product's
+  colours, materials or details. It names the product the way the user
+  does and says "exactly as it appears in <Picture N>".
+
+### A4. No on-screen text [hypothesis]
+
+No captions, prices, logos or titles in the video. H3 doesn't render text
+reliably; describe the action instead.
+
+### A5. Speech fits the shot [tested]
+
+- At most one line per shot, about 2.5 words per second of that shot.
+- The line goes in quotes and says who speaks, on or off camera.
+- 2026-10-07: 3-second shots with 7-10 word lines landed in time.
+- Never invent claims (price, materials, awards).
+
+### A6. Music-only edits [hypothesis]
+
+- Write no dialogue at all, and say the music is the only soundtrack.
+- Give the music's style and BPM.
+- Cuts land on beats, with a bass drop on the first cut.
+- Name one sound effect per shot (a whoosh on a whip pan, a thud when the
+  product lands).
+
+### A7. Compose for the frame [hypothesis]
+
+- 9:16: one centred subject, people chest-up or waist-up filling the frame,
+  products close and large, push-ins and gentle handheld moves.
+- The assistant now receives the Generator's aspect.
 
 ## Motion swap prompts (Ref2VA: reference video + picture)
 
