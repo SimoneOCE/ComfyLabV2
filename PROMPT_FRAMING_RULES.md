@@ -178,15 +178,37 @@ pictures, so these rules carry the craft. From two hand-written ad prompts on
 2026-10-07: a UGC bag ad (tested, see the log) and a trendy music-only edit
 (not yet rendered).
 
-### A1. Pick one format [hypothesis]
+### A1. Pick one format; the user's request always wins [hypothesis]
 
-- **UGC**: one creator filming herself or himself, selfie-style, handheld, in a real
-  everyday place, talking to camera in short casual lines. The default for
-  "an ad" in 9:16. **[tested]** 2026-10-07: came out convincing.
-- **Trendy edit**: beat-synced cuts, whip pans, slow-motion drops, orbits,
-  music and sound effects only, nobody speaks.
-- **Polished commercial**: studio + lifestyle, smooth moves, music, at most
-  one short tagline. The default for "an ad" in 16:9 / 1:1.
+Professional, cinematic and high-production ads stay fully available. The
+defaults only apply when the user doesn't say.
+
+- **Aesthetic UGC, no talking** (default for "an ad" in 9:16):
+  - Genuine-looking handheld phone footage in a beautiful real place.
+  - "Pack with me" style: everyday essentials into a bag, details, heading
+    out. Never unboxing or packaging the picture doesn't show.
+  - Natural light, gentle sway, the phone adjusting exposure, imperfect
+    framing.
+  - Soft trending music plus small real sounds.
+  - Closed-lip smile on the one face shot.
+  - Why it's the default: the user's own direction on 2026-10-07. The
+    music-only "trendy edit" read as too high-production; they wanted
+    something that looks user-made but aesthetic.
+- **Talking UGC**: selfie-style creator talking to camera (asked for with
+  review, testimonial, talking, voiceover). **[tested]** 2026-10-07: came
+  out convincing.
+- **Trendy edit**: high-energy beat-synced cuts, whip pans, orbits, music
+  only (asked for with edit, transitions, hype).
+- **Polished commercial**: professional studio and lifestyle
+  cinematography, dolly/slider/crane moves, controlled light, at most one
+  tagline. Default for "an ad" in 16:9 / 1:1, and whenever the user says
+  professional, cinematic, high-end or brand film.
+
+### A1b. Make the place specific [hypothesis]
+
+When the user names a vibe ("luxury apartment"), name two or three concrete
+details (white marble island, cream bouclé sofa, floor-to-ceiling window
+with sheer curtains), and keep one to three props per shot.
 
 ### A2. The product is the hero [tested]
 
