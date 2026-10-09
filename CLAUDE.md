@@ -31,6 +31,12 @@ session must exist in `gpu_sessions` (not ended); its `user_id` is the owner.
    running job is force-killed within ~2s), 45 minutes idle counted from
    ready and reset after each job (`end_reason: timeout`), 23h safety cutoff
    (`timeout`), or a failed restart (`error`, refunded by the website).
+   Two safety stops (2026-10-09, `is_session_active`): if the session can't
+   be read for 3 minutes in a row (a database outage) the worker stops; and
+   every 30s it checks the billing backstop: when the time since the
+   website's meter last charged (`gpu_sessions.metered_until`, else
+   `billing_started_at`) is more than the owner's balance + 90s, the meter
+   has stalled, so it ends the session as `out_of_credit` itself.
 
 ## Jobs
 

@@ -32,6 +32,7 @@ import re
 import shutil
 import urllib.parse
 import uuid
+from datetime import datetime
 import boto3
 from botocore.client import Config
 
@@ -1365,19 +1366,79 @@ def get_session_owner(session_id):
     return rows[0]
 
 
+# If the session can't be read for this long in a row (a database outage),
+# the worker stops: a GPU nobody can bill or stop must not run for the whole
+# 45-minute idle window.
+SESSION_CHECK_FAIL_CLOSED_SECONDS = 3 * 60
+# Backstop for the website's billing meter (server.js, every ~30s): if the
+# time since the meter last charged this session is more than the owner's
+# whole balance plus this grace, the meter has stalled, so the worker ends
+# the session as out of credit itself. The database then charges only what
+# was left (meter_gpu_session never goes below zero).
+BALANCE_BACKSTOP_GRACE_SECONDS = 90
+BALANCE_BACKSTOP_INTERVAL_SECONDS = 30
+_session_check_failing_since = {}
+_balance_checked_at = {}
+
+
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _balance_exhausted(session_row):
+    """True when the meter has stalled past the owner's balance (see
+    BALANCE_BACKSTOP_GRACE_SECONDS). Any read problem answers False: this is
+    only a backstop, the meter itself is the source of truth."""
+    since = _parse_ts(session_row.get("metered_until")) or _parse_ts(session_row.get("billing_started_at"))
+    if since is None or not session_row.get("user_id"):
+        return False
+    try:
+        credits = sb_get("user_credits", {"user_id": f"eq.{session_row['user_id']}", "select": "balance_seconds"})
+    except Exception as e:
+        print(f"Balance backstop: could not read the balance ({e}).")
+        return False
+    balance = credits[0].get("balance_seconds") if credits else 0
+    if not isinstance(balance, (int, float)):
+        return False
+    return time.time() - since > balance + BALANCE_BACKSTOP_GRACE_SECONDS
+
+
 def is_session_active(session_id):
     """Active only while gpu_sessions.ended_at is null AND the session's
     active_gpu_sessions claim row exists. Manual Stop, the meter's
-    out-of-credit auto-stop and the reaper all clear one or both."""
+    out-of-credit auto-stop and the reaper all clear one or both.
+    Fails closed: after SESSION_CHECK_FAIL_CLOSED_SECONDS of read errors in
+    a row it answers False, and every BALANCE_BACKSTOP_INTERVAL_SECONDS it
+    also checks the balance backstop above."""
     try:
-        sessions = sb_get("gpu_sessions", {"id": f"eq.{session_id}", "select": "ended_at"})
+        sessions = sb_get("gpu_sessions", {"id": f"eq.{session_id}",
+                                           "select": "ended_at,user_id,billing_started_at,metered_until"})
         if not sessions or sessions[0].get("ended_at") is not None:
             return False
         claims = sb_get("active_gpu_sessions", {"session_id": f"eq.{session_id}", "select": "user_id"})
-        return len(claims) > 0
     except Exception as e:
-        print(f"Could not check session state (treating as still active): {e}")
+        failing_since = _session_check_failing_since.setdefault(session_id, time.time())
+        if time.time() - failing_since > SESSION_CHECK_FAIL_CLOSED_SECONDS:
+            print(f"Could not check session state for {SESSION_CHECK_FAIL_CLOSED_SECONDS}s - stopping: {e}")
+            return False
+        print(f"Could not check session state (still active for now): {e}")
         return True
+    _session_check_failing_since.pop(session_id, None)
+    if not claims:
+        return False
+    now = time.time()
+    if now - _balance_checked_at.get(session_id, 0) >= BALANCE_BACKSTOP_INTERVAL_SECONDS:
+        _balance_checked_at[session_id] = now
+        if _balance_exhausted(sessions[0]):
+            print(f"Session {session_id}: billing meter stalled past the balance - ending as out of credit.")
+            mark_session_ended(session_id, "out_of_credit")
+            return False
+    return True
 
 
 def touch_session_heartbeat(session_id):
