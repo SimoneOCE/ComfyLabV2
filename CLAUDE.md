@@ -23,7 +23,10 @@ session must exist in `gpu_sessions` (not ended); its `user_id` is the owner.
    queue time is free; startup, model load and warmup are billed, matching
    RunPod's execution time. `worker_started_at` then marks "ready" (the UI
    lets the user generate). `warmup_seconds` in the summary is informational.
-2. Loop: heartbeat (`active_gpu_sessions.last_activity_at`, 20s), session
+2. Loop: heartbeat (`active_gpu_sessions.last_activity_at`, 20s; also kept
+   up through startup, every job and a crash restart: since 2026-10-09 the
+   website charges GPU time only up to a minute past the last heartbeat, so
+   a step without one would go unbilled), session
    still active? (`gpu_sessions.ended_at` null AND claim row present), claim
    the oldest queued `gpu_session_jobs` row, run it, write `progress` /
    `status` / `output`.

@@ -1708,6 +1708,16 @@ def run_session(session_id):
             why = "force-killed" if result.get("force_killed") else "crashed"
             print(f"Session {session_id}: ComfyUI {why} - restarting and re-warming.")
             reset_worker_started(session_id)
+            # Heartbeat through the restart too: the website charges GPU time
+            # only up to a minute past the last heartbeat.
+            restart_heartbeat_stop = threading.Event()
+
+            def restart_heartbeat():
+                touch_session_heartbeat(session_id)
+                while not restart_heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+                    touch_session_heartbeat(session_id)
+
+            threading.Thread(target=restart_heartbeat, daemon=True).start()
             try:
                 start_comfyui_if_needed()
                 run_warmup("base")
@@ -1718,6 +1728,8 @@ def run_session(session_id):
                 print(f"Session {session_id}: restart failed ({e}) - ending session.")
                 mark_session_ended(session_id, "error")
                 return ended("worker_error", last_error=str(e))
+            finally:
+                restart_heartbeat_stop.set()
 
         # Restarted after each job FINISHES, never at claim time: a long job
         # must not count as idle time.
