@@ -1130,7 +1130,8 @@ def run_generation(job, report, should_cancel=None, should_force_kill=None, load
             return {"cancelled": True}, model
         report({"stage": "Saving"})
         raw = fetch_output_video(result)
-        if job.get("trial"):
+        watermarked = bool(job.get("trial")) and not job.get("watermark_removed")
+        if watermarked:
             raw = apply_watermark(raw)
         video_key = upload_result_and_get_key(raw)
         return {
@@ -1138,6 +1139,9 @@ def run_generation(job, report, should_cancel=None, should_force_kill=None, load
             "storage": "wasabi",
             "kind": job_kind(job),
             "trial": bool(job.get("trial")),
+            # Read by the website's reaper: false marks the paid removal used,
+            # anything else gives it back to the user.
+            "watermarked": watermarked,
             "seed": job["seed"],
             "width": width * (2 if job["upscale"] else 1),
             "height": height * (2 if job["upscale"] else 1),
@@ -1535,6 +1539,25 @@ def claim_next_queued_job(session_id):
     return claimed[0] if claimed else None
 
 
+def watermark_pass_reserved(job_row_id, owner_id):
+    """True only when the website reserved a paid watermark removal for this
+    exact job and owner (trial_watermark_passes, written by the server's
+    service role when the job was queued; users can't write that table).
+    Anything else, including an error reading it, means the watermark goes
+    on: this fails closed like the watermark itself."""
+    try:
+        rows = sb_get("trial_watermark_passes", {
+            "job_id": f"eq.{job_row_id}",
+            "user_id": f"eq.{owner_id}",
+            "status": "eq.reserved",
+            "select": "id",
+        })
+        return bool(rows)
+    except Exception as e:
+        print(f"Could not check the watermark pass for job {job_row_id}: {e}")
+        return False
+
+
 def _job_flag(job_row_id, column):
     try:
         rows = sb_get("gpu_session_jobs", {"id": f"eq.{job_row_id}", "select": column})
@@ -1708,6 +1731,9 @@ def run_session(session_id):
                 if job_row.get("user_id") != owner_id or job_row.get("session_id") != session_id:
                     raise JobRejected("This job does not belong to this session")
                 job = validate_job(job_row.get("input"), owner_id, is_trial)
+                # Trial videos are watermarked unless a paid removal was
+                # reserved for this job ($1, trial watermark removal).
+                job["watermark_removed"] = bool(job.get("trial")) and watermark_pass_reserved(job_id, owner_id)
                 # Stop GPU / out of credit / reaper mid-job: the session is
                 # over, so kill the generation now rather than finishing it.
                 kwargs = {

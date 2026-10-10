@@ -68,7 +68,13 @@ repeating line in a faint band across the middle of the frame, scrolling
 left to right without a break (`apply_watermark`, PyAV + Pillow, font
 `assets/watermark-font.ttf` = Bricolage Grotesque Bold, OFL; audio
 copied), so it can't be cropped or blurred out of one corner; if that
-fails the job fails rather than upload an unmarked video.
+fails the job fails rather than upload an unmarked video. **Paid removal
+(2026-10-10)**: a trial user can pay $1 on the website to make ONE video
+clean; the website reserves a row in `trial_watermark_passes` for that
+job id before the job exists. `watermark_pass_reserved(job_id, owner_id)`
+looks for that reserved row (any error = watermark on), and the output
+records `watermarked` (true/false), which the website reads to mark the
+pass used or give it back.
 
 What the worker decides (never the user):
 
