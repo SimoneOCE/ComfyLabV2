@@ -216,10 +216,12 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 SESSION_POLL_INTERVAL_SECONDS = 3
-# 45 minutes with no job ends the session (user decision 2026-10-06; the test
-# worker's 10 minutes was too short for real users). The clock starts once
-# the worker is READY (after warmup), and restarts when each job finishes.
-SESSION_IDLE_TIMEOUT_SECONDS = 45 * 60
+# 10 minutes with no job ends the session (user decision 2026-10-10, was 45:
+# an idle session holds a GPU someone else could use). Never while a job is
+# queued or rendering: the clock starts once the worker is READY (after
+# warmup) and restarts when each job finishes. SESSION_IDLE_TIMEOUT_SECONDS on
+# the endpoint overrides it without a rebuild.
+SESSION_IDLE_TIMEOUT_SECONDS = int(os.environ.get("SESSION_IDLE_TIMEOUT_SECONDS") or 10 * 60)
 # Self-return well before RunPod's suspected 24h job ceiling.
 SESSION_SAFETY_MAX_SECONDS = 23 * 60 * 60
 HEARTBEAT_INTERVAL_SECONDS = 20
