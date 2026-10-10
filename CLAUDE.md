@@ -63,9 +63,12 @@ video of kind generate/refine (`refine_source_allowed`).
 from the job) makes `validate_job` refuse face fix, motion swap, start/end
 frames and more than 2 pictures, force upscale off and clamp the length to
 3s; the job's own `is_trial` stamp (added by the database trigger) must
-agree. Every trial video gets the `assets/watermark.png` "Bizzle Studio"
-mark burned in bottom-right (`apply_watermark`, PyAV + Pillow, audio
-copied); if that fails the job fails rather than upload an unmarked video.
+agree. Every trial video gets "Made on Bizzle.Studio" burned in as a
+repeating line in a faint band across the middle of the frame, scrolling
+left to right without a break (`apply_watermark`, PyAV + Pillow, font
+`assets/watermark-font.ttf` = Bricolage Grotesque Bold, OFL; audio
+copied), so it can't be cropped or blurred out of one corner; if that
+fails the job fails rather than upload an unmarked video.
 
 What the worker decides (never the user):
 

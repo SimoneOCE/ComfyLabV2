@@ -177,7 +177,6 @@ OUTPUT_KEY_RE = re.compile(rf"^{UUID_RE}\.mp4$")
 # server.js and the job-input trigger enforce the same rules first.
 TRIAL_MAX_DURATION = 3.0
 TRIAL_MAX_PICTURES = 2
-WATERMARK_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "watermark.png")
 
 GENERATE_FIELDS = {"v", "mode", "prompt", "aspect", "duration", "speed", "seed", "upscale",
                    "ref_images", "start_frame", "end_frame", "ref_video", "is_trial"}
@@ -483,11 +482,47 @@ def validate_job(job_input, owner_id, is_trial=False):
     }
 
 
+WATERMARK_TEXT = "Made on Bizzle.Studio"
+WATERMARK_FONT_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "watermark-font.ttf")
+# The banner crosses the frame once every this many seconds.
+WATERMARK_CROSS_SECONDS = 4.0
+
+
+def build_watermark_strip(w, h):
+    """The free-trial banner: "Made on Bizzle.Studio" repeated along one
+    strip (white, semi-transparent, with a dark outline and a soft band
+    behind it so it reads on light and dark scenes alike). Returns the
+    strip (RGBA, long enough to cover the frame plus one repeat), the width
+    of one repeat, and the strip's top edge (vertically centred)."""
+    from PIL import Image, ImageDraw, ImageFont
+    size = max(18, round(min(w, h) * 0.06))
+    try:
+        font = ImageFont.truetype(WATERMARK_FONT_PATH, size)
+    except OSError:
+        font = ImageFont.load_default(size=size)
+    gap = round(size * 1.6)
+    stroke = max(1, round(size / 22))
+    left, top, right, bottom = font.getbbox(WATERMARK_TEXT, stroke_width=stroke)
+    text_w, text_h = right - left, bottom - top
+    tile_w = text_w + gap
+    band_h = round(text_h * 1.9)
+    repeats = -(-w // tile_w) + 2
+    strip = Image.new("RGBA", (tile_w * repeats, band_h), (0, 0, 0, 46))
+    draw = ImageDraw.Draw(strip)
+    y = (band_h - text_h) // 2 - top
+    for i in range(repeats):
+        draw.text((i * tile_w + gap // 2 - left, y), WATERMARK_TEXT, font=font, fill=(255, 255, 255, 150),
+                  stroke_width=stroke, stroke_fill=(0, 0, 0, 120))
+    return strip, tile_w, (h - band_h) // 2
+
+
 def apply_watermark(raw_bytes):
-    """Burns the free-trial "Bizzle Studio" mark into the bottom-right corner
-    of every frame (PyAV + Pillow; audio copied untouched). Returns the new
-    MP4 bytes. Raises on any failure: an unmarked trial video must never be
-    uploaded (fail closed)."""
+    """Burns the free-trial banner ("Made on Bizzle.Studio", repeated)
+    across the middle of every frame, scrolling left to right without a
+    break, so it can't be cropped out or covered by a corner logo (PyAV +
+    Pillow; audio copied untouched). Returns the new MP4 bytes. Raises on
+    any failure: an unmarked trial video must never be uploaded (fail
+    closed)."""
     import av
     from PIL import Image
     work = os.path.join(OUTPUT_DIR, f"wm_{uuid.uuid4().hex}")
@@ -496,17 +531,12 @@ def apply_watermark(raw_bytes):
     try:
         with open(src, "wb") as f:
             f.write(raw_bytes)
-        mark = Image.open(WATERMARK_PATH).convert("RGBA")
         with av.open(src) as inp:
             vin = inp.streams.video[0]
             w, h = vin.codec_context.width, vin.codec_context.height
-            # About 28% of the frame width at most (the PNG is 376px wide).
-            scale = min(1.0, (w * 0.28) / mark.width)
-            if scale < 1.0:
-                mark = mark.resize((max(1, round(mark.width * scale)), max(1, round(mark.height * scale))), Image.LANCZOS)
-            margin = max(8, round(min(w, h) * 0.03))
-            pos = (w - mark.width - margin, h - mark.height - margin)
+            strip, tile_w, band_y = build_watermark_strip(w, h)
             fps = vin.average_rate or 24
+            speed = w / (float(fps) * WATERMARK_CROSS_SECONDS)  # px per frame
             ain = inp.streams.audio[0] if inp.streams.audio else None
             with av.open(dst, mode="w") as out:
                 vout = out.add_stream("libx264", rate=fps)
@@ -523,7 +553,11 @@ def apply_watermark(raw_bytes):
                         continue
                     for frame in packet.decode():
                         img = frame.to_image().convert("RGBA")
-                        img.alpha_composite(mark, dest=pos)
+                        # Moving right: the window into the strip slides
+                        # left by one repeat over and over, seamlessly.
+                        offset = int(round(frames * speed)) % tile_w
+                        band = strip.crop((tile_w - offset, 0, tile_w - offset + w, strip.height))
+                        img.alpha_composite(band, dest=(0, band_y))
                         new = av.VideoFrame.from_image(img.convert("RGB")).reformat(format="yuv420p")
                         new.pts, new.time_base = frame.pts, frame.time_base
                         for p in vout.encode(new):
