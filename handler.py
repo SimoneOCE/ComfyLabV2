@@ -164,6 +164,11 @@ SEED_MAX = 0xFFFFFFFF
 IMAGE_MAX_BYTES = 50 * 1024 * 1024
 IMAGE_MAX_SIDE = 16384
 IMAGE_MAX_PIXELS = 200_000_000
+# Pillow only refuses images over twice MAX_IMAGE_PIXELS (and merely warns
+# above it), so a ~1MB PNG declaring 16384x16384 would decode to ~1GB. This
+# is checked from the header before anything is decoded: 60MP covers a 48MP
+# phone photo.
+IMAGE_MAX_DECODE_PIXELS = 60_000_000
 REF_IMAGE_MAX_SIDE = 1536     # references are downscaled to this before use
 VIDEO_MAX_BYTES = 800 * 1024 * 1024
 VIDEO_MAX_SIDE = 4096
@@ -290,6 +295,19 @@ def is_comfyui_ready():
         return False
 
 
+# ComfyUI decodes user-uploaded pictures and videos with FFmpeg and its own
+# libraries. It never needs the database or storage keys, so it doesn't get
+# them: a bug in a decoder must not hand over the service-role key.
+_COMFYUI_SECRET_ENV = ("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY",
+                       "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "RUNPOD_API_KEY",
+                       "RUNPOD_AI_API_KEY", "RUNPOD_WEBHOOK_GET_JOB", "RUNPOD_WEBHOOK_POST_OUTPUT",
+                       "RUNPOD_WEBHOOK_PING")
+
+
+def comfyui_env():
+    return {k: v for k, v in os.environ.items() if k not in _COMFYUI_SECRET_ENV}
+
+
 def start_comfyui_if_needed():
     global comfyui_process
     with comfyui_process_lock:
@@ -302,6 +320,7 @@ def start_comfyui_if_needed():
                 ["python3", "main.py", "--listen", "127.0.0.1", "--port", "8188",
                  "--output-directory", COMFYUI_OUTPUT_DIR],
                 cwd=COMFYUI_DIR,
+                env=comfyui_env(),
             )
     for _ in range(180):
         if is_comfyui_ready():
@@ -644,13 +663,14 @@ def load_input_image(key, target_size=None):
             raise JobRejected("A picture is too large (max 50MB)")
         Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS
         try:
-            with Image.open(tmp) as probe:
+            # formats=: only these decoders ever look at the file.
+            with Image.open(tmp, formats=["JPEG", "PNG", "WEBP"]) as probe:
                 if probe.format not in ("JPEG", "PNG", "WEBP"):
                     raise JobRejected("Pictures must be JPEG, PNG or WebP")
                 probe.verify()
-            with Image.open(tmp) as img:
+            with Image.open(tmp, formats=["JPEG", "PNG", "WEBP"]) as img:
                 w, h = img.size
-                if min(w, h) < 16 or max(w, h) > IMAGE_MAX_SIDE:
+                if min(w, h) < 16 or max(w, h) > IMAGE_MAX_SIDE or w * h > IMAGE_MAX_DECODE_PIXELS:
                     raise JobRejected("A picture's size is out of range")
                 img = ImageOps.exif_transpose(img).convert("RGB")
                 if target_size:
@@ -671,12 +691,35 @@ def load_input_image(key, target_size=None):
             pass
 
 
+# The reference video is opened ONLY as MP4/MOV with a known codec. FFmpeg
+# otherwise picks a demuxer by sniffing the content (a file starting with
+# "#EXTM3U" could be read as a playlist), and every extra demuxer/decoder is
+# attack surface next to the worker's keys.
+MP4_FIRST_BOXES = {b"ftyp", b"moov", b"wide", b"free", b"skip", b"mdat", b"pnot"}
+VIDEO_CODECS = {"h264", "hevc", "prores", "mpeg4", "av1", "vp9", "mjpeg"}
+AUDIO_CODECS = {"aac", "mp3", "alac", "opus", "ac3", "eac3", "flac"}
+
+
 def probe_video(path):
     import av
-    with av.open(path) as c:
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if len(head) < 8 or head[4:8] not in MP4_FIRST_BOXES:
+        raise JobRejected("The reference video must be an MP4 or MOV file")
+    with av.open(path, format="mov") as c:
         if not c.streams.video:
             raise JobRejected("The reference video has no picture")
+        if not (c.format.name or "").startswith("mov"):
+            raise JobRejected("The reference video must be an MP4 or MOV file")
         v = c.streams.video[0]
+        if v.codec_context.name not in VIDEO_CODECS:
+            raise JobRejected("The reference video's format isn't supported - export it as H.264 or HEVC")
+        for a in c.streams.audio:
+            name = a.codec_context.name or ""
+            if name not in AUDIO_CODECS and not name.startswith("pcm_"):
+                raise JobRejected("The reference video's sound format isn't supported - export it with AAC audio")
+            if a.duration and a.time_base and float(a.duration * a.time_base) > REF_VIDEO_MAX_SECONDS + 2:
+                raise JobRejected("The reference video's sound is longer than its picture - trim it to 15s or less")
         fps = float(v.average_rate or 0)
         # The picture's own length (a soundtrack can run past the frames).
         if v.frames and fps:
@@ -1400,10 +1443,40 @@ def run_face_refine(job, owner_id, report, should_cancel=None, should_force_kill
 # --- Session state (production tables) -------------------------------------
 
 def get_session_owner(session_id):
-    rows = sb_get("gpu_sessions", {"id": f"eq.{session_id}", "select": "user_id,ended_at,is_trial"})
+    rows = sb_get("gpu_sessions", {"id": f"eq.{session_id}", "select": "user_id,ended_at,is_trial,runpod_job_id"})
     if not rows:
         return None
     return rows[0]
+
+
+def session_claimed(session_id):
+    """The session's claim row exists (the website holds one per running
+    session; it's removed when the session ends). Without it nothing meters
+    or reaps the session, so the worker must not start."""
+    return bool(sb_get("active_gpu_sessions", {"session_id": f"eq.{session_id}", "select": "session_id"}))
+
+
+# The website records the RunPod job id right after RunPod accepts the job,
+# so a worker can start a moment before it's there.
+RUNPOD_JOB_ID_WAIT_SECONDS = 20
+
+
+def runpod_job_matches(session_id, owner, runpod_job_id):
+    """Only the RunPod job the website started for this session may run it:
+    a second job naming the same session (anyone holding the RunPod key, or
+    a duplicate delivery) would be a second GPU billed as one."""
+    if not runpod_job_id:
+        return True  # local runs without RunPod
+    stored = owner.get("runpod_job_id")
+    deadline = time.time() + RUNPOD_JOB_ID_WAIT_SECONDS
+    while not stored and time.time() < deadline:
+        time.sleep(2)
+        try:
+            again = get_session_owner(session_id)
+        except Exception:
+            again = None
+        stored = (again or {}).get("runpod_job_id")
+    return stored == runpod_job_id
 
 
 # If the session can't be read for this long in a row (a database outage),
@@ -1603,12 +1676,19 @@ def make_progress_writer(job_row_id):
 def finish_job(job_row_id, output):
     status = "cancelled" if output.get("cancelled") else "failed" if output.get("error") else "completed"
     try:
-        sb_patch("gpu_session_jobs", {"id": f"eq.{job_row_id}"}, {"status": status, "output": output})
+        # Only while the job is still ours (processing): if the website has
+        # already closed it (failed after heartbeat silence, which gives a
+        # paid watermark removal back), a late result must not turn it into a
+        # delivered clean video while the pass is reused.
+        rows = sb_patch("gpu_session_jobs", {"id": f"eq.{job_row_id}", "status": "eq.processing"},
+                        {"status": status, "output": output})
+        if not rows:
+            print(f"Job {job_row_id} was already closed by the website - result not written.")
     except Exception as e:
         print(f"Could not write final result for job {job_row_id}: {e}")
 
 
-def run_session(session_id):
+def run_session(session_id, runpod_job_id=None):
     session_start = time.time()
     last_heartbeat = 0.0
     jobs_processed = 0
@@ -1641,6 +1721,14 @@ def run_session(session_id):
         # Unknown, already-ended, or ownerless session: nothing to run. Never
         # touch the GPU for it.
         print(f"Session {session_id}: not an active session - refusing.")
+        return ended("not_active")
+    try:
+        allowed = session_claimed(session_id) and runpod_job_matches(session_id, owner, runpod_job_id)
+    except Exception as e:
+        print(f"Session {session_id}: could not check the session's claim ({e}).")
+        allowed = False
+    if not allowed:
+        print(f"Session {session_id}: no claim, or not the RunPod job started for it - refusing.")
         return ended("not_active")
     owner_id = owner["user_id"]
     is_trial = bool(owner.get("is_trial"))
@@ -1806,7 +1894,8 @@ def handler(job):
     # before touching ComfyUI or the GPU.
     if not isinstance(session_id, str) or not re.fullmatch(UUID_RE, session_id):
         return {"error": "This endpoint only accepts GPU sessions started by the website."}
-    return run_session(session_id)
+    runpod_job_id = job.get("id")
+    return run_session(session_id, runpod_job_id if isinstance(runpod_job_id, str) else None)
 
 
 if __name__ == "__main__":
