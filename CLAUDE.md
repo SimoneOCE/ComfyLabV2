@@ -114,6 +114,12 @@ up to 362).
 - `finish_job` writes only while the row is still `processing`: once the
   website has closed a job (and possibly given back a watermark pass), a
   late result is dropped.
+- Face detector (`face_yolov8m.pt`): the engine script keeps only the file
+  matching `FACE_DETECTOR_SHA256`, downloaded from a pinned commit. If none
+  is left after it runs, `report_face_detector_problem` writes one
+  `ops_events` row (kind `worker_alert`, `face_detector_rejected` when a
+  `.mismatch` copy was set aside, else `face_detector_missing`; once per
+  worker, never stops the session) and the website emails the owner.
 
 ## Configuration
 

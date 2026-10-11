@@ -274,6 +274,31 @@ def ensure_comfyui_engine():
     subprocess.run(["bash", ENGINE_SCRIPT, VOLUME_DIR, COMFYUI_DIR], check=True)
 
 
+_face_detector_reported = False
+
+
+def report_face_detector_problem():
+    """Tell the website when the engine script left no face detector (it
+    failed its fingerprint check, or couldn't be downloaded): Fix faces is off
+    on this worker, and the website emails the owner (ops_events kind
+    worker_alert, no account data). Once per worker; never stops a session."""
+    global _face_detector_reported
+    if _face_detector_reported:
+        return
+    detector = os.path.join(VOLUME_MODELS_DIR, "ultralytics", "bbox", FACE_DETECTOR)
+    if os.path.isfile(detector):
+        return
+    _face_detector_reported = True
+    problem = "face_detector_rejected" if os.path.exists(detector + ".mismatch") else "face_detector_missing"
+    print(f"Face detector problem: {problem} - Fix faces is off on this worker.")
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/ops_events", headers=_sb_headers(),
+                          json={"kind": "worker_alert", "detail": {"problem": problem}}, timeout=5)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"Couldn't report the face detector problem: {e}")
+
+
 def symlink_models_to_volume():
     for subdir in ("diffusion_models", "text_encoders", "vae", "loras", "ultralytics"):
         link_path = os.path.join(COMFYUI_DIR, "models", subdir)
@@ -1747,6 +1772,7 @@ def run_session(session_id, runpod_job_id=None):
     threading.Thread(target=startup_heartbeat, daemon=True).start()
     try:
         ensure_comfyui_engine()
+        report_face_detector_problem()
         symlink_models_to_volume()
         start_comfyui_if_needed()
         run_warmup("base")
