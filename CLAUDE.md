@@ -7,8 +7,9 @@ It started as the ComfyLabV2 test worker; `MERGE_NOTES.md` records what was
 ported, rejected and deferred, and `PROMPT_FRAMING_RULES.md` is the source
 for the site's Prompt Assistant.
 
-Branches: `main` and `claude/hello-4vzjin` are kept identical (push both).
-The RunPod endpoint builds from `claude/hello-4vzjin`.
+Branch: work ONLY on `claude/hello-4vzjin` (owner, 2026-10-11; no other
+branches). The RunPod endpoint builds from it, so every push rebuilds the
+live worker: ask the owner before pushing.
 
 ## How it runs
 
