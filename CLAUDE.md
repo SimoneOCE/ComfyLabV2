@@ -96,6 +96,24 @@ cache drops base), the next base job swaps back. Motion swaps keep the
 reference video's soundtrack, and their length is the video's (17n+5 frames,
 up to 362).
 
+## Security rules (2026-10-11)
+
+- ComfyUI is started without the service-role, Wasabi and RunPod keys
+  (`comfyui_env`): it decodes user files, so a decoder bug must not reach
+  them. Don't pass secrets to it.
+- Pictures: `Image.open(..., formats=["JPEG","PNG","WEBP"])`, and more than
+  `IMAGE_MAX_DECODE_PIXELS` (60MP) is refused from the header before any
+  decode.
+- Reference videos: the first box must be an MP4/MOV box, opened with
+  `format="mov"` only, video codec in `VIDEO_CODECS`, audio in
+  `AUDIO_CODECS` (or pcm), sound no longer than the 15.5s limit + 2s.
+- A session runs only if its `active_gpu_sessions` claim exists and the
+  RunPod job is the one the website stored in `gpu_sessions.runpod_job_id`
+  (`runpod_job_matches`, waits up to 20s for it to be written).
+- `finish_job` writes only while the row is still `processing`: once the
+  website has closed a job (and possibly given back a watermark pass), a
+  late result is dropped.
+
 ## Configuration
 
 RunPod endpoint (the former test endpoint `qnrreh1dtupfsf`, its network
