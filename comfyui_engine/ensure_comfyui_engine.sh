@@ -222,7 +222,7 @@ mkdir -p "$MODELS_DIR/ultralytics/bbox"
 # doesn't match either it's removed (Fix faces then fails safely; every
 # other video still works). Set FACE_DETECTOR_SHA256 only from the hash shown
 # on huggingface.co/Bingsu/adetailer/blob/main/face_yolov8m.pt.
-FACE_DETECTOR_SHA256="__FILL_ME__"
+FACE_DETECTOR_SHA256="717923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f"
 FACE_DETECTOR="$MODELS_DIR/ultralytics/bbox/face_yolov8m.pt"
 face_detector_ok() {
     [ -f "$FACE_DETECTOR" ] && [ "$(sha256sum "$FACE_DETECTOR" | cut -d' ' -f1)" = "$FACE_DETECTOR_SHA256" ]
