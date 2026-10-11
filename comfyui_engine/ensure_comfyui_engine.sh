@@ -221,7 +221,10 @@ mkdir -p "$MODELS_DIR/ultralytics/bbox"
 # doesn't match is set aside and fetched again, and if the fresh download
 # doesn't match either it's removed (Fix faces then fails safely; every
 # other video still works). Set FACE_DETECTOR_SHA256 only from the hash shown
-# on huggingface.co/Bingsu/adetailer/blob/main/face_yolov8m.pt.
+# on huggingface.co/Bingsu/adetailer/blob/main/face_yolov8m.pt. The download
+# is pinned to that exact version (commit 53cc19d), so a later upload there
+# never reaches us; to move to a new version, change both the commit in the
+# URL and this hash.
 FACE_DETECTOR_SHA256="717923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f"
 FACE_DETECTOR="$MODELS_DIR/ultralytics/bbox/face_yolov8m.pt"
 face_detector_ok() {
@@ -231,7 +234,7 @@ if [ -f "$FACE_DETECTOR" ] && ! face_detector_ok; then
     echo "[comfylab-engine]   face_yolov8m.pt doesn't match its known hash - setting it aside and fetching it again."
     mv -f "$FACE_DETECTOR" "$FACE_DETECTOR.mismatch"
 fi
-download_if_missing "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt" "$MODELS_DIR/ultralytics/bbox"
+download_if_missing "https://huggingface.co/Bingsu/adetailer/resolve/53cc19de382014514d9d4038601d261a7faa9b7b/face_yolov8m.pt" "$MODELS_DIR/ultralytics/bbox"
 if ! face_detector_ok; then
     echo "[comfylab-engine]   WARNING: the downloaded face_yolov8m.pt doesn't match its known hash - removed; Fix faces is off until it's fixed."
     rm -f "$FACE_DETECTOR"
