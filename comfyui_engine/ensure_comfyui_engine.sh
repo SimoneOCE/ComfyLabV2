@@ -216,7 +216,26 @@ download_if_missing "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/lo
 # Face detector for the refine pass (ComfyUI-H3-FaceRefine's H3FaceTrackCrop).
 # It looks in models/ultralytics/bbox, symlinked to the volume by handler.py.
 mkdir -p "$MODELS_DIR/ultralytics/bbox"
+# A .pt file can run code when it loads, so only the exact published file is
+# kept (2026-10-11): its SHA-256 is checked on every start, a copy that
+# doesn't match is set aside and fetched again, and if the fresh download
+# doesn't match either it's removed (Fix faces then fails safely; every
+# other video still works). Set FACE_DETECTOR_SHA256 only from the hash shown
+# on huggingface.co/Bingsu/adetailer/blob/main/face_yolov8m.pt.
+FACE_DETECTOR_SHA256="__FILL_ME__"
+FACE_DETECTOR="$MODELS_DIR/ultralytics/bbox/face_yolov8m.pt"
+face_detector_ok() {
+    [ -f "$FACE_DETECTOR" ] && [ "$(sha256sum "$FACE_DETECTOR" | cut -d' ' -f1)" = "$FACE_DETECTOR_SHA256" ]
+}
+if [ -f "$FACE_DETECTOR" ] && ! face_detector_ok; then
+    echo "[comfylab-engine]   face_yolov8m.pt doesn't match its known hash - setting it aside and fetching it again."
+    mv -f "$FACE_DETECTOR" "$FACE_DETECTOR.mismatch"
+fi
 download_if_missing "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt" "$MODELS_DIR/ultralytics/bbox"
+if ! face_detector_ok; then
+    echo "[comfylab-engine]   WARNING: the downloaded face_yolov8m.pt doesn't match its known hash - removed; Fix faces is off until it's fixed."
+    rm -f "$FACE_DETECTOR"
+fi
 
 # NVIDIA RTX Video Super Resolution (Comfy-Org/Nvidia_RTX_Nodes_ComfyUI) -
 # the one upscale option (see handler.py's NVIDIA_VSR comment). No separate
