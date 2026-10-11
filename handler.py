@@ -171,6 +171,9 @@ IMAGE_MAX_PIXELS = 200_000_000
 IMAGE_MAX_DECODE_PIXELS = 60_000_000
 REF_IMAGE_MAX_SIDE = 1536     # references are downscaled to this before use
 VIDEO_MAX_BYTES = 800 * 1024 * 1024
+# A face fix's source is one of our own finished videos (the gateway's
+# upload cap is the same 1GB).
+REFINE_SOURCE_MAX_BYTES = 1024 * 1024 * 1024
 VIDEO_MAX_SIDE = 4096
 REF_VIDEO_MAX_SECONDS = 15.5  # H3's trained range tops out at 15s
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -235,6 +238,10 @@ COMFY_JOB_TIMEOUT_SECONDS = int(os.environ.get("COMFY_JOB_TIMEOUT_SECONDS", "360
 
 
 def _sb_headers():
+    # A session on the worker gateway never uses the master keys, even if
+    # they are still set on the endpoint: no silent fallback.
+    if _GW is not None:
+        raise GatewayOnly("The database key isn't used on the worker gateway")
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -266,6 +273,109 @@ def utc_now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# --- Worker gateway (2026-10-12) -------------------------------------------
+# With the gateway on for a session, the RunPod job's input carries
+# {"gateway": {"url", "pass"}}: a pass for THIS session only. The worker then
+# does everything through the website's /api/worker/* routes (server.js,
+# "Worker gateway") and never touches the service-role or Wasabi keys, even
+# if they're still set on the endpoint (_sb_headers and the storage helpers
+# refuse while _GW is set). Without it, the worker works as before.
+_GW = None
+_gw_job = {"id": None, "files": None}
+GW_TIMEOUT_SECONDS = 15
+GW_PASS_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+GW_URL_RE = re.compile(r"^(https://[A-Za-z0-9.-]+(:\d+)?|http://(localhost|127\.0\.0\.1)(:\d+)?)$")
+
+
+class GatewayOnly(Exception):
+    pass
+
+
+class GatewaySessionGone(Exception):
+    pass
+
+
+def gateway_from_input(job_input):
+    """The job's gateway settings, checked; None when the job has none.
+    Raises ValueError for a malformed one (the job is refused, never run on
+    the master keys instead)."""
+    gw = job_input.get("gateway")
+    if gw is None:
+        return None
+    if (not isinstance(gw, dict) or not isinstance(gw.get("url"), str) or not isinstance(gw.get("pass"), str)
+            or not GW_URL_RE.match(gw["url"]) or not GW_PASS_RE.match(gw["pass"])):
+        raise ValueError("Malformed gateway settings")
+    return {"url": gw["url"], "pass": gw["pass"]}
+
+
+def gw_call(path, body=None, timeout=GW_TIMEOUT_SECONDS):
+    r = requests.post(f"{_GW['url']}/api/worker{path}", json=body or {},
+                      headers={"Authorization": f"Bearer {_GW['pass']}"}, timeout=timeout)
+    if r.status_code == 410:
+        raise GatewaySessionGone("The session has ended")
+    r.raise_for_status()
+    return r.json()
+
+
+def gw_set_job(job_id):
+    _gw_job["id"] = job_id
+    _gw_job["files"] = None
+
+
+def gw_input_files():
+    """This job's file links (fetched once per job): {key: {url, size} or
+    {missing: true}}, plus whether a face fix's source is allowed."""
+    if _gw_job["files"] is None:
+        data = gw_call(f"/jobs/{_gw_job['id']}/inputs")
+        _gw_job["files"] = data.get("files") or {}
+        _gw_job["refine_not_allowed"] = bool(data.get("refineNotAllowed"))
+    return _gw_job["files"]
+
+
+def gw_download(key, path, max_bytes):
+    entry = gw_input_files().get(key)
+    if not entry or entry.get("missing") or not entry.get("url"):
+        raise JobRejected("An uploaded file is missing - upload it again")
+    written = 0
+    with requests.get(entry["url"], stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise JobRejected("A file is larger than allowed")
+                f.write(chunk)
+
+
+def gw_upload(filepath):
+    size = os.path.getsize(filepath)
+    link = gw_call(f"/jobs/{_gw_job['id']}/upload", {"size": size})
+    with open(filepath, "rb") as f:
+        r = requests.put(link["url"], data=f,
+                         headers={**(link.get("headers") or {}), "Content-Length": str(size)}, timeout=600)
+    r.raise_for_status()
+    return link["key"]
+
+
+# Storage helpers: the only places the worker reads or writes files.
+def storage_size(key):
+    if _GW is not None:
+        entry = gw_input_files().get(key)
+        if not entry or entry.get("missing"):
+            raise JobRejected("An uploaded file is missing - upload it again")
+        return int(entry.get("size") or 0)
+    head = s3_client.head_object(Bucket=S3_BUCKET, Key=key)
+    return int(head.get("ContentLength") or 0)
+
+
+def storage_download(key, path, max_bytes):
+    """key: an input key, or a face fix's bare output key (outputs/<key>)."""
+    if _GW is not None:
+        return gw_download(key, path, max_bytes)
+    object_key = key if key.startswith("inputs/") else f"outputs/{key}"
+    s3_client.download_file(S3_BUCKET, object_key, path)
+
+
 # --- ComfyUI process -------------------------------------------------------
 
 def ensure_comfyui_engine():
@@ -292,9 +402,12 @@ def report_face_detector_problem():
     problem = "face_detector_rejected" if os.path.exists(detector + ".mismatch") else "face_detector_missing"
     print(f"Face detector problem: {problem} - Fix faces is off on this worker.")
     try:
-        r = requests.post(f"{SUPABASE_URL}/rest/v1/ops_events", headers=_sb_headers(),
-                          json={"kind": "worker_alert", "detail": {"problem": problem}}, timeout=5)
-        r.raise_for_status()
+        if _GW is not None:
+            gw_call("/alert", {"problem": problem}, timeout=5)
+        else:
+            r = requests.post(f"{SUPABASE_URL}/rest/v1/ops_events", headers=_sb_headers(),
+                              json={"kind": "worker_alert", "detail": {"problem": problem}}, timeout=5)
+            r.raise_for_status()
     except Exception as e:
         print(f"Couldn't report the face detector problem: {e}")
 
@@ -639,7 +752,11 @@ def refine_source_allowed(owner_id, key):
     """A face refine may only read a video this user owns and that face
     refine is offered on (not reference-picture or motion-swap videos): a
     saved Library row on Wasabi, or one of the user's own completed jobs.
-    The key itself was already format-checked (OUTPUT_KEY_RE)."""
+    The key itself was already format-checked (OUTPUT_KEY_RE). On the
+    gateway the website checks it (the same rule) and only then links it."""
+    if _GW is not None:
+        files = gw_input_files()
+        return not _gw_job.get("refine_not_allowed") and key in files and not files[key].get("missing")
     rows = sb_get("generations", {
         "user_id": f"eq.{owner_id}",
         "video_url": f"like.*/api/video/{key}",
@@ -665,10 +782,11 @@ def refine_source_allowed(owner_id, key):
 
 def _object_size(key):
     try:
-        head = s3_client.head_object(Bucket=S3_BUCKET, Key=key)
+        return storage_size(key)
+    except JobRejected:
+        raise
     except Exception:
         raise JobRejected("An uploaded file is missing - upload it again")
-    return int(head.get("ContentLength") or 0)
 
 
 def load_input_image(key, target_size=None):
@@ -683,7 +801,7 @@ def load_input_image(key, target_size=None):
     os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
     tmp = os.path.join(COMFYUI_INPUT_DIR, f"dl_{uuid.uuid4().hex}")
     try:
-        s3_client.download_file(S3_BUCKET, key, tmp)
+        storage_download(key, tmp, IMAGE_MAX_BYTES)
         if os.path.getsize(tmp) > IMAGE_MAX_BYTES:
             raise JobRejected("A picture is too large (max 50MB)")
         Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS
@@ -773,7 +891,12 @@ def load_ref_video(key):
     os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
     filename = f"refvideo_{uuid.uuid4().hex}{os.path.splitext(key)[1]}"
     path = os.path.join(COMFYUI_INPUT_DIR, filename)
-    s3_client.download_file(S3_BUCKET, key, path)
+    try:
+        storage_download(key, path, VIDEO_MAX_BYTES)
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
     try:
         info = probe_video(path)
     except JobRejected:
@@ -1111,6 +1234,9 @@ def upload_result_and_get_key(raw_bytes):
     with open(filepath, "wb") as f:
         f.write(raw_bytes)
     try:
+        if _GW is not None:
+            # The website picks the key and links only this job's upload.
+            return gw_upload(filepath)
         s3_client.upload_file(filepath, S3_BUCKET, f"outputs/{out_filename}", ExtraArgs={"ContentType": "video/mp4"})
     finally:
         try:
@@ -1319,7 +1445,7 @@ def prepare_refine_source(video_key):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tmp_path = os.path.join(OUTPUT_DIR, f"refine_src_{uuid.uuid4().hex}.mp4")
     try:
-        s3_client.download_file(S3_BUCKET, f"outputs/{video_key}", tmp_path)
+        storage_download(video_key, tmp_path, REFINE_SOURCE_MAX_BYTES)
     except Exception:
         raise JobRejected("The source video could not be found")
     os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
@@ -1546,6 +1672,24 @@ def _balance_exhausted(session_row):
     return time.time() - since > balance + BALANCE_BACKSTOP_GRACE_SECONDS
 
 
+def _gw_session_active(session_id):
+    """Gateway version of is_session_active: the website answers (and runs
+    the meter backstop itself). Same fail-closed timing on errors."""
+    try:
+        active = bool(gw_call("/state").get("active"))
+    except GatewaySessionGone:
+        return False
+    except Exception as e:
+        failing_since = _session_check_failing_since.setdefault(session_id, time.time())
+        if time.time() - failing_since > SESSION_CHECK_FAIL_CLOSED_SECONDS:
+            print(f"Could not check session state for {SESSION_CHECK_FAIL_CLOSED_SECONDS}s - stopping: {e}")
+            return False
+        print(f"Could not check session state (still active for now): {e}")
+        return True
+    _session_check_failing_since.pop(session_id, None)
+    return active
+
+
 def is_session_active(session_id):
     """Active only while gpu_sessions.ended_at is null AND the session's
     active_gpu_sessions claim row exists. Manual Stop, the meter's
@@ -1553,6 +1697,8 @@ def is_session_active(session_id):
     Fails closed: after SESSION_CHECK_FAIL_CLOSED_SECONDS of read errors in
     a row it answers False, and every BALANCE_BACKSTOP_INTERVAL_SECONDS it
     also checks the balance backstop above."""
+    if _GW is not None:
+        return _gw_session_active(session_id)
     try:
         sessions = sb_get("gpu_sessions", {"id": f"eq.{session_id}",
                                            "select": "ended_at,user_id,billing_started_at,metered_until"})
@@ -1582,6 +1728,12 @@ def is_session_active(session_id):
 def touch_session_heartbeat(session_id):
     """active_gpu_sessions.last_activity_at - server.js's reapDeadWorkers
     treats 5 minutes without it as a dead worker."""
+    if _GW is not None:
+        try:
+            gw_call("/heartbeat")
+        except Exception as e:
+            print(f"Could not write heartbeat for session {session_id}: {e}")
+        return
     try:
         sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"last_activity_at": utc_now_iso()})
     except Exception as e:
@@ -1593,6 +1745,12 @@ def mark_session_execution_started(session_id):
     billing starts here (server.js meterActiveSessions). Only queue time,
     before a worker picked the job up, is free; worker startup, model load
     and warmup are billed, matching RunPod's own execution time."""
+    if _GW is not None:
+        try:
+            gw_call("/mark", {"event": "execution_started"})
+        except Exception as e:
+            print(f"Could not mark execution started for session {session_id}: {e}")
+        return
     try:
         sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"execution_started_at": utc_now_iso()})
     except Exception as e:
@@ -1602,6 +1760,12 @@ def mark_session_execution_started(session_id):
 def mark_session_worker_started(session_id):
     """Sets worker_started_at: the UI's "ready" signal (generating is allowed
     from here)."""
+    if _GW is not None:
+        try:
+            gw_call("/mark", {"event": "worker_started"})
+        except Exception as e:
+            print(f"Could not mark worker started for session {session_id}: {e}")
+        return
     try:
         sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"worker_started_at": utc_now_iso()})
     except Exception as e:
@@ -1609,6 +1773,12 @@ def mark_session_worker_started(session_id):
 
 
 def reset_worker_started(session_id):
+    if _GW is not None:
+        try:
+            gw_call("/mark", {"event": "worker_reset"})
+        except Exception as e:
+            print(f"Could not reset worker_started for session {session_id}: {e}")
+        return
     try:
         sb_patch("active_gpu_sessions", {"session_id": f"eq.{session_id}"}, {"worker_started_at": None})
     except Exception as e:
@@ -1617,6 +1787,14 @@ def reset_worker_started(session_id):
 
 def mark_session_ended(session_id, reason):
     """reason must be one of gpu_sessions_end_reason_check's values."""
+    if _GW is not None:
+        try:
+            gw_call("/end", {"reason": reason})
+        except GatewaySessionGone:
+            pass
+        except Exception as e:
+            print(f"Could not mark session {session_id} ended: {e}")
+        return
     try:
         sb_patch("gpu_sessions", {"id": f"eq.{session_id}", "ended_at": "is.null"},
                  {"ended_at": utc_now_iso(), "end_reason": reason})
@@ -1629,6 +1807,11 @@ def mark_session_ended(session_id, reason):
 
 
 def claim_next_queued_job(session_id):
+    if _GW is not None:
+        job = gw_call("/jobs/claim").get("job")
+        if job:
+            gw_set_job(job["id"])
+        return job
     queued = sb_get("gpu_session_jobs", {
         "session_id": f"eq.{session_id}", "status": "eq.queued", "order": "created_at.asc", "limit": "1",
     })
@@ -1645,6 +1828,12 @@ def watermark_pass_reserved(job_row_id, owner_id):
     service role when the job was queued; users can't write that table).
     Anything else, including an error reading it, means the watermark goes
     on: this fails closed like the watermark itself."""
+    if _GW is not None:
+        try:
+            return bool(gw_call(f"/jobs/{job_row_id}/watermark").get("reserved"))
+        except Exception as e:
+            print(f"Could not check the watermark pass for job {job_row_id}: {e}")
+            return False
     try:
         rows = sb_get("trial_watermark_passes", {
             "job_id": f"eq.{job_row_id}",
@@ -1658,7 +1847,21 @@ def watermark_pass_reserved(job_row_id, owner_id):
         return False
 
 
+_gw_flags = {}
+
+
 def _job_flag(job_row_id, column):
+    if _GW is not None:
+        cached = _gw_flags.get(job_row_id)
+        if cached is None or time.time() - cached[0] > 1.0:
+            try:
+                cached = (time.time(), gw_call(f"/jobs/{job_row_id}/flags"))
+            except Exception as e:
+                print(f"Could not check {column} for job {job_row_id}: {e}")
+                return False
+            _gw_flags.clear()
+            _gw_flags[job_row_id] = cached
+        return bool(cached[1].get(column))
     try:
         rows = sb_get("gpu_session_jobs", {"id": f"eq.{job_row_id}", "select": column})
         return bool(rows and rows[0].get(column))
@@ -1691,7 +1894,10 @@ def make_progress_writer(job_row_id):
                 return
             last_write[0] = now
         try:
-            sb_patch("gpu_session_jobs", {"id": f"eq.{job_row_id}"}, {"progress": body})
+            if _GW is not None:
+                gw_call(f"/jobs/{job_row_id}/progress", {"progress": body})
+            else:
+                sb_patch("gpu_session_jobs", {"id": f"eq.{job_row_id}"}, {"progress": body})
         except Exception as e:
             print(f"Could not write progress for job {job_row_id}: {e}")
 
@@ -1700,6 +1906,13 @@ def make_progress_writer(job_row_id):
 
 def finish_job(job_row_id, output):
     status = "cancelled" if output.get("cancelled") else "failed" if output.get("error") else "completed"
+    if _GW is not None:
+        try:
+            if not gw_call(f"/jobs/{job_row_id}/finish", {"output": output}).get("written"):
+                print(f"Job {job_row_id} was already closed by the website - result not written.")
+        except Exception as e:
+            print(f"Could not write final result for job {job_row_id}: {e}")
+        return
     try:
         # Only while the job is still ours (processing): if the website has
         # already closed it (failed after heartbeat silence, which gives a
@@ -1711,6 +1924,30 @@ def finish_job(job_row_id, output):
             print(f"Job {job_row_id} was already closed by the website - result not written.")
     except Exception as e:
         print(f"Could not write final result for job {job_row_id}: {e}")
+
+
+def gateway_start(runpod_job_id):
+    """The session's owner and trial flag from the gateway, only for the
+    RunPod job the website started (it may still be writing the job id:
+    retried for up to RUNPOD_JOB_ID_WAIT_SECONDS). None = refused."""
+    deadline = time.time() + RUNPOD_JOB_ID_WAIT_SECONDS
+    while True:
+        try:
+            r = requests.post(f"{_GW['url']}/api/worker/start", json={"runpodJobId": runpod_job_id},
+                              headers={"Authorization": f"Bearer {_GW['pass']}"}, timeout=GW_TIMEOUT_SECONDS)
+        except Exception as e:
+            print(f"Gateway start failed: {e}")
+            r = None
+        if r is not None and r.status_code == 200:
+            data = r.json()
+            if not isinstance(data.get("userId"), str) or not re.fullmatch(UUID_RE, data["userId"]):
+                return None
+            return {"user_id": data["userId"], "is_trial": bool(data.get("isTrial"))}
+        if r is not None and r.status_code not in (409, 429, 500, 502, 503, 504):
+            return None
+        if time.time() > deadline:
+            return None
+        time.sleep(2)
 
 
 def run_session(session_id, runpod_job_id=None):
@@ -1737,24 +1974,32 @@ def run_session(session_id, runpod_job_id=None):
         return summary
 
     warmup_seconds = 0.0
-    try:
-        owner = get_session_owner(session_id)
-    except Exception as e:
-        print(f"Session {session_id}: could not read the session ({e}).")
-        owner = None
-    if not owner or owner.get("ended_at") is not None or not owner.get("user_id"):
-        # Unknown, already-ended, or ownerless session: nothing to run. Never
-        # touch the GPU for it.
-        print(f"Session {session_id}: not an active session - refusing.")
-        return ended("not_active")
-    try:
-        allowed = session_claimed(session_id) and runpod_job_matches(session_id, owner, runpod_job_id)
-    except Exception as e:
-        print(f"Session {session_id}: could not check the session's claim ({e}).")
-        allowed = False
-    if not allowed:
-        print(f"Session {session_id}: no claim, or not the RunPod job started for it - refusing.")
-        return ended("not_active")
+    if _GW is not None:
+        # The website checks the pass, that the session is running and that
+        # this is the RunPod job it started for it.
+        owner = gateway_start(runpod_job_id)
+        if owner is None:
+            print(f"Session {session_id}: the gateway refused this session - refusing.")
+            return ended("not_active")
+    else:
+        try:
+            owner = get_session_owner(session_id)
+        except Exception as e:
+            print(f"Session {session_id}: could not read the session ({e}).")
+            owner = None
+        if not owner or owner.get("ended_at") is not None or not owner.get("user_id"):
+            # Unknown, already-ended, or ownerless session: nothing to run.
+            # Never touch the GPU for it.
+            print(f"Session {session_id}: not an active session - refusing.")
+            return ended("not_active")
+        try:
+            allowed = session_claimed(session_id) and runpod_job_matches(session_id, owner, runpod_job_id)
+        except Exception as e:
+            print(f"Session {session_id}: could not check the session's claim ({e}).")
+            allowed = False
+        if not allowed:
+            print(f"Session {session_id}: no claim, or not the RunPod job started for it - refusing.")
+            return ended("not_active")
     owner_id = owner["user_id"]
     is_trial = bool(owner.get("is_trial"))
     mark_session_execution_started(session_id)
@@ -1921,7 +2166,18 @@ def handler(job):
     if not isinstance(session_id, str) or not re.fullmatch(UUID_RE, session_id):
         return {"error": "This endpoint only accepts GPU sessions started by the website."}
     runpod_job_id = job.get("id")
-    return run_session(session_id, runpod_job_id if isinstance(runpod_job_id, str) else None)
+    global _GW
+    try:
+        gateway = gateway_from_input(job_input)
+    except ValueError:
+        return {"error": "This job's gateway settings are malformed."}
+    _GW = gateway
+    gw_set_job(None)
+    try:
+        return run_session(session_id, runpod_job_id if isinstance(runpod_job_id, str) else None)
+    finally:
+        _GW = None
+        gw_set_job(None)
 
 
 if __name__ == "__main__":

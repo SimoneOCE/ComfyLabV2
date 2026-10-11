@@ -121,6 +121,28 @@ up to 362).
   `.mismatch` copy was set aside, else `face_detector_missing`; once per
   worker, never stops the session) and the website emails the owner.
 
+## Worker gateway (2026-10-12, security step 1)
+
+A session whose RunPod job input carries `{"gateway": {"url", "pass"}}`
+runs entirely through the website's `/api/worker/*` routes (server.js
+"Worker gateway"): start (owner + trial flag, only for the RunPod job the
+website started), state (the website runs the meter backstop), heartbeat,
+marks (execution started / ready / reset), end (timeout, error,
+out_of_credit only), job claim, flags, watermark pass, progress, input
+links (short-lived read-only links to that job's own files; face fixes
+checked by the website), one upload link per result (a key the website
+picks, the declared size), the result, and the face-detector alert. In
+that mode `_sb_headers` and the storage helpers refuse to use the master
+keys even if they're still set on the endpoint: no silent fallback. A
+malformed pass or gateway address refuses the job. Without `gateway` the
+worker works exactly as before (the switch is `WORKER_GATEWAY` on
+Railway: off / all / account ids). All storage goes through
+`storage_size` / `storage_download` / `upload_result_and_get_key`; don't
+call `s3_client` or `sb_*` directly in new code. Local test (no GPU, no
+keys): `python3 tests/test_gateway_mode.py`. Once every session runs on
+the gateway, remove `SUPABASE_SERVICE_ROLE_KEY`, `S3_ACCESS_KEY` and
+`S3_SECRET_KEY` from the endpoint (security step 2).
+
 ## Configuration
 
 RunPod endpoint (the former test endpoint `qnrreh1dtupfsf`, its network
