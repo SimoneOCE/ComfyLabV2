@@ -651,8 +651,10 @@ WATERMARK_TAG = "DEMO TEST"
 WATERMARK_TEXT = "".join(WATERMARK_BRAND) + " " + WATERMARK_TAG
 WATERMARK_GOLD = (235, 189, 101)  # the site's --bz-gold, #ebbd65
 WATERMARK_FONT_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "watermark-font.ttf")
-# The banner crosses the frame once every this many seconds.
-WATERMARK_CROSS_SECONDS = 4.0
+# The banner crosses the frame once every this many seconds (owner,
+# 2026-10-12: 4s was "moving too fast"; a 5s trial clip now shows it
+# drift about half a frame).
+WATERMARK_CROSS_SECONDS = 10.0
 # Where the band's middle sits, as a share of the frame's height: below
 # centre, but far enough from the bottom that cropping it off would throw
 # away a third of the picture.
