@@ -150,7 +150,7 @@ COPY test_input.json .
 
 # websocket-client: step progress from ComfyUI's websocket (handler.py
 # ProgressWatcher). Pinned like everything else in this image.
-RUN pip install --no-cache-dir runpod requests boto3 psutil "websocket-client==1.8.0"
+RUN pip install --no-cache-dir runpod requests psutil "websocket-client==1.8.0"
 
 ENTRYPOINT []
 CMD ["python3", "-u", "handler.py"]

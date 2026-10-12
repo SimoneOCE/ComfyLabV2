@@ -3,8 +3,9 @@
 A fake website (the /api/worker/* routes, server.js "Worker gateway") runs
 on 127.0.0.1; handler.py's ComfyUI steps are stubbed. Checks that a session
 with a pass runs entirely through the gateway (start, marks, heartbeats,
-claim, input links, upload link, progress, result, end) and never touches
-the master keys, and that a malformed pass is refused.
+claim, input links, upload link, progress, result, end), that the worker
+has no master-key code left (2026-10-12), and that a job without a pass, or
+with a malformed one, is refused before anything runs.
 
     python3 tests/test_gateway_mode.py
 """
@@ -17,7 +18,7 @@ import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Stand-ins for packages the GPU image has but a laptop may not.
-for name in ("runpod", "boto3", "botocore", "botocore.client"):
+for name in ("runpod",):
     if name not in sys.modules:
         try:
             __import__(name)
@@ -25,12 +26,6 @@ for name in ("runpod", "boto3", "botocore", "botocore.client"):
             mod = types.ModuleType(name)
             sys.modules[name] = mod
 sys.modules["runpod"].serverless = getattr(sys.modules["runpod"], "serverless", types.SimpleNamespace(start=lambda *_: None))
-if not hasattr(sys.modules["boto3"], "client"):
-    class _NoS3:
-        def __getattr__(self, name):
-            raise AssertionError(f"the master storage key was used: s3.{name}")
-    sys.modules["boto3"].client = lambda *a, **k: _NoS3()
-    sys.modules["botocore.client"].Config = lambda **k: None
 
 os.environ.pop("SUPABASE_SERVICE_ROLE_KEY", None)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -171,17 +166,15 @@ check("the result names the key the website picked", (state["finished"] or {}).g
 check("progress was sent", [p.get("stage") for p in state["progress"]][:1] == ["Preparing your inputs"], state["progress"])
 check("the pass is forgotten after the job", handler._GW is None)
 
-print("no master keys on the gateway")
-handler._GW = {"url": BASE, "pass": PASS}
-try:
-    handler.sb_get("gpu_sessions", {})
-    check("the database key is refused in gateway mode", False)
-except handler.GatewayOnly:
-    check("the database key is refused in gateway mode", True)
-finally:
-    handler._GW = None
+print("no master-key code left")
+src = open(handler.__file__).read()
+for gone in ("SUPABASE_SERVICE_ROLE_KEY\")", "sb_get", "sb_patch", "s3_client", "boto3", "_sb_headers"):
+    check(f"handler.py has no {gone}", gone not in src.replace('"SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_URL"', ""))
 
 print("refusals")
+calls.clear()
+r = handler.handler({"id": "rp-1", "input": {"session_id": SESSION}})
+check("a job without a pass -> refused before anything runs", "error" in r and calls == [], (r, calls))
 r = handler.handler({"id": "rp-1", "input": {"session_id": SESSION, "gateway": {"url": "http://evil.example", "pass": PASS}}})
 check("a gateway address that isn't https -> refused", "error" in r, r)
 r = handler.handler({"id": "rp-1", "input": {"session_id": SESSION, "gateway": {"url": BASE, "pass": "short"}}})

@@ -125,41 +125,39 @@ up to 362).
   `.mismatch` copy was set aside, else `face_detector_missing`; once per
   worker, never stops the session) and the website emails the owner.
 
-## Worker gateway (2026-10-12, security step 1)
+## Worker gateway (2026-10-12, security step 1): the only way to run
 
-A session whose RunPod job input carries `{"gateway": {"url", "pass"}}`
-runs entirely through the website's `/api/worker/*` routes (server.js
-"Worker gateway"): start (owner + trial flag, only for the RunPod job the
-website started), state (the website runs the meter backstop), heartbeat,
-marks (execution started / ready / reset), end (timeout, error,
-out_of_credit only), job claim, flags, watermark pass, progress, input
-links (short-lived read-only links to that job's own files; face fixes
-checked by the website), one upload link per result (a key the website
-picks, the declared size), the result, and the face-detector alert. In
-that mode `_sb_headers` and the storage helpers refuse to use the master
-keys even if they're still set on the endpoint: no silent fallback. A
-malformed pass or gateway address refuses the job. Without `gateway` the
-worker works exactly as before (the switch is `WORKER_GATEWAY` on
-Railway: off / all / account ids). All storage goes through
-`storage_size` / `storage_download` / `upload_result_and_get_key`; don't
-call `s3_client` or `sb_*` directly in new code. Local test (no GPU, no
-keys): `python3 tests/test_gateway_mode.py`. Once every session runs on
-the gateway, remove `SUPABASE_SERVICE_ROLE_KEY`, `S3_ACCESS_KEY` and
-`S3_SECRET_KEY` from the endpoint (security step 2).
+Every RunPod job's input carries `{"gateway": {"url", "pass"}}`; a job
+without a valid pass is refused before anything runs. The session runs
+entirely through the website's `/api/worker/*` routes (server.js "Worker
+gateway"): start (owner + trial flag, only for the RunPod job the website
+started), state (the website runs the meter backstop), heartbeat, marks
+(execution started / ready / reset), end (timeout, error, out_of_credit
+only), job claim, flags, watermark pass, progress, input links
+(short-lived read-only links to that job's own files; face fixes checked
+by the website), one upload link per result (a key the website picks, the
+declared size), the result, and the face-detector alert. **The worker
+holds no database or storage keys and has no code that could use them**:
+the master-key path (`sb_*`, `s3_client`, boto3) was removed on
+2026-10-12 (owner) after the RunPod endpoint's keys were deleted (A4);
+the website's `WORKER_GATEWAY` switch went at the same time. All storage
+goes through `storage_size` / `storage_download` / `upload_result_and_get_key`.
+Local test (no GPU, no keys): `python3 tests/test_gateway_mode.py`.
 
 ## Configuration
 
 RunPod endpoint (the former test endpoint `qnrreh1dtupfsf`, its network
 volume mounted at `/runpod-volume`) env vars:
 
+**None are needed** (since 2026-10-12 the endpoint has no variables;
+everything comes through the gateway pass). Optional overrides:
+
 | Var | Purpose |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | production tables (service role) |
-| `S3_ACCESS_KEY`, `S3_SECRET_KEY` | Wasabi |
-| `S3_ENDPOINT` (default `https://s3.eu-west-1.wasabisys.com`), `S3_BUCKET` (default `comfylab-outputs`), `S3_REGION` (default `eu-west-1`) | Wasabi location |
-| `HF_TOKEN` (optional) | HuggingFace downloads |
+| `HF_TOKEN` (optional) | HuggingFace downloads (the repos are public) |
 | `COMFY_JOB_TIMEOUT_SECONDS` (default 3600) | per-graph ceiling |
 | `NVIDIA_VFX_VERSION` (default 0.2.0.0) | RTX VSR library |
+| `SESSION_IDLE_TIMEOUT_SECONDS` | idle cut-off override |
 
 Endpoint settings: RTX 5090, CUDA 13.0 floor, execution timeout above 23h
 (the worker returns itself at 23h), container image built from this repo's
@@ -173,12 +171,14 @@ low-noise 14B fp8, its lightx2v LoRA, umt5 text encoder, Wan VAE (first face
 fix); face detector `ultralytics/bbox/face_yolov8m.pt` (engine script); the
 SageAttention wheel cache `sageattention_wheel_cu13.0/` + marker.
 
-## Storage (Wasabi bucket)
+## Storage (Wasabi bucket, reached only through gateway links)
 
-- `outputs/<uuid>.mp4` — results. Served only through the website's
-  `GET /api/video/:key` after an ownership check.
+- `outputs/<uuid>.mp4` — results, uploaded through the job's one upload
+  link. Served only through the website's `GET /api/video/:key` after an
+  ownership check.
 - `inputs/<user_id>/<uuid>.<ext>` — uploads, written through presigned PUT
-  URLs the website issues per user; swept after 48h by `cleanup.js`.
+  URLs the website issues per user; the worker reads them only through the
+  job's short-lived read links; swept after 48h by `cleanup.js`.
 The bucket is private (anonymous list/get are refused).
 
 ## Not in production
