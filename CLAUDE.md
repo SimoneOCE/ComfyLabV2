@@ -63,7 +63,7 @@ video of kind generate/refine (`refine_source_allowed`).
 **Free trial**: `gpu_sessions.is_trial` (read once at session start, never
 from the job) makes `validate_job` refuse face fix, motion swap, start/end
 frames and more than 2 pictures, force upscale off and clamp the length to
-3s; the job's own `is_trial` stamp (added by the database trigger) must
+5s (3s until 2026-10-12); the job's own `is_trial` stamp (added by the database trigger) must
 agree. Every trial video gets "Made on Bizzle.Studio" burned in as a
 repeating line in a faint band across the middle of the frame, scrolling
 left to right without a break (`apply_watermark`, PyAV + Pillow, font

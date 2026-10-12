@@ -180,10 +180,10 @@ UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 OUTPUT_KEY_RE = re.compile(rf"^{UUID_RE}\.mp4$")
 
 # Free trial (gpu_sessions.is_trial, set by server.js at session start — never
-# taken from the job): generate only, at most 3s and 2 pictures, no start/end
+# taken from the job): generate only, at most 5s (3s until 2026-10-12) and 2 pictures, no start/end
 # frames, no motion swap, no upscale, no face fix, and a burned-in watermark.
 # server.js and the job-input trigger enforce the same rules first.
-TRIAL_MAX_DURATION = 3.0
+TRIAL_MAX_DURATION = 5.0
 TRIAL_MAX_PICTURES = 2
 
 GENERATE_FIELDS = {"v", "mode", "prompt", "aspect", "duration", "speed", "seed", "upscale",
