@@ -314,6 +314,18 @@ invent it. Seen in the Prompt Assistant's answer to "ugc review of my
 earbuds ..." on 2026-10-12; the website's format check retries a tag
 inside quoted speech.
 
+### F6. The enhancer sees the pictures, but still doesn't describe them [hypothesis]
+
+Since 2026-10-12 the website's Prompt Assistant is shown the attached
+pictures (small JPEGs, labelled Picture 1... / Start frame / End frame).
+It uses them to name each thing correctly and to give it only actions it
+really allows (open or closed, what can be held or worn), and never adds
+a part the picture doesn't show. F2 still holds: a pictured thing's looks
+stay out of subject_definitions and retention_analysis. With start / end
+frames it matches the people, place, light and positions in them; on a
+motion swap it uses the pictures only to tell who is who. Untested
+against the model's output so far: add results to the test log.
+
 ## Motion swap prompts (Ref2VA: reference video + picture)
 
 Rules for the motion swap / character swap (a reference video `<Video 1>`, one
