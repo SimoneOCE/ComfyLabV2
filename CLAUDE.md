@@ -144,6 +144,15 @@ the website's `WORKER_GATEWAY` switch went at the same time. All storage
 goes through `storage_size` / `storage_download` / `upload_result_and_get_key`.
 Local test (no GPU, no keys): `python3 tests/test_gateway_mode.py`.
 
+## Package lock (2026-10-12)
+
+`constraints.txt` pins every Python package the image installs (~190, exact
+versions); the Dockerfile's pip steps run with `PIP_CONSTRAINT` set to it
+(build only). **If a build fails with a version conflict, or a worker breaks
+after a ComfyUI / node / package change, check `constraints.txt` first**;
+how to re-resolve it is at the top of the file. nvidia-vfx and SageAttention
+are pinned separately in `comfyui_engine/ensure_comfyui_engine.sh`.
+
 ## Configuration
 
 RunPod endpoint (the former test endpoint `qnrreh1dtupfsf`, its network

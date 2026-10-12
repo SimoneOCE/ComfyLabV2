@@ -64,6 +64,15 @@ ARG COMFYUI_COMMIT=fb2315f11db0ebfaafa9099a5df5227dc6bb42bc
 ARG KJNODES_COMMIT=d3cfe21625e5170126ce06fbfcfe1d88108688c3
 
 WORKDIR /opt/comfylab
+# Every pip install in this build is held to constraints.txt (exact versions
+# of all ~190 packages; owner 2026-10-12: locked so a rebuild never pulls a
+# newer, possibly broken or hijacked, release). An ARG, not ENV: it applies
+# to the build's RUN steps only, never to the runtime installs in
+# ensure_comfyui_engine.sh (nvidia-vfx and SageAttention, pinned there).
+# IF A BUILD FAILS WITH A VERSION CONFLICT, or a worker breaks after a
+# dependency change, start with constraints.txt (how to update it is at its top).
+COPY constraints.txt ./constraints.txt
+ARG PIP_CONSTRAINT=/opt/comfylab/constraints.txt
 
 # libgl1/libglib2.0-0: OpenCV's GUI build (opencv-python, pulled in by
 # ultralytics and scenedetect for the face refine nodes) links libGL.so.1,
@@ -149,7 +158,7 @@ COPY assets ./assets
 COPY test_input.json .
 
 # websocket-client: step progress from ComfyUI's websocket (handler.py
-# ProgressWatcher). Pinned like everything else in this image.
+# ProgressWatcher). runpod / requests / psutil are pinned by constraints.txt.
 RUN pip install --no-cache-dir runpod requests psutil "websocket-client==1.8.0"
 
 ENTRYPOINT []
