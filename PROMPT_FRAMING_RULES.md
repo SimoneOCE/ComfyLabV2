@@ -290,6 +290,18 @@ short clip make faces small and glitchy; on 2026-10-12 a 6.6s earbuds
 draft asked for seven actions (raise, open, show inside, close, nod,
 speak, lower).
 
+### F4. Section names and bracketed tags, checked in code [tested]
+
+Every Advanced prompt has all six section names, each on its own line
+with a colon, and every tag in angle brackets every time (`<Subject 1>`,
+`<Picture 1>`; a bare "Subject 1" doesn't point the model at the picture).
+The summary tag matches the job: `[generation]` (text only),
+`[reference generation]` (pictures), `[video editing + reference
+generation + audio reuse]` (motion swap). On 2026-10-12 the Prompt
+Assistant still dropped these after its instructions were fixed, so the
+website now checks each answer (`enhanceFormatProblems`), retries once
+naming the problems, and brackets bare tags itself (`bracketEnhanceTags`).
+
 ## Motion swap prompts (Ref2VA: reference video + picture)
 
 Rules for the motion swap / character swap (a reference video `<Video 1>`, one
