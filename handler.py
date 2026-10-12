@@ -641,43 +641,85 @@ def validate_job(job_input, owner_id, is_trial=False):
     }
 
 
-WATERMARK_TEXT = "Made on Bizzle.Studio"
+# The free-trial banner (owner, 2026-10-12: "more branded ... a little lower
+# in the video not dead centre but still high enough that it cant be cropped
+# easily ... also say demo test"): the wordmark as the site draws it
+# ("Bizzle" white, ".Studio" gold) and a gold "DEMO TEST" tag, repeated
+# along a dark band with thin gold edges, scrolling across the frame.
+WATERMARK_BRAND = ("Bizzle", ".Studio")
+WATERMARK_TAG = "DEMO TEST"
+WATERMARK_TEXT = "".join(WATERMARK_BRAND) + " " + WATERMARK_TAG
+WATERMARK_GOLD = (235, 189, 101)  # the site's --bz-gold, #ebbd65
 WATERMARK_FONT_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "watermark-font.ttf")
 # The banner crosses the frame once every this many seconds.
 WATERMARK_CROSS_SECONDS = 4.0
+# Where the band's middle sits, as a share of the frame's height: below
+# centre, but far enough from the bottom that cropping it off would throw
+# away a third of the picture.
+WATERMARK_CENTRE_Y = 0.64
 
 
 def build_watermark_strip(w, h):
-    """The free-trial banner: "Made on Bizzle.Studio" repeated along one
-    strip (white, semi-transparent, with a dark outline and a soft band
-    behind it so it reads on light and dark scenes alike). Returns the
-    strip (RGBA, long enough to cover the frame plus one repeat), the width
-    of one repeat, and the strip's top edge (vertically centred)."""
+    """The free-trial banner as one long strip: per repeat, "Bizzle" (white)
+    ".Studio" (gold), a gold "DEMO TEST" tag and a gold dot, on a dark
+    translucent band with gold edges, so it reads on light and dark scenes
+    alike. Returns the strip (RGBA, long enough to cover the frame plus one
+    repeat), the width of one repeat, and the strip's top edge."""
     from PIL import Image, ImageDraw, ImageFont
-    size = max(18, round(min(w, h) * 0.06))
+    size = max(18, round(min(w, h) * 0.058))
+    tag_size = max(12, round(size * 0.52))
     try:
         font = ImageFont.truetype(WATERMARK_FONT_PATH, size)
+        tag_font = ImageFont.truetype(WATERMARK_FONT_PATH, tag_size)
+        try:
+            font.set_variation_by_axes([800])
+            tag_font.set_variation_by_axes([800])
+        except Exception:
+            pass
     except OSError:
         font = ImageFont.load_default(size=size)
-    gap = round(size * 1.6)
-    stroke = max(1, round(size / 22))
-    left, top, right, bottom = font.getbbox(WATERMARK_TEXT, stroke_width=stroke)
-    text_w, text_h = right - left, bottom - top
-    tile_w = text_w + gap
-    band_h = round(text_h * 1.9)
+        tag_font = ImageFont.load_default(size=tag_size)
+    stroke = max(1, round(size / 24))
+    brand, studio = WATERMARK_BRAND
+    b_l, b_t, b_r, b_b = font.getbbox(brand, stroke_width=stroke)
+    s_l, s_t, s_r, s_b = font.getbbox(studio, stroke_width=stroke)
+    t_l, t_t, t_r, t_b = tag_font.getbbox(WATERMARK_TAG)
+    text_h = max(b_b, s_b) - min(b_t, s_t)
+    pad_x, pad_y = round(tag_size * 0.7), round(tag_size * 0.38)
+    tag_w, tag_h = (t_r - t_l) + 2 * pad_x, (t_b - t_t) + 2 * pad_y
+    gap = round(size * 0.55)
+    dot_r = max(2, round(size * 0.09))
+    tile_w = (b_r - b_l) + (s_r - s_l) + gap + tag_w + 2 * gap + 2 * dot_r + gap
+    band_h = round(text_h * 2.1)
+    edge = max(1, round(band_h * 0.04))
     repeats = -(-w // tile_w) + 2
-    strip = Image.new("RGBA", (tile_w * repeats, band_h), (0, 0, 0, 46))
+    strip = Image.new("RGBA", (tile_w * repeats, band_h), (8, 8, 10, 92))
     draw = ImageDraw.Draw(strip)
-    y = (band_h - text_h) // 2 - top
+    gold = WATERMARK_GOLD
+    draw.rectangle((0, 0, strip.width, edge - 1), fill=gold + (170,))
+    draw.rectangle((0, band_h - edge, strip.width, band_h), fill=gold + (170,))
+    mid = band_h / 2
+    text_y = round(mid - text_h / 2) - min(b_t, s_t)
     for i in range(repeats):
-        draw.text((i * tile_w + gap // 2 - left, y), WATERMARK_TEXT, font=font, fill=(255, 255, 255, 150),
-                  stroke_width=stroke, stroke_fill=(0, 0, 0, 120))
-    return strip, tile_w, (h - band_h) // 2
+        x = i * tile_w + gap // 2
+        draw.text((x - b_l, text_y), brand, font=font, fill=(255, 255, 255, 205),
+                  stroke_width=stroke, stroke_fill=(0, 0, 0, 130))
+        x += b_r - b_l
+        draw.text((x - s_l, text_y), studio, font=font, fill=gold + (225,),
+                  stroke_width=stroke, stroke_fill=(0, 0, 0, 130))
+        x += (s_r - s_l) + gap
+        ty = round(mid - tag_h / 2)
+        draw.rounded_rectangle((x, ty, x + tag_w, ty + tag_h), radius=tag_h // 2, fill=gold + (215,))
+        draw.text((x + pad_x - t_l, ty + pad_y - t_t), WATERMARK_TAG, font=tag_font, fill=(20, 16, 10, 235))
+        x += tag_w + gap
+        draw.ellipse((x, mid - dot_r, x + 2 * dot_r, mid + dot_r), fill=gold + (190,))
+    top = round(h * WATERMARK_CENTRE_Y - band_h / 2)
+    return strip, tile_w, max(0, min(h - band_h, top))
 
 
 def apply_watermark(raw_bytes):
-    """Burns the free-trial banner ("Made on Bizzle.Studio", repeated)
-    across the middle of every frame, scrolling left to right without a
+    """Burns the free-trial banner ("Bizzle.Studio" + "DEMO TEST", repeated)
+    across every frame a little below the middle (WATERMARK_CENTRE_Y), scrolling left to right without a
     break, so it can't be cropped out or covered by a corner logo (PyAV +
     Pillow; audio copied untouched). Returns the new MP4 bytes. Raises on
     any failure: an unmarked trial video must never be uploaded (fail
