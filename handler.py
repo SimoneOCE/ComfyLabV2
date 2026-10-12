@@ -1186,6 +1186,13 @@ def submit_and_wait(workflow, should_cancel=None, should_force_kill=None, on_pro
                                 return {"cancelled": True}
                             raise RuntimeError(f"Generation failed ({data.get('exception_type')}: "
                                                f"{str(data.get('exception_message'))[:300]})")
+                    # A run stopped by /interrupt ends as an error whose
+                    # message is "execution_interrupted", not
+                    # "execution_error": it was the user's cancel, not a
+                    # failure (2026-10-12: cancels were recorded as
+                    # "Generation failed").
+                    if interrupted:
+                        return {"cancelled": True}
                     raise RuntimeError("Generation failed")
                 if interrupted and NODE_IDS["output"] not in entry.get("outputs", {}):
                     return {"cancelled": True}
