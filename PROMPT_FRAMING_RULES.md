@@ -302,6 +302,18 @@ Assistant still dropped these after its instructions were fixed, so the
 website now checks each answer (`enhanceFormatProblems`), retries once
 naming the problems, and brackets bare tags itself (`bracketEnhanceTags`).
 
+### F5. Spoken words are only the words, and an opened product stays closed inside [hypothesis]
+
+Dialogue goes in double quotes and holds only what the person says out
+loud: never a tag inside it ("these are the best I've owned", not "these
+earbuds from <Picture 2> ..."), or the model may try to voice the tag.
+When the user asks for a product to be opened, show it opening and
+closing, but don't describe, take out or handle what's inside unless the
+user describes it (A3): the picture doesn't show it, so the model has to
+invent it. Seen in the Prompt Assistant's answer to "ugc review of my
+earbuds ..." on 2026-10-12; the website's format check retries a tag
+inside quoted speech.
+
 ## Motion swap prompts (Ref2VA: reference video + picture)
 
 Rules for the motion swap / character swap (a reference video `<Video 1>`, one
