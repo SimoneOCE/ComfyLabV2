@@ -644,12 +644,50 @@ def validate_job(job_input, owner_id, is_trial=False):
 # The free-trial banner (owner, 2026-10-12: "more branded ... a little lower
 # in the video not dead centre but still high enough that it cant be cropped
 # easily ... also say demo test"): the wordmark as the site draws it
-# ("Bizzle" white, ".Studio" gold) and a gold "DEMO TEST" tag, repeated
-# along a dark band with thin gold edges, scrolling across the frame.
+# ("Bizzle" white, ".Studio" gold) after the gold infinity mark, and an
+# outlined gold "FREE DEMO" tag like the admin console's "ADMIN" one (owner,
+# 2026-10-12: "also have our infinity logo ... instead of demo test, Free
+# Demo"), repeated along a dark band with thin gold edges, scrolling across
+# the frame.
 WATERMARK_BRAND = ("Bizzle", ".Studio")
-WATERMARK_TAG = "DEMO TEST"
+WATERMARK_TAG = "FREE DEMO"
+# The site's infinity loop (web BrandMark.tsx LOOP, viewBox 1.6 6.6 20.8
+# 10.8) as absolute cubic segments: (start, control 1, control 2, end).
+WATERMARK_LOOP = (
+    ((7, 8), (5, 8), (3, 9.8), (3, 12)),
+    ((3, 12), (3, 14.2), (4.8, 16), (7, 16)),
+    ((7, 16), (9.5, 16), (10.5, 14), (12, 12)),
+    ((12, 12), (13.5, 10), (14.5, 8), (17, 8)),
+    ((17, 8), (19.2, 8), (21, 9.8), (21, 12)),
+    ((21, 12), (21, 14.2), (19.2, 16), (17, 16)),
+    ((17, 16), (14.5, 16), (13.5, 14), (12, 12)),
+    ((12, 12), (10.5, 10), (9.5, 8), (7, 8)),
+)
 WATERMARK_TEXT = "".join(WATERMARK_BRAND) + " " + WATERMARK_TAG
 WATERMARK_GOLD = (235, 189, 101)  # the site's --bz-gold, #ebbd65
+
+
+def build_watermark_mark(height):
+    """The gold infinity mark, `height` px tall (RGBA), drawn 4x large and
+    scaled down so its curves are smooth."""
+    from PIL import Image, ImageDraw
+    k = 4
+    scale = height * k / 10.8
+    w = round(20.8 * scale)
+    img = Image.new("RGBA", (w, round(10.8 * scale)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pts = []
+    for p0, c1, c2, p1 in WATERMARK_LOOP:
+        for i in range(24):
+            t = i / 24
+            u = 1 - t
+            x = u ** 3 * p0[0] + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t ** 3 * p1[0]
+            y = u ** 3 * p0[1] + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t ** 3 * p1[1]
+            pts.append(((x - 1.6) * scale, (y - 6.6) * scale))
+    pts.append(pts[0])
+    draw.line(pts, fill=(0, 0, 0, 120), width=round(3.4 * scale), joint="curve")
+    draw.line(pts, fill=WATERMARK_GOLD + (235,), width=round(2.4 * scale), joint="curve")
+    return img.resize((max(1, round(w / k)), max(1, height)), Image.LANCZOS)
 WATERMARK_FONT_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "watermark-font.ttf")
 # The banner crosses the frame once every this many seconds (owner,
 # 2026-10-12: 4s was "moving too fast"; a 5s trial clip now shows it
@@ -662,8 +700,9 @@ WATERMARK_CENTRE_Y = 0.64
 
 
 def build_watermark_strip(w, h):
-    """The free-trial banner as one long strip: per repeat, "Bizzle" (white)
-    ".Studio" (gold), a gold "DEMO TEST" tag and a gold dot, on a dark
+    """The free-trial banner as one long strip: per repeat, the gold infinity
+    mark, "Bizzle" (white) ".Studio" (gold), an outlined gold "FREE DEMO" tag
+    and a gold dot, on a dark
     translucent band with gold edges, so it reads on light and dark scenes
     alike. Returns the strip (RGBA, long enough to cover the frame plus one
     repeat), the width of one repeat, and the strip's top edge."""
@@ -685,13 +724,20 @@ def build_watermark_strip(w, h):
     brand, studio = WATERMARK_BRAND
     b_l, b_t, b_r, b_b = font.getbbox(brand, stroke_width=stroke)
     s_l, s_t, s_r, s_b = font.getbbox(studio, stroke_width=stroke)
-    t_l, t_t, t_r, t_b = tag_font.getbbox(WATERMARK_TAG)
+    # The tag's letters, spaced out like the site's small caps badges.
+    spacing = round(tag_size * 0.14)
+    letters = [(ch, tag_font.getbbox(ch)) for ch in WATERMARK_TAG]
+    t_t = min(bb[1] for _, bb in letters)
+    t_b = max(bb[3] for _, bb in letters)
+    space_w = round(tag_size * 0.32)
+    letters_w = sum((space_w if ch == " " else tag_font.getlength(ch)) for ch, _ in letters) + spacing * (len(letters) - 1)
     text_h = max(b_b, s_b) - min(b_t, s_t)
-    pad_x, pad_y = round(tag_size * 0.7), round(tag_size * 0.38)
-    tag_w, tag_h = (t_r - t_l) + 2 * pad_x, (t_b - t_t) + 2 * pad_y
+    pad_x, pad_y = round(tag_size * 0.85), round(tag_size * 0.45)
+    tag_w, tag_h = round(letters_w) + 2 * pad_x, (t_b - t_t) + 2 * pad_y
+    mark = build_watermark_mark(round(text_h * 0.74))
     gap = round(size * 0.55)
     dot_r = max(2, round(size * 0.09))
-    tile_w = (b_r - b_l) + (s_r - s_l) + gap + tag_w + 2 * gap + 2 * dot_r + gap
+    tile_w = mark.width + round(gap * 0.45) + (b_r - b_l) + (s_r - s_l) + gap + tag_w + 2 * gap + 2 * dot_r + gap
     band_h = round(text_h * 2.1)
     edge = max(1, round(band_h * 0.04))
     repeats = -(-w // tile_w) + 2
@@ -702,8 +748,11 @@ def build_watermark_strip(w, h):
     draw.rectangle((0, band_h - edge, strip.width, band_h), fill=gold + (170,))
     mid = band_h / 2
     text_y = round(mid - text_h / 2) - min(b_t, s_t)
+    border = max(1, round(tag_size * 0.1))
     for i in range(repeats):
         x = i * tile_w + gap // 2
+        strip.alpha_composite(mark, dest=(x, round(mid - mark.height / 2)))
+        x += mark.width + round(gap * 0.45)
         draw.text((x - b_l, text_y), brand, font=font, fill=(255, 255, 255, 205),
                   stroke_width=stroke, stroke_fill=(0, 0, 0, 130))
         x += b_r - b_l
@@ -711,8 +760,15 @@ def build_watermark_strip(w, h):
                   stroke_width=stroke, stroke_fill=(0, 0, 0, 130))
         x += (s_r - s_l) + gap
         ty = round(mid - tag_h / 2)
-        draw.rounded_rectangle((x, ty, x + tag_w, ty + tag_h), radius=tag_h // 2, fill=gold + (215,))
-        draw.text((x + pad_x - t_l, ty + pad_y - t_t), WATERMARK_TAG, font=tag_font, fill=(20, 16, 10, 235))
+        draw.rounded_rectangle((x, ty, x + tag_w, ty + tag_h), radius=tag_h // 2, fill=(14, 11, 6, 170),
+                               outline=gold + (230,), width=border)
+        lx = x + pad_x
+        for ch, bb in letters:
+            if ch == " ":
+                lx += space_w + spacing
+                continue
+            draw.text((lx, ty + pad_y - t_t), ch, font=tag_font, fill=gold + (240,))
+            lx += tag_font.getlength(ch) + spacing
         x += tag_w + gap
         draw.ellipse((x, mid - dot_r, x + 2 * dot_r, mid + dot_r), fill=gold + (190,))
     top = round(h * WATERMARK_CENTRE_Y - band_h / 2)
@@ -720,7 +776,7 @@ def build_watermark_strip(w, h):
 
 
 def apply_watermark(raw_bytes):
-    """Burns the free-trial banner ("Bizzle.Studio" + "DEMO TEST", repeated)
+    """Burns the free-trial banner (infinity mark, "Bizzle.Studio", "FREE DEMO", repeated)
     across every frame a little below the middle (WATERMARK_CENTRE_Y), scrolling left to right without a
     break, so it can't be cropped out or covered by a corner logo (PyAV +
     Pillow; audio copied untouched). Returns the new MP4 bytes. Raises on

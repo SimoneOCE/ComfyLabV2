@@ -64,11 +64,12 @@ video of kind generate/refine (`refine_source_allowed`).
 from the job) makes `validate_job` refuse face fix, motion swap, start/end
 frames and more than 2 pictures, force upscale off and clamp the length to
 5s (3s until 2026-10-12); the job's own `is_trial` stamp (added by the database trigger) must
-agree. Every trial video gets a branded banner burned in: "Bizzle" (white)
-".Studio" (gold #ebbd65) and a gold "DEMO TEST" tag, repeated along a dark
+agree. Every trial video gets a branded banner burned in: the gold infinity
+mark, "Bizzle" (white) ".Studio" (gold #ebbd65) and an outlined gold "FREE
+DEMO" tag (it said "DEMO TEST" for a few hours on 2026-10-12), repeated along a dark
 band with thin gold edges, its middle at 64% of the frame's height (below
 centre but too high to crop off; owner 2026-10-12, it was "Made on
-Bizzle.Studio" dead centre before), scrolling
+Bizzle.Studio" dead centre before), crossing the frame in 10s, scrolling
 left to right without a break (`apply_watermark`, PyAV + Pillow, font
 `assets/watermark-font.ttf` = Bricolage Grotesque Bold, OFL; audio
 copied), so it can't be cropped or blurred out of one corner; if that
