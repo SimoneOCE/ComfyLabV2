@@ -32,9 +32,19 @@ session must exist in `gpu_sessions` (not ended); its `user_id` is the owner.
    the oldest queued `gpu_session_jobs` row, run it, write `progress` /
    `status` / `output`.
 3. Ends on: Stop / out of credit / reaper (session no longer active — a
-   running job is force-killed within ~2s), 45 minutes idle counted from
-   ready and reset after each job (`end_reason: timeout`), 23h safety cutoff
-   (`timeout`), or a failed restart (`error`, refunded by the website).
+   running job is force-killed within ~2s), 10 minutes idle counted from
+   ready and reset after each job (`end_reason: timeout`; it said 45 until
+   2026-10-10), 23h safety cutoff (`timeout`), or a failed restart (`error`,
+   refunded by the website). **Since 2026-10-12 the website enforces these
+   limits itself too** (server.js `enforceSessionTimers`: idle 11 min, a
+   video over 65 min, a waiting video ignored 5 min, not ready 40 min after
+   a start or restart, 23.5h), so these worker checks are only the fast
+   path; a changed worker can't keep a session billing.
+   **Blocked machines (2026-10-12)**: the website asks RunPod which worker
+   and machine run the job and refuses `/start` with `{"blocked": true}` if
+   the owner blocked it in the admin console; the worker then returns
+   `refresh_worker: True` (runpod-python stops this worker after the job)
+   so RunPod doesn't send it the next session.
    Two safety stops (2026-10-09, `is_session_active`): if the session can't
    be read for 3 minutes in a row (a database outage) the worker stops; and
    every 30s it checks the billing backstop: when the time since the

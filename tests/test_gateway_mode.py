@@ -75,6 +75,8 @@ class Fake(BaseHTTPRequestHandler):
         if self.headers.get("authorization") != f"Bearer {PASS}":
             return self._send(401, {"error": "Not allowed"})
         if path == "/api/worker/start":
+            if body.get("runpodJobId") == "rp-blocked":
+                return self._send(403, {"error": "This GPU machine is blocked", "blocked": True})
             if body.get("runpodJobId") != "rp-1":
                 return self._send(403, {})
             return self._send(200, {"sessionId": SESSION, "userId": OWNER, "isTrial": False})
@@ -186,6 +188,13 @@ r = handler.handler({"id": "rp-other", "input": {"session_id": SESSION, "gateway
 check("another RunPod job -> the gateway refuses, nothing runs", r.get("reason") == "not_active" and calls == ["/api/worker/start"], (r, calls))
 r = handler.handler({"id": "rp-1", "input": {"session_id": SESSION, "gateway": {"url": BASE, "pass": "q" * 43}}})
 check("a wrong pass -> refused, nothing runs", r.get("reason") == "not_active", r)
+
+calls.clear()
+r = handler.handler({"id": "rp-blocked", "input": {"session_id": SESSION, "gateway": {"url": BASE, "pass": PASS}}})
+check("a blocked machine -> nothing runs, and RunPod is asked to replace this worker",
+      r.get("reason") == "machine_blocked" and r.get("refresh_worker") is True and calls == ["/api/worker/start"], (r, calls))
+r = handler.handler({"id": "rp-other", "input": {"session_id": SESSION, "gateway": {"url": BASE, "pass": PASS}}})
+check("an ordinary refusal doesn't replace the worker", "refresh_worker" not in r, r)
 
 print("\nall passed" if not failures else f"\n{failures} FAILED")
 sys.exit(1 if failures else 0)

@@ -1777,6 +1777,15 @@ def gateway_start(runpod_job_id):
             if not isinstance(data.get("userId"), str) or not re.fullmatch(UUID_RE, data["userId"]):
                 return None
             return {"user_id": data["userId"], "is_trial": bool(data.get("isTrial"))}
+        if r is not None and r.status_code == 403:
+            # The owner blocked the machine this worker runs on (the website
+            # asked RunPod which one; 2026-10-12, GPU machines).
+            try:
+                if r.json().get("blocked") is True:
+                    return {"blocked": True}
+            except Exception:
+                pass
+            return None
         if r is not None and r.status_code not in (409, 429, 500, 502, 503, 504):
             return None
         if time.time() > deadline:
@@ -1814,6 +1823,11 @@ def run_session(session_id, runpod_job_id=None):
     if owner is None:
         print(f"Session {session_id}: the gateway refused this session - refusing.")
         return ended("not_active")
+    if owner.get("blocked"):
+        # The website already ended the session (refunded in full). Ask
+        # RunPod to replace this worker so the next session isn't sent here.
+        print(f"Session {session_id}: this machine is blocked by the owner - stopping this worker.")
+        return ended("machine_blocked", refresh_worker=True)
     owner_id = owner["user_id"]
     is_trial = bool(owner.get("is_trial"))
     mark_session_execution_started(session_id)
@@ -1850,7 +1864,7 @@ def run_session(session_id, runpod_job_id=None):
     mark_session_worker_started(session_id)
     loaded_model = "base"
     # The idle clock starts here, after the warmup - a first-time download or
-    # a slow model load never eats into the user's 45 minutes.
+    # a slow model load never eats into the user's 10 idle minutes.
     last_activity = time.time()
     print(f"Session {session_id}: ready after {warmup_seconds}s.")
 
