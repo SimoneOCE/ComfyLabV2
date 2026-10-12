@@ -253,6 +253,43 @@ reliably; describe the action instead.
   products close and large, push-ins and gentle handheld moves.
 - The assistant now receives the Generator's aspect.
 
+## Format rules for every prompt (2026-10-12)
+
+Added after the Prompt Assistant wrote an H3 earbuds prompt with
+retention lines missing their label and the pictured man's age, hair and
+sweater re-described next to his picture (owner: "how can we update/fix
+it so its more accurate"). Mirrored in the website's `enhanceSystemPrompt`
+(server.js) and checked by its security.test.js.
+
+### F1. Retention lines are label first [tested]
+
+Every `retention_analysis` line starts with its label, then the marker:
+`<Subject 1>: fully_preserved - ...`, `<Subject 2>: generated_fresh - ...`,
+`<Video 1> (...): partially_preserved - ...`, `<Audio 1>: fully_copy - ...`.
+That's MiniMax's guide format and the one the motion-swap tests passed
+with (S1). A bare `fully_preserved - ...` line doesn't say which subject
+it's about.
+
+### F2. Let the picture carry the looks [tested for motion swaps, S4; hypothesis for reference generation]
+
+A subject from a picture is only `<Subject N> is the [thing] in
+<Picture N>, exactly as it appears in <Picture N>.`, and in each shot
+"the [thing] from <Picture N>". Never add its age, face, hair, clothes,
+colours, shape or materials, even when the user describes them: added
+words can fight the photo. The retention line says what's kept (a
+person's face, hair, skin and clothes; a product's shape, colours,
+materials and any logo or text), and for a person "face clearly visible
+and large in frame throughout".
+
+### F3. One main action every ~2 seconds [hypothesis]
+
+A shot holds about one main action per 2 seconds (a 6-second shot: lift,
+open, speak). When it's full, drop the small extras (nods, glances,
+extra gestures). MiniMax's guide: too many characters or events in a
+short clip make faces small and glitchy; on 2026-10-12 a 6.6s earbuds
+draft asked for seven actions (raise, open, show inside, close, nod,
+speak, lower).
+
 ## Motion swap prompts (Ref2VA: reference video + picture)
 
 Rules for the motion swap / character swap (a reference video `<Video 1>`, one
