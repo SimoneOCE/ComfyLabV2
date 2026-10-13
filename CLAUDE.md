@@ -47,10 +47,14 @@ session must exist in `gpu_sessions` (not ended); its `user_id` is the owner.
    so RunPod doesn't send it the next session.
    Two safety stops (2026-10-09, `is_session_active`): if the session can't
    be read for 3 minutes in a row (a database outage) the worker stops; and
-   every 30s it checks the billing backstop: when the time since the
-   website's meter last charged (`gpu_sessions.metered_until`, else
-   `billing_started_at`) is more than the owner's balance + 90s, the meter
-   has stalled, so it ends the session as `out_of_credit` itself.
+   every 30s it asks the website's `/state`, which runs the billing
+   backstop: when the time since the website's meter last charged
+   (`gpu_sessions.metered_until`, else `billing_started_at`) is more than
+   the owner's balance + 90s, the meter has stalled, so the website ends
+   the session as `out_of_credit` and answers "not active". The worker
+   itself can't end a session as out of credit (2026-10-13: that reason
+   holds the interrupted video's time for the customer's next purchase, so
+   only the website may use it).
 
 ## Jobs
 
@@ -149,8 +153,8 @@ without a valid pass is refused before anything runs. The session runs
 entirely through the website's `/api/worker/*` routes (server.js "Worker
 gateway"): start (owner + trial flag, only for the RunPod job the website
 started), state (the website runs the meter backstop), heartbeat, marks
-(execution started / ready / reset), end (timeout, error, out_of_credit
-only), job claim, flags, progress, input links
+(execution started / ready / reset), end (timeout or error only; the
+website alone ends a session as out of credit), job claim, flags, progress, input links
 (short-lived read-only links to that job's own files; face fixes checked
 by the website), one upload link per result (a key the website picks, the
 declared size), the result, and the face-detector alert. **The worker

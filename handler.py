@@ -1692,7 +1692,7 @@ def reset_worker_started(session_id):
 
 
 def mark_session_ended(session_id, reason):
-    """reason: timeout, error or out_of_credit (the gateway refuses others)."""
+    """reason: timeout or error (the gateway refuses others, out_of_credit included)."""
     try:
         gw_call("/end", {"reason": reason})
     except GatewaySessionGone:
