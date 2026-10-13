@@ -120,7 +120,14 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git ComfyUI \
 # it, and its only user here (MiniMaxH3NativeAudioLock, for the old H3 face
 # refine) is gone. If it ever comes back, pin it to 2.10.0+cu130 - an
 # unpinned torchaudio resolved to 2.11 and failed to load against torch 2.10.
+# PyPI is an EXTRA index here (2026-10-13): constraints.txt was resolved
+# against both indexes, and pins torch's helpers (filelock, fsspec,
+# typing_extensions, ...) at versions PyTorch's own index doesn't carry, so
+# with that index alone every build since the lock failed with
+# "ResolutionImpossible" at this step. Every version is still exact (the
+# +cu130 builds exist only on PyTorch's index).
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
+    --extra-index-url https://pypi.org/simple \
     torch==2.10.0+cu130 torchvision==0.25.0+cu130
 
 RUN pip install --no-cache-dir -r ComfyUI/requirements.txt

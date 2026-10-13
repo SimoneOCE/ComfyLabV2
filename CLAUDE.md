@@ -173,6 +173,13 @@ versions); the Dockerfile's pip steps run with `PIP_CONSTRAINT` set to it
 after a ComfyUI / node / package change, check `constraints.txt` first**;
 how to re-resolve it is at the top of the file. nvidia-vfx and SageAttention
 are pinned separately in `comfyui_engine/ensure_comfyui_engine.sh`.
+**The lock is resolved against PyTorch's index AND PyPI, so the torch step
+must see both** (`--extra-index-url https://pypi.org/simple`): with
+PyTorch's index alone, every build from the lock (`a42a39c`, 2026-10-12)
+until the fix (2026-10-13) failed with `ResolutionImpossible` at that step,
+and the live worker stayed on the F4 build (`69e0b85`) for a day without
+anyone noticing. **After every push here, check RunPod > Builds shows
+"Completed"**, not just that the push went through.
 
 ## Configuration
 
