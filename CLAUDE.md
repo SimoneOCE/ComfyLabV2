@@ -83,13 +83,20 @@ Bizzle.Studio" dead centre before), crossing the frame in 10s, scrolling
 left to right without a break (`apply_watermark`, PyAV + Pillow, font
 `assets/watermark-font.ttf` = Bricolage Grotesque Bold, OFL; audio
 copied), so it can't be cropped or blurred out of one corner; if that
-fails the job fails rather than upload an unmarked video. **Paid removal
-(2026-10-10)**: a trial user can pay $1 on the website to make ONE video
-clean; the website reserves a row in `trial_watermark_passes` for that
-job id before the job exists. `watermark_pass_reserved(job_id, owner_id)`
-looks for that reserved row (any error = watermark on), and the output
-records `watermarked` (true/false), which the website reads to mark the
-pass used or give it back.
+fails the job fails rather than upload an unmarked video.
+
+**Removing the watermark AFTER the video (owner, 2026-10-13; replaces the
+2026-10-10 "pay before you generate" pass)**: every trial video is saved
+twice (`save_result`): the clean file is uploaded first, then the
+watermarked one, which is the result the customer sees. The clean key is
+sent beside the result (`finish_job` sends `{output, cleanKey}`), never
+inside it; the website keeps it locked until the customer pays $1 for that
+video or subscribes, then swaps the video to the clean file and deletes the
+watermarked one (website: `docs/plans/trial-watermark-after.md`). A failed
+clean upload still delivers the watermarked video (just no offer); a
+failed watermark still fails the job. A trial job may upload 4 files (2 +
+one retry each). `watermark_pass_reserved` and the `/watermark` gateway
+route were removed.
 
 What the worker decides (never the user):
 
@@ -126,7 +133,7 @@ up to 362).
   RunPod job is the one the website stored in `gpu_sessions.runpod_job_id`
   (`runpod_job_matches`, waits up to 20s for it to be written).
 - `finish_job` writes only while the row is still `processing`: once the
-  website has closed a job (and possibly given back a watermark pass), a
+  website has closed a job, a
   late result is dropped.
 - Face detector (`face_yolov8m.pt`): the engine script keeps only the file
   matching `FACE_DETECTOR_SHA256`, downloaded from a pinned commit. If none
@@ -143,7 +150,7 @@ entirely through the website's `/api/worker/*` routes (server.js "Worker
 gateway"): start (owner + trial flag, only for the RunPod job the website
 started), state (the website runs the meter backstop), heartbeat, marks
 (execution started / ready / reset), end (timeout, error, out_of_credit
-only), job claim, flags, watermark pass, progress, input links
+only), job claim, flags, progress, input links
 (short-lived read-only links to that job's own files; face fixes checked
 by the website), one upload link per result (a key the website picks, the
 declared size), the result, and the face-detector alert. **The worker

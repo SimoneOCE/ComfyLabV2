@@ -1241,6 +1241,25 @@ def fetch_output_video(history_entry):
     return r.content
 
 
+def save_result(job, raw):
+    """Uploads a finished video; returns (video key, clean key or None,
+    watermarked). Free trial (owner, 2026-10-13): the customer sees the
+    watermarked video; the clean file is uploaded first and kept locked by
+    the website until they remove the watermark ($1) or subscribe. If the
+    clean upload fails the video is still delivered, watermarked, with no
+    offer; the watermark itself is never skipped (apply_watermark failing
+    fails the job, as before)."""
+    watermarked = bool(job.get("trial"))
+    clean_key = None
+    if watermarked:
+        try:
+            clean_key = upload_result_and_get_key(raw)
+        except Exception as e:
+            print(f"Clean copy not uploaded ({type(e).__name__}: {e}); the video stays watermarked with no offer")
+        raw = apply_watermark(raw)
+    return upload_result_and_get_key(raw), clean_key, watermarked
+
+
 def upload_result_and_get_key(raw_bytes):
     """Uploads a finished video through the gateway's upload link and returns
     the bare key the website chose (what VALID_VIDEO_KEY / OUTPUT_KEY_RE accept)."""
@@ -1339,17 +1358,12 @@ def run_generation(job, report, should_cancel=None, should_force_kill=None, load
             return {"cancelled": True}, model
         report({"stage": "Saving"})
         raw = fetch_output_video(result)
-        watermarked = bool(job.get("trial")) and not job.get("watermark_removed")
-        if watermarked:
-            raw = apply_watermark(raw)
-        video_key = upload_result_and_get_key(raw)
-        return {
+        video_key, clean_key, watermarked = save_result(job, raw)
+        output = {
             "videoKey": video_key,
             "storage": "wasabi",
             "kind": job_kind(job),
             "trial": bool(job.get("trial")),
-            # Read by the website's reaper: false marks the paid removal used,
-            # anything else gives it back to the user.
             "watermarked": watermarked,
             "seed": job["seed"],
             "width": width * (2 if job["upscale"] else 1),
@@ -1360,7 +1374,11 @@ def run_generation(job, report, should_cancel=None, should_force_kill=None, load
             "speed": job["speed"],
             "upscaled": bool(job["upscale"]),
             "comfy_seconds": comfy_seconds,
-        }, model
+        }
+        if clean_key:
+            # Sent beside the result, never inside it (finish_job).
+            output["cleanKey"] = clean_key
+        return output, model
     finally:
         remove_inputs(staged)
 
@@ -1690,18 +1708,6 @@ def claim_next_queued_job(session_id):
     return job
 
 
-def watermark_pass_reserved(job_row_id, owner_id):
-    """True only when the website reserved a paid watermark removal for this
-    exact job (trial_watermark_passes, checked by the gateway). Anything else,
-    including an error, means the watermark goes on: this fails closed like
-    the watermark itself."""
-    try:
-        return bool(gw_call(f"/jobs/{job_row_id}/watermark").get("reserved"))
-    except Exception as e:
-        print(f"Could not check the watermark pass for job {job_row_id}: {e}")
-        return False
-
-
 _gw_flags = {}
 
 
@@ -1751,10 +1757,17 @@ def make_progress_writer(job_row_id):
 
 def finish_job(job_row_id, output):
     """The website writes it only while the job is still processing: once it
-    has closed the job (and possibly given back a watermark pass), a late
-    result is dropped."""
+    has closed the job, a late result is dropped. A trial video's clean copy
+    (cleanKey) goes beside the result, never in it: the result is readable by
+    the customer, the clean copy stays locked until they remove the
+    watermark."""
+    output = dict(output)
+    body = {"output": output}
+    clean_key = output.pop("cleanKey", None)
+    if clean_key:
+        body["cleanKey"] = clean_key
     try:
-        if not gw_call(f"/jobs/{job_row_id}/finish", {"output": output}).get("written"):
+        if not gw_call(f"/jobs/{job_row_id}/finish", body).get("written"):
             print(f"Job {job_row_id} was already closed by the website - result not written.")
     except Exception as e:
         print(f"Could not write final result for job {job_row_id}: {e}")
@@ -1920,9 +1933,6 @@ def run_session(session_id, runpod_job_id=None):
                 if job_row.get("user_id") != owner_id or job_row.get("session_id") != session_id:
                     raise JobRejected("This job does not belong to this session")
                 job = validate_job(job_row.get("input"), owner_id, is_trial)
-                # Trial videos are watermarked unless a paid removal was
-                # reserved for this job ($1, trial watermark removal).
-                job["watermark_removed"] = bool(job.get("trial")) and watermark_pass_reserved(job_id, owner_id)
                 # Stop GPU / out of credit / reaper mid-job: the session is
                 # over, so kill the generation now rather than finishing it.
                 kwargs = {

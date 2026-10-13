@@ -100,8 +100,6 @@ class Fake(BaseHTTPRequestHandler):
                                             "input": {"v": 2, "mode": "generate"}, "cancel_requested": False}})
         if path == f"/api/worker/jobs/{JOB}/flags":
             return self._send(200, {"cancel_requested": False, "force_cancel_requested": False})
-        if path == f"/api/worker/jobs/{JOB}/watermark":
-            return self._send(200, {"reserved": False})
         if path == f"/api/worker/jobs/{JOB}/inputs":
             return self._send(200, {"files": {IMG: {"url": f"{BASE}/file/img", "size": 17}}, "refineNotAllowed": False})
         if path == f"/api/worker/jobs/{JOB}/progress":
@@ -112,6 +110,7 @@ class Fake(BaseHTTPRequestHandler):
                                     "headers": {"Content-Type": "video/mp4"}})
         if path == f"/api/worker/jobs/{JOB}/finish":
             state["finished"] = body["output"]
+            state["finish_body"] = body
             state["active"] = False  # the user ends the session after their video
             return self._send(200, {"written": True})
         self._send(404, {})
@@ -142,7 +141,9 @@ def fake_generation(job, report, should_cancel=None, should_force_kill=None, loa
     assert not should_cancel() and not should_force_kill()
     report({"stage": "Saving"})
     key = handler.upload_result_and_get_key(b"finished video bytes")
-    return {"videoKey": key, "storage": "wasabi", "kind": "generate", "watermarked": False, "seed": 1}, "base"
+    # As a trial video would: the clean copy's key beside the result.
+    return {"videoKey": key, "storage": "wasabi", "kind": "generate", "watermarked": True, "seed": 1,
+            "cleanKey": "99999999-aaaa-4bbb-8ccc-123456789012.mp4"}, "base"
 
 
 handler.run_generation = fake_generation
@@ -165,8 +166,48 @@ check("the picture came through its read link", any(p.endswith("/inputs") for p 
 check("the video went to the upload link, as MP4", state["uploaded"].get("/put/out.mp4", (b"", ""))[1] == "video/mp4"
       and state["uploaded"]["/put/out.mp4"][0] == b"finished video bytes", state["uploaded"])
 check("the result names the key the website picked", (state["finished"] or {}).get("videoKey") == "12345678-aaaa-4bbb-8ccc-123456789012.mp4", state["finished"])
+check("a trial video's clean copy is sent beside the result, never inside it",
+      (state.get("finish_body") or {}).get("cleanKey") == "99999999-aaaa-4bbb-8ccc-123456789012.mp4"
+      and "cleanKey" not in (state["finished"] or {}), state.get("finish_body"))
+check("the worker no longer asks whether to skip the watermark", not any(p.endswith("/watermark") for p in calls), calls)
 check("progress was sent", [p.get("stage") for p in state["progress"]][:1] == ["Preparing your inputs"], state["progress"])
 check("the pass is forgotten after the job", handler._GW is None)
+
+print("saving a finished video (2026-10-13)")
+uploads = []
+fail_first = [False]
+
+
+def fake_upload(raw):
+    if fail_first[0]:
+        fail_first[0] = False
+        raise RuntimeError("upload link refused")
+    uploads.append(raw)
+    return f"{len(uploads):08d}-aaaa-4bbb-8ccc-123456789012.mp4"
+
+
+real_upload, real_watermark = handler.upload_result_and_get_key, handler.apply_watermark
+handler.upload_result_and_get_key = fake_upload
+handler.apply_watermark = lambda raw: b"WM:" + raw
+video, clean, marked = handler.save_result({"trial": True}, b"raw")
+check("trial: the clean file goes first, then the watermarked one; the result is the watermarked one",
+      uploads == [b"raw", b"WM:raw"] and marked is True and clean == "00000001-aaaa-4bbb-8ccc-123456789012.mp4"
+      and video == "00000002-aaaa-4bbb-8ccc-123456789012.mp4", (uploads, video, clean))
+uploads.clear()
+fail_first[0] = True
+video, clean, marked = handler.save_result({"trial": True}, b"raw")
+check("trial, the clean upload fails: still delivered watermarked, no clean copy", uploads == [b"WM:raw"] and clean is None and marked is True, uploads)
+uploads.clear()
+video, clean, marked = handler.save_result({"trial": False}, b"raw")
+check("a plan's video: one upload, no watermark, no clean copy", uploads == [b"raw"] and clean is None and marked is False, uploads)
+handler.apply_watermark = lambda raw: (_ for _ in ()).throw(RuntimeError("watermark failed"))
+uploads.clear()
+try:
+    handler.save_result({"trial": True}, b"raw")
+    check("trial, the watermark fails: the job fails (never an unmarked video)", False, uploads)
+except RuntimeError:
+    check("trial, the watermark fails: the job fails (never an unmarked video)", uploads == [b"raw"], uploads)
+handler.upload_result_and_get_key, handler.apply_watermark = real_upload, real_watermark
 
 print("no master-key code left")
 src = open(handler.__file__).read()
