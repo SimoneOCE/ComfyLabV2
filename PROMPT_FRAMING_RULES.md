@@ -326,6 +326,27 @@ frames it matches the people, place, light and positions in them; on a
 motion swap it uses the pictures only to tell who is who. Untested
 against the model's output so far: add results to the test log.
 
+### F7. Write out every spoken word, and the silence after it [tested]
+
+Owner, 2026-10-13: "any speech must be written out, not decided by h3,
+otherwise the video distorts it and generates mumble jumble". The
+homepage H3 take (Standard, 6.6s) said its one line "Honestly, the best
+earbuds I've owned" from 0 to 2.5s, was silent for a second, then made up
+about 2s of mumbled words (3.5-5.7s). The prompt gave a short line in a
+long shot, said nothing about him stopping, and its soundscape said "his
+natural, friendly speaking voice". So:
+
+- Every word anyone says is written out in double quotes. Never "he
+  talks about", "she explains", "chats to camera" or "keeps talking".
+- The words fill the time the person talks (about 2.5 words a second),
+  or, right after the last line, the shot says they stop talking and stay
+  silent with mouth closed for the rest of it (a smile, a nod).
+- overall_soundscape says the voice says only those words: "his voice
+  saying only these words, no other talking", never "his speaking voice".
+
+The website's format check retries answers that break any of these
+(not for motion swaps, whose speech comes from the reference video).
+
 ## Motion swap prompts (Ref2VA: reference video + picture)
 
 Rules for the motion swap / character swap (a reference video `<Video 1>`, one
